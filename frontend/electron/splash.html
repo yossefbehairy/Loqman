@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src 'self' file:; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    />
+    <title>AgentOS</title>
+    <style>
+      :root {
+        --bg: #121214;
+        --fg: #f4f4f5;
+        --muted: #a1a1aa;
+        --accent-a: #fafafa;
+        --accent-b: #a1a1aa;
+        --danger: #f87171;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--fg);
+        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        -webkit-app-region: drag;
+        user-select: none;
+      }
+
+      /* Ambient accent glow, echoing the app's dark theme. */
+      body::before {
+        content: "";
+        position: fixed;
+        inset: -40%;
+        pointer-events: none;
+        background:
+          radial-gradient(circle at 22% 18%, rgba(255, 255, 255, 0.07), transparent 45%),
+          radial-gradient(circle at 82% 88%, rgba(161, 161, 170, 0.08), transparent 45%);
+      }
+
+      .card {
+        position: relative;
+        width: 100%;
+        padding: 26px 30px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
+        text-align: center;
+      }
+
+      .logo {
+        width: 64px;
+        height: 64px;
+        border-radius: 16px;
+        display: block;
+        object-fit: contain;
+        box-shadow: 0 0 34px rgba(255, 255, 255, 0.18);
+      }
+
+      .wordmark {
+        font-size: 22px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+
+      .wordmark .accent {
+        background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .tagline {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .bar {
+        width: 100%;
+        max-width: 240px;
+        height: 3px;
+        margin-top: 8px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.18);
+        overflow: hidden;
+      }
+
+      .bar-fill {
+        width: 40%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--accent-a), var(--accent-b));
+        animation: slide 1.4s ease-in-out infinite;
+      }
+
+      @keyframes slide {
+        0% {
+          transform: translateX(-110%);
+        }
+        100% {
+          transform: translateX(310%);
+        }
+      }
+
+      .status {
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--muted);
+        min-height: 18px;
+        max-width: 100%;
+      }
+
+      /* Error state shows the message plus the last backend log lines. */
+      .status[data-kind="error"] {
+        width: 100%;
+        max-height: 128px;
+        overflow-y: auto;
+        text-align: left;
+        font-size: 11px;
+        color: var(--danger);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        -webkit-app-region: no-drag;
+        user-select: text;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="card">
+      <img class="logo" src="icon.png" alt="" aria-hidden="true" />
+      <h1 class="wordmark">Agent<span class="accent">OS</span></h1>
+      <p class="tagline">Local-first multi-agent workflows</p>
+      <div class="bar" aria-hidden="true"><div class="bar-fill"></div></div>
+      <div id="status" class="status" data-kind="info">Booting AgentOS…</div>
+    </main>
+    <script>
+      // Called from the main process via webContents.executeJavaScript().
+      window.__setStatus = function (payload) {
+        var el = document.getElementById("status");
+        if (!el || !payload) return;
+        el.textContent = String(payload.message || "");
+        el.dataset.kind = payload.kind || "info";
+      };
+    </script>
+  </body>
+</html>

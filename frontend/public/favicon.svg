@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- تدرج فحمي فخم للخلفية -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#27272A" />
+      <stop offset="100%" stop-color="#121214" />
+    </linearGradient>
+  </defs>
+
+  <!-- الخلفية الفحمية بحواف دائرية وإطار داخلي خفيف -->
+  <rect width="512" height="512" rx="115" fill="url(#bgGrad)" stroke="#3F3F46" stroke-width="4" />
+
+  <!-- قوس ثانوي خفيف يكمل مسار التدفق -->
+  <path 
+    d="M 275 130 A 128 128 0 0 1 372 202" 
+    fill="none" 
+    stroke="#A1A1AA" 
+    stroke-width="20" 
+    stroke-linecap="round"
+    opacity="0.45"
+  />
+
+  <!-- القوس الرئيسي الأبيض (نفس زاوية اللوجو الأصلي) -->
+  <path 
+    d="M 384 256 A 128 128 0 1 1 223 132" 
+    fill="none" 
+    stroke="#FFFFFF" 
+    stroke-width="34" 
+    stroke-linecap="round" 
+  />
+
+  <!-- عقدة متصلة في نهاية المسار (تعبير عن الـ Workflow Node) -->
+  <circle cx="223" cy="132" r="24" fill="#FFFFFF" />
+  <circle cx="223" cy="132" r="10" fill="#18181B" />
+
+  <!-- النواة المركزية البيضاء (Core OS) -->
+  <circle cx="256" cy="256" r="48" fill="#FFFFFF" />
+</svg>

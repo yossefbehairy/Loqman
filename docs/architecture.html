@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentOS — Architecture & Message Workflow</title>
+<style>
+  :root { --bg:#0f141b; --card:#182030; --line:#2b3548; --txt:#e8edf5; --mut:#93a0b8;
+         --acc:#4cc38a; --warn:#f5b14c; --bad:#f26d6d; --info:#5aa9ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:"Segoe UI",Tahoma,Arial,sans-serif; line-height:1.8; }
+  .wrap { max-width:1060px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  h2 { font-size:19px; margin:34px 0 10px; color:var(--acc); border-bottom:1px solid var(--line); padding-bottom:6px; }
+  h3 { font-size:15px; margin:18px 0 6px; color:var(--info); }
+  p, li { font-size:14px; color:var(--txt); }
+  .sub { color:var(--mut); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px 18px; margin:12px 0; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin:10px 0; }
+  th, td { border:1px solid var(--line); padding:8px 10px; text-align:right; vertical-align:top; }
+  th { background:#1f2940; }
+  code { background:#0b0f16; border:1px solid var(--line); border-radius:6px; padding:1px 7px; font-size:12.5px;
+         font-family:Consolas,monospace; direction:ltr; display:inline-block; }
+  .tag { display:inline-block; font-size:11px; font-weight:bold; border-radius:20px; padding:1px 10px; margin-inline-start:6px; }
+  .t-ok { background:#123f2c; color:#5fe3a1; } .t-warn { background:#4a3512; color:#ffcf7d; }
+  .t-bad { background:#4d1a1a; color:#ff9d9d; } .t-info { background:#173a5e; color:#9cc8ff; }
+  svg { width:100%; height:auto; display:block; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12px; color:var(--mut); margin-top:8px; }
+  .dot { display:inline-block; width:11px; height:11px; border-radius:3px; margin-inline-end:5px; vertical-align:middle; }
+  .check li { margin-bottom:6px; }
+  .foot { margin-top:30px; font-size:12px; color:var(--mut); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>AgentOS — خريطة الاركتكتشر ومسار الرسالة</h1>
+<div class="sub">من أين تدخل جملة «عامل ايه»؟ وأين تتفرع؟ وأين كانت المشكلة؟ — ملف واحد يعمل offline.</div>
+
+<h2>1) خريطة النظام العامة</h2>
+<div class="card">
+<svg viewBox="0 0 1000 340" font-family="Segoe UI,Tahoma" font-size="13">
+  <!-- clients -->
+  <rect x="790" y="30" width="180" height="70" rx="10" fill="#173a5e" stroke="#5aa9ff"/>
+  <text x="880" y="58" text-anchor="middle" fill="#fff" font-weight="bold">Conversations</text>
+  <text x="880" y="78" text-anchor="middle" fill="#9cc8ff" font-size="11">شاشة الشات (chat مباشر)</text>
+  <rect x="790" y="120" width="180" height="70" rx="10" fill="#4d1a1a" stroke="#f26d6d"/>
+  <text x="880" y="148" text-anchor="middle" fill="#fff" font-weight="bold">Sha7at (خارجي)</text>
+  <text x="880" y="168" text-anchor="middle" fill="#ff9d9d" font-size="11">يضرب /api/missions مباشرة</text>
+  <rect x="790" y="210" width="180" height="70" rx="10" fill="#1f2940" stroke="#93a0b8"/>
+  <text x="880" y="238" text-anchor="middle" fill="#fff" font-weight="bold">Inbox / Stream</text>
+  <text x="880" y="258" text-anchor="middle" fill="#93a0b8" font-size="11">قراءة فقط (نتائج + SSE)</text>
+  <!-- backend -->
+  <rect x="430" y="30" width="260" height="250" rx="10" fill="#182030" stroke="#4cc38a"/>
+  <text x="560" y="55" text-anchor="middle" fill="#5fe3a1" font-weight="bold">Backend — FastAPI</text>
+  <rect x="450" y="70" width="220" height="52" rx="8" fill="#123f2c" stroke="#4cc38a"/>
+  <text x="560" y="92" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold">POST /api/chat</text>
+  <text x="560" y="109" text-anchor="middle" fill="#5fe3a1" font-size="11">رد مباشر، بلا mission</text>
+  <rect x="450" y="132" width="220" height="52" rx="8" fill="#123f2c" stroke="#4cc38a"/>
+  <text x="560" y="154" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold">POST /api/missions</text>
+  <text x="560" y="171" text-anchor="middle" fill="#5fe3a1" font-size="11">تحية → رد واحد / شغل → pipeline</text>
+  <rect x="450" y="194" width="220" height="52" rx="8" fill="#1f2940" stroke="#93a0b8"/>
+  <text x="560" y="216" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold">/api/opencode-proxy/*</text>
+  <text x="560" y="233" text-anchor="middle" fill="#93a0b8" font-size="11">سيشن مستمر (legacy ⇄ v2)</text>
+  <text x="560" y="268" text-anchor="middle" fill="#93a0b8" font-size="11">+ SQLite (missions/tasks/profiles)</text>
+  <!-- runtime -->
+  <rect x="120" y="30" width="230" height="120" rx="10" fill="#1f2940" stroke="#f5b14c"/>
+  <text x="235" y="55" text-anchor="middle" fill="#ffcf7d" font-weight="bold">Runtime layer</text>
+  <text x="235" y="78" text-anchor="middle" fill="#e8edf5" font-size="12">RealOpenCodeRuntime</text>
+  <text x="235" y="98" text-anchor="middle" fill="#93a0b8" font-size="11">ترجمة + polling بدل wait</text>
+  <text x="235" y="118" text-anchor="middle" fill="#93a0b8" font-size="11">MockRuntime (للاختبارات)</text>
+  <rect x="120" y="170" width="230" height="110" rx="10" fill="#1f2940" stroke="#f5b14c"/>
+  <text x="235" y="195" text-anchor="middle" fill="#ffcf7d" font-weight="bold">opencode CLI v2.0.29</text>
+  <text x="235" y="218" text-anchor="middle" fill="#e8edf5" font-size="12" direction="ltr">127.0.0.1:49100</text>
+  <text x="235" y="240" text-anchor="middle" fill="#93a0b8" font-size="11">142 موديل · 60 مجاني</text>
+  <text x="235" y="260" text-anchor="middle" fill="#93a0b8" font-size="11">CEO planning + تنفيذ</text>
+  <!-- arrows clients -> backend -->
+  <line x1="790" y1="65" x2="690" y2="95" stroke="#5aa9ff" stroke-width="2" marker-end="url(#a1)"/>
+  <line x1="790" y1="155" x2="690" y2="158" stroke="#f26d6d" stroke-width="2"/>
+  <line x1="790" y1="245" x2="690" y2="220" stroke="#93a0b8" stroke-width="2"/>
+  <!-- arrows backend -> runtime -->
+  <line x1="430" y1="110" x2="350" y2="85" stroke="#4cc38a" stroke-width="2"/>
+  <line x1="430" y1="160" x2="350" y2="95" stroke="#4cc38a" stroke-width="2"/>
+  <line x1="430" y1="215" x2="350" y2="105" stroke="#93a0b8" stroke-width="2"/>
+  <line x1="235" y1="150" x2="235" y2="170" stroke="#f5b14c" stroke-width="2"/>
+  <defs><marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6" fill="none" stroke="#5aa9ff" stroke-width="1.5"/></marker></defs>
+</svg>
+<div class="legend">
+  <span><span class="dot" style="background:#5aa9ff"></span>مسار الشات المباشر</span>
+  <span><span class="dot" style="background:#f26d6d"></span>مسار الـ missions (مشكلتك كانت هنا)</span>
+  <span><span class="dot" style="background:#93a0b8"></span>قراءة / سيشن مستمر</span>
+</div>
+</div>
+
+<h2>2) رحلة جملة «عامل ايه» — البابان</h2>
+<div class="card">
+<svg viewBox="0 0 1000 400" font-family="Segoe UI,Tahoma" font-size="12.5">
+  <rect x="400" y="10" width="200" height="54" rx="10" fill="#1f2940" stroke="#fff"/>
+  <text x="500" y="33" text-anchor="middle" fill="#fff" font-weight="bold">المستخدم يكتب: «عامل ايه»</text>
+  <text x="500" y="52" text-anchor="middle" fill="#93a0b8" font-size="11">أي client؟ أي endpoint؟</text>
+  <line x1="500" y1="64" x2="500" y2="88" stroke="#fff" stroke-width="2"/>
+  <!-- door A -->
+  <rect x="560" y="88" width="380" height="300" rx="10" fill="#10281c" stroke="#4cc38a"/>
+  <text x="750" y="112" text-anchor="middle" fill="#5fe3a1" font-weight="bold">الباب (أ): POST /api/chat</text>
+  <text x="750" y="132" text-anchor="middle" fill="#93a0b8" font-size="11">شاشة Conversations في AgentOS</text>
+  <rect x="580" y="145" width="340" height="60" rx="8" fill="#182030" stroke="#4cc38a"/>
+  <text x="750" y="167" text-anchor="middle" fill="#fff">قالب [CONSULTATION] محادثي</text>
+  <text x="750" y="187" text-anchor="middle" fill="#93a0b8" font-size="11">شخصية CEO + نفس لهجة المستخدم</text>
+  <rect x="580" y="215" width="340" height="60" rx="8" fill="#182030" stroke="#4cc38a"/>
+  <text x="750" y="237" text-anchor="middle" fill="#fff">رد واحد طبيعي، بلا mission</text>
+  <text x="750" y="257" text-anchor="middle" fill="#5fe3a1" font-size="11">مثال: «الحمد لله تمام، إنت عامل إيه؟»</text>
+  <text x="750" y="300" text-anchor="middle" fill="#5fe3a1" font-weight="bold">✔ سريع · بلا Inbox · بلا تكلفة pipeline</text>
+  <text x="750" y="330" text-anchor="middle" fill="#93a0b8" font-size="11">chat.py:96 · suggested_mission = None دائماً</text>
+  <text x="750" y="355" text-anchor="middle" fill="#93a0b8" font-size="11">يُختبر في test_chat_and_profiles.py</text>
+  <!-- door B -->
+  <rect x="60" y="88" width="380" height="300" rx="10" fill="#2c1212" stroke="#f26d6d"/>
+  <text x="250" y="112" text-anchor="middle" fill="#ff9d9d" font-weight="bold">الباب (ب): POST /api/missions</text>
+  <text x="250" y="132" text-anchor="middle" fill="#93a0b8" font-size="11">عميل Sha7at الخارجي يستخدمه لأي رسالة</text>
+  <rect x="80" y="145" width="340" height="60" rx="8" fill="#182030" stroke="#f5b14c"/>
+  <text x="250" y="167" text-anchor="middle" fill="#fff">قبل الإصلاح: أي objective = pipeline</text>
+  <text x="250" y="187" text-anchor="middle" fill="#ff9d9d" font-size="11">3 موظفين + synthesis (05cf3770)</text>
+  <rect x="80" y="215" width="340" height="60" rx="8" fill="#182030" stroke="#4cc38a"/>
+  <text x="250" y="237" text-anchor="middle" fill="#fff">بعد الإصلاح: تحية = رد واحد فقط</text>
+  <text x="250" y="257" text-anchor="middle" fill="#5fe3a1" font-size="11">mission succeeded من أول لحظة · مهمة واحدة</text>
+  <text x="250" y="300" text-anchor="middle" fill="#ffcf7d" font-weight="bold">⚠ يعمل فقط بعد إعادة تشغيل الباكند!</text>
+  <text x="250" y="330" text-anchor="middle" fill="#93a0b8" font-size="11">missions.py: is_greeting_objective</text>
+  <text x="250" y="355" text-anchor="middle" fill="#93a0b8" font-size="11">يُختبر في test_greeting_mission.py</text>
+  <!-- split lines -->
+  <line x1="500" y1="88" x2="750" y2="88" stroke="#4cc38a" stroke-width="2"/>
+  <line x1="500" y1="88" x2="250" y2="88" stroke="#f26d6d" stroke-width="2"/>
+</svg>
+</div>
+
+<h2>3) داخل الباب (ب): مراحل الـ mission</h2>
+<div class="card">
+<svg viewBox="0 0 1000 210" font-family="Segoe UI,Tahoma" font-size="12">
+  <rect x="810" y="60" width="150" height="90" rx="10" fill="#1f2940" stroke="#93a0b8"/>
+  <text x="885" y="90" text-anchor="middle" fill="#fff" font-weight="bold">queued</text>
+  <text x="885" y="112" text-anchor="middle" fill="#93a0b8" font-size="11">حُفظ في SQLite</text>
+  <text x="885" y="130" text-anchor="middle" fill="#93a0b8" font-size="11">201 Created</text>
+  <rect x="610" y="60" width="150" height="90" rx="10" fill="#1f2940" stroke="#5aa9ff"/>
+  <text x="685" y="90" text-anchor="middle" fill="#fff" font-weight="bold">planning</text>
+  <text x="685" y="112" text-anchor="middle" fill="#93a0b8" font-size="11">CEO يخطط (muse-spark)</text>
+  <text x="685" y="130" text-anchor="middle" fill="#93a0b8" font-size="11">JSON صارم + retry</text>
+  <rect x="410" y="60" width="150" height="90" rx="10" fill="#1f2940" stroke="#f5b14c"/>
+  <text x="485" y="90" text-anchor="middle" fill="#fff" font-weight="bold">running (1/3…)</text>
+  <text x="485" y="112" text-anchor="middle" fill="#93a0b8" font-size="11">موظفون بالتوازي (×3)</text>
+  <text x="485" y="130" text-anchor="middle" fill="#93a0b8" font-size="11">SSE progress حي</text>
+  <rect x="180" y="60" width="180" height="90" rx="10" fill="#123f2c" stroke="#4cc38a"/>
+  <text x="270" y="90" text-anchor="middle" fill="#fff" font-weight="bold">succeeded ✅</text>
+  <text x="270" y="112" text-anchor="middle" fill="#93a0b8" font-size="11">CEO synthesis + Inbox</text>
+  <text x="270" y="130" text-anchor="middle" fill="#93a0b8" font-size="11">ملخص مقطوع (1200 حرف)</text>
+  <rect x="20" y="60" width="110" height="90" rx="10" fill="#123f2c" stroke="#4cc38a" stroke-dasharray="5,4"/>
+  <text x="75" y="90" text-anchor="middle" fill="#5fe3a1" font-weight="bold" font-size="11">تحية: تخطي</text>
+  <text x="75" y="112" text-anchor="middle" fill="#5fe3a1" font-size="11">الكل → رد واحد</text>
+  <text x="75" y="130" text-anchor="middle" fill="#5fe3a1" font-size="11">succeeded فوراً</text>
+  <line x1="810" y1="105" x2="760" y2="105" stroke="#93a0b8" stroke-width="2"/>
+  <line x1="610" y1="105" x2="560" y2="105" stroke="#93a0b8" stroke-width="2"/>
+  <line x1="410" y1="105" x2="360" y2="105" stroke="#93a0b8" stroke-width="2"/>
+  <line x1="180" y1="105" x2="130" y2="105" stroke="#4cc38a" stroke-width="2" stroke-dasharray="5,4"/>
+  <text x="500" y="30" text-anchor="middle" fill="#93a0b8">كل مرحلة تُحفظ في DB أولاً (لا نجاح وهمي) — orchestration/ceo.py</text>
+  <text x="500" y="185" text-anchor="middle" fill="#93a0b8">التكرار خلال 10 دقائق يرجع نفس الـ mission (idempotency) — لهذا رأيت 05cf3770 مرتين</text>
+</svg>
+</div>
+
+<h2>4) أين تضغط لتتأكد أن الكود الجديد هو الشغال؟</h2>
+<div class="card">
+<table>
+  <tr><th>الحالة</th><th>المعنى</th><th>العلاج</th></tr>
+  <tr>
+    <td>تشغّل <span class="tag t-info">AgentOS.exe</span> المجمّدة</td>
+    <td>الباكند داخلها نسخة PyInstaller قديمة — تعديلات السورس لا تصلها أبداً</td>
+    <td>أعد البناء: <code>pyinstaller\build-backend.ps1</code> ثم <code>npm run desktop:dist</code> <span class="tag t-warn">الأكيد</span></td>
+  </tr>
+  <tr>
+    <td>تشغّل الباكند من السورس</td>
+    <td>عملية python قديمة ما زالت شغالة بالكود القديم</td>
+    <td>اقتلها وأعد التشغيل من <code>D:\AgentOS</code> — التعديل يُقرأ عند بدء العملية فقط</td>
+  </tr>
+  <tr>
+    <td>تريد إثباتاً سريعاً</td>
+    <td>تحية عبر API يجب أن ترجع مهمة واحدة ناجحة فوراً</td>
+    <td><code>POST /api/missions {"objective":"عامل ايه"}</code> ← يجب: <code>tasks: 1</code> و <code>task_key: greeting_reply</code></td>
+  </tr>
+</table>
+</div>
+
+<h2>5) الملفات المسؤولة (أين تصلّح ماذا)</h2>
+<div class="card">
+<table>
+  <tr><th>تريد…</th><th>الملف</th><th>السطر/الدالة</th></tr>
+  <tr><td>نبرة رد الشات المباشر</td><td><code>backend/app/api/routes/chat.py</code></td><td><code>_handle_consultation</code> — قالب الـ prompt</td></tr>
+  <tr><td>شخصية المدير العام</td><td><code>backend/app/db/repository.py</code></td><td>بروفايل <code>custom</code> + ترقية <code>_LEGACY_GM_INSTRUCTIONS</code></td></tr>
+  <tr><td>قائمة التحيات المستثناة</td><td><code>backend/app/api/routes/missions.py</code></td><td><code>_GREETING_OBJECTIVES</code> / <code>is_greeting_objective</code></td></tr>
+  <tr><td>ترجمة سيشن SDK القديم ↔ الجديد</td><td><code>backend/app/runtime/opencode_runtime.py</code></td><td><code>request_api</code> / <code>_prompt_and_wait</code> (polling)</td></tr>
+  <tr><td>من يتصل بماذا في الواجهة</td><td><code>frontend/src/App.tsx</code> + <code>frontend/src/api/opencode.ts</code></td><td><code>handleSendMessage</code> / <code>sendOpenCodeMessage</code></td></tr>
+</table>
+</div>
+
+<div class="foot">وُلّد من السورس الحالي (D:\AgentOS) — يعمل offline بالكامل. حدّثه مع أي تغيير معماري.</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,72 @@
+/** @type {import('tailwindcss').Config} */
+const neutrals = {
+  50: '#f4f4f4',
+  100: '#eeeeee',
+  200: '#e2e2e2',
+  300: '#d0d0d0',
+  400: '#b4b4b4',
+  500: '#8e8e8e',
+  600: '#707070',
+  700: '#444444',
+  800: '#383838',
+  850: '#303030',
+  900: '#252525',
+  950: '#212121',
+};
+
+const accent = {
+  50: '#fafafa',
+  100: '#f4f4f5',
+  200: '#e4e4e7',
+  300: '#d4d4d8',
+  400: '#a1a1aa',
+  500: '#8a8a93',
+  600: '#71717a',
+  700: '#52525b',
+  800: '#3f3f46',
+  900: '#27272a',
+  950: '#18181b',
+};
+
+export default {
+  content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  theme: {
+    colors: {
+      transparent: 'transparent',
+      current: 'currentColor',
+      white: '#f4f4f4',
+      black: '#171717',
+      gray: neutrals,
+      slate: neutrals,
+      zinc: neutrals,
+      neutral: neutrals,
+      stone: neutrals,
+      indigo: accent,
+      blue: accent,
+      cyan: accent,
+      teal: accent,
+      emerald: accent,
+      green: accent,
+      lime: accent,
+      yellow: accent,
+      amber: accent,
+      orange: accent,
+      red: accent,
+      rose: accent,
+      pink: accent,
+      fuchsia: accent,
+      purple: accent,
+      violet: accent,
+      background: '#121214',
+      card: '#27272a',
+      border: '#3f3f46',
+      primary: accent,
+    },
+    extend: {
+      fontFamily: {
+        sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+      },
+    },
+  },
+  plugins: [],
+};
