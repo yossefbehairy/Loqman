@@ -8,6 +8,9 @@ import type {
   AgentProfile,
   ManagerConsultationResponse,
   MissionOut,
+  CeoAskResponse,
+  CeoAction,
+  CeoActionStatus,
 } from '../types';
 
 /**
@@ -151,4 +154,32 @@ export const cancelMission = (id: string) =>
   request<MissionOut>(`/missions/${id}/cancel`, { method: 'POST' });
 
 export const missionEventsUrl = (id: string) => `${API_BASE}/missions/${id}/events`;
+
+// CEO control plane — ask (read-only reasoning loop) + approval-gated actions.
+// Decide endpoints REQUIRE the local confirmation header; without it the
+// backend refuses with 403 (external callers cannot auto-approve proposals).
+export const askCeo = (question: string, modelId?: string, variant?: string) =>
+  request<CeoAskResponse>('/ceo/ask', {
+    method: 'POST',
+    body: JSON.stringify({
+      question,
+      ...(modelId ? { model_id: modelId } : {}),
+      ...(variant ? { variant } : {}),
+    }),
+  });
+
+export const listCeoActions = (status: CeoActionStatus = 'pending') =>
+  request<CeoAction[]>(`/ceo/actions?status=${status}`);
+
+export const approveCeoAction = (id: string) =>
+  request<CeoAction>(`/ceo/actions/${encodeURIComponent(id)}/approve`, {
+    method: 'POST',
+    headers: { 'X-AgentOS-Confirm': 'true' },
+  });
+
+export const denyCeoAction = (id: string) =>
+  request<CeoAction>(`/ceo/actions/${encodeURIComponent(id)}/deny`, {
+    method: 'POST',
+    headers: { 'X-AgentOS-Confirm': 'true' },
+  });
 

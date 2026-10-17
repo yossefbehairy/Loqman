@@ -9,20 +9,22 @@ POST /api/ceo/actions/{id}/approve|deny
     - only pending actions transition; anything else is 409 (no double execution).
     - approve for update_contract rechecks expected_updated_at (optimistic
       concurrency): a newer contract edit wins, the proposal fails instead.
+    - approve for new_profile / new_team creates profiles (a team is created
+      atomically: full validation happens before the first write).
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.db.models import PendingAction
+from backend.app.db.models import AgentProfile, PendingAction
 from backend.app.db.repository import AgentProfileRepository
 from backend.app.db.session import get_db
 from backend.app.engine.events import event_hub
@@ -52,6 +54,12 @@ class AskResponse(BaseModel):
     iterations: int
 
 
+class CreatedProfileOut(BaseModel):
+    id: str
+    name: str
+    role_type: str
+
+
 class ActionOut(BaseModel):
     id: str
     kind: str
@@ -60,9 +68,18 @@ class ActionOut(BaseModel):
     created_by: Optional[str] = None
     decided_at: Optional[str] = None
     decision_note: Optional[str] = None
+    # Populated on approval so the UI can materialize the executed hire/team
+    # locally without a second lookup. Informational only: the DB is the source
+    # of truth and list/deny/failed responses keep the empty defaults.
+    created_profiles: List[CreatedProfileOut] = Field(default_factory=list)
+    team_name: Optional[str] = None
 
 
-def _action_to_out(a: PendingAction) -> ActionOut:
+def _action_to_out(
+    a: PendingAction,
+    created_profiles: Optional[List[CreatedProfileOut]] = None,
+    team_name: Optional[str] = None,
+) -> ActionOut:
     return ActionOut(
         id=a.id,
         kind=a.kind,
@@ -71,6 +88,8 @@ def _action_to_out(a: PendingAction) -> ActionOut:
         created_by=a.created_by,
         decided_at=a.decided_at.isoformat() if a.decided_at else None,
         decision_note=a.decision_note,
+        created_profiles=created_profiles or [],
+        team_name=team_name,
     )
 
 
@@ -162,12 +181,22 @@ def _decide(action_id: str, approve: bool, note: Optional[str],
         return _action_to_out(action)
 
     # Approve: execute via the existing repositories (no duplicated validation).
+    created_profiles: List[CreatedProfileOut] = []
+    team_name: Optional[str] = None
     try:
         payload = json.loads(action.payload_json or "{}")
         if action.kind == "update_contract":
             _apply_update_contract(db, payload)
         elif action.kind == "new_profile":
-            _apply_new_profile(db, payload)
+            prof = _apply_new_profile(db, payload)
+            created_profiles = [CreatedProfileOut(
+                id=prof.id, name=prof.name, role_type=prof.role_type)]
+        elif action.kind == "new_team":
+            rows, team_name = _apply_new_team(db, payload)
+            created_profiles = [
+                CreatedProfileOut(id=p.id, name=p.name, role_type=p.role_type)
+                for p in rows
+            ]
         else:
             raise ValueError(f"Unknown action kind '{action.kind}'.")
     except HTTPException:
@@ -184,7 +213,7 @@ def _decide(action_id: str, approve: bool, note: Optional[str],
     action.decision_note = note
     db.commit()
     db.refresh(action)
-    return _action_to_out(action)
+    return _action_to_out(action, created_profiles=created_profiles, team_name=team_name)
 
 
 def _apply_update_contract(db: Session, payload: Dict[str, Any]) -> None:
@@ -215,7 +244,7 @@ def _apply_update_contract(db: Session, payload: Dict[str, Any]) -> None:
     repo.update(prof.id, **changes)
 
 
-def _apply_new_profile(db: Session, payload: Dict[str, Any]) -> None:
+def _apply_new_profile(db: Session, payload: Dict[str, Any]) -> AgentProfile:
     from backend.app.orchestration.ceo_tools import KNOWN_ROLES  # noqa
 
     repo = AgentProfileRepository(db)
@@ -234,7 +263,60 @@ def _apply_new_profile(db: Session, payload: Dict[str, Any]) -> None:
     }
     if not data["name"] or not data["instructions"]:
         raise ValueError("New profile requires name and instructions.")
-    repo.create(data)
+    return repo.create(data)
+
+
+def _apply_new_team(db: Session, payload: Dict[str, Any]) -> Tuple[List[AgentProfile], str]:
+    """Create all team member profiles in one decision.
+
+    Partial-failure semantics: the WHOLE batch is validated (team name,
+    1..8 members, known role, name + instructions per member) BEFORE the
+    first write, so invalid proposals fail with zero profiles created.
+    If an unexpected DB error still hits midway, already-created members
+    are deleted before re-raising — a failed team leaves no zombie rows.
+    """
+    from backend.app.orchestration.ceo_tools import KNOWN_ROLES  # noqa
+
+    team_name = str(payload.get("name") or "").strip()
+    if not team_name:
+        raise ValueError("New team requires a name.")
+    members = payload.get("members")
+    if not isinstance(members, list) or not (1 <= len(members) <= 8):
+        raise ValueError("New team requires 1..8 members.")
+    planned: List[Dict[str, Any]] = []
+    for i, member in enumerate(members, start=1):
+        if not isinstance(member, dict):
+            raise ValueError(f"Team member #{i} must be an object.")
+        role = str(member.get("role_type", "")).strip().lower()
+        if role not in KNOWN_ROLES:
+            raise ValueError(f"Team member #{i} has unknown role '{member.get('role_type')}'.")
+        name = str(member.get("name") or "").strip()
+        if not name or not member.get("instructions"):
+            raise ValueError(f"Team member #{i} requires name and instructions.")
+        planned.append({
+            "name": name,
+            "role_type": role,
+            "description": member.get("description"),
+            "instructions": member.get("instructions"),
+            "default_model_id": member.get("default_model_id"),
+            "default_variant_id": member.get("default_variant_id"),
+        })
+    import uuid as _uuid
+    repo = AgentProfileRepository(db)
+    created = []
+    try:
+        for member_data in planned:
+            created.append(repo.create({
+                "id": f"custom-{_uuid.uuid4().hex[:8]}",
+                **member_data,
+            }))
+    except Exception:
+        # Best-effort cleanup: a failed team must not leave partial members.
+        for prof in created:
+            db.delete(prof)
+        db.commit()
+        raise
+    return created, team_name
 
 
 @router.post("/actions/{action_id}/approve", response_model=ActionOut)

@@ -7,28 +7,35 @@
 ![Node: 22](https://img.shields.io/badge/node-22-green.svg)
 
 > **AgentOS** engine, published under the **Loqman** repository.
-> تطبيق ديسكتوب يعمل محليًا بالكامل لتنسيق وكلاء ذكاء اصطناعي عبر محادثة تنفيذية، عقود حوكمة، خريطة تفاعلية، وبث جماعي — مع FastAPI + React + Electron.
+> تطبيق ديسكتوب يعمل محليًا بالكامل لتنسيق وكلاء ذكاء اصطناعي عبر محادثة تنفيذية، عقود حوكمة، خريطة تفاعلية، بث جماعي، ولوحة تحكم CEO — مع FastAPI + React + Electron.
 
 **English:** Local-first desktop studio to coordinate specialized AI agents across
 departments (Planning, Research, QA) — chat with managers, enforce execution
-contracts, watch live telemetry on an agent map, and audit multi-turn handovers.
+contracts, explore a live Company graph (physics map + org chart), audit multi-turn
+handovers, and steer the team through an approval-gated CEO control plane.
 No cloud lock-in: SQLite locally, free-model-only runtime, frozen offline installer.
 
 ---
 
 ## ✨ المميزات | Features
 
-- **Executive Chat (R1):** محادثة بأسلوب Grok/ChatGPT مع pill لاختيار المدير
-  (General Manager / د. سارة / م. طارق / أ. ياسمين) وتنقل جانبي من 5 views.
-- **Company & Contracts (R2/R3):** هيكل إدارات هرمي + شارات (👑 Manager / 💼 Specialist)
-  + دعم أسماء عربية طبيعية + تعديل System Prompt وعقد التنفيذ
+- **Executive Workspace (R1):** شاشة افتتاحية **Company** (رسم تفاعلي + Org chart)
+  + محادثات مباشرة مع المديرين والموظفين (اختيار الوكيل، اقتراحات، وتفويض مهام
+  حقيقي بتتبعه حتى التسليم).
+- **Company & Contracts (R2/R3):** هيكل إدارات هرمي + شارات (Manager / Executive /
+  Specialist) + دعم أسماء عربية طبيعية + تعديل System Prompt وعقد التنفيذ
   (strict JSON, retries 1–3, timeout, موديلات مجانية فقط).
-- **Interactive Agent Map (R4):** مناطق أقسام مرئية + halos نابضة للحالة
-  (`running` / `completed` بالمللي ثانية / `error`) + Contract Card عند الضغط.
-- **Team Chat Stream (R5):** فيد زمني بأسلوب Slack/Discord للـ handovers
-  (تفويض → تسليم → مراجعة) + JSON قابل للتوسيع + SSE حي.
-- **Studio (Legacy):** DAG canvas بخمس عقد، تحقق طوبولوجي، تنفيذ + SSE drawer،
-  سجل تنفيذ SQLite.
+- **Interactive Agent Map (R4):** رسم فيزيائي تفاعلي للشركة (Obsidian-style)
+  + Org chart بديل + chips للأقسام + فحص المهام ومددها (ms) + Contract Card.
+- **Team Chat Stream (R5):** فيد زمني بأسلوب Slack/Discord للـ handovers الحقيقية
+  (تفويض → تسليم → مراجعة) مسجّلة من المهام الفعلية + JSON قابل للتوسيع +
+  تحديث حي أثناء التنفيذ.
+- **Studio (Legacy):** DAG canvas بخمس عقد، تحقق طوبولوجي (Kahn)، تنفيذ حقيقي +
+  live team-chat drawer، سجل تنفيذ SQLite، و Inspector/Role Library.
+- **CEO Control Plane:** اسأل الـ CEO → رد من بيانات حقيقية (missions/profiles/
+  contracts) + مقترحات كتابة محكومة (عقد / موظف / **فريق كامل**) لا تُنفَّذ إلا
+  بموافقة صريحة (approve/deny بهيدر تأكيد محلي) — وصفحة CEO أول عناصر الـ nav؛
+  الفريق المعتمد يظهر فورًا في شاشة الشركة.
 - **Desktop:** Electron + PyInstaller sidecar (`agentos-backend.exe`) — تشغيل بدون
   Python/Node على جهاز المستخدم، بورت ديناميكي، SQLite في `%APPDATA%\AgentOS`.
 - **Free-model guardrails:** الكتالوج الحي هو المرجع؛ أي موديل غير مؤكد
@@ -55,7 +62,7 @@ Runtime:
 | Backend | FastAPI, SQLAlchemy (SQLite WAL), Pydantic v2, SSE (`sse-starlette`), pytest |
 | Frontend | React 19, Vite, Tailwind, xyflow, Electron 44 |
 | Runtime | OpenCode CLI transport (`opencode api …`) + deterministic `MockRuntime` للاختبارات |
-| Tests | pytest (backend) + Playwright Chromium (frontend E2E R1–R5 + Studio) |
+| Tests | pytest (backend) + Playwright Chromium (E2E: R1–R5 + Studio + CEO) |
 
 ## 📁 هيكل المشروع | Structure
 
@@ -66,18 +73,18 @@ backend/
     core/            # lifecycle (crash recovery)
     db/              # session, models, repository (+ seed 10 profiles)
     engine/          # executor, state_machine, validator, context, events
-    orchestration/   # ceo, planner, agent_loop
+    orchestration/   # ceo, ceo_tools, planner, agent_loop
     runtime/         # opencode_runtime (real), mock_runtime (tests), base, errors
     config.py cli.py main.py
-  tests/             # 20+ pytest suites
+  tests/             # 21 pytest suites (143 tests)
   requirements.txt
 frontend/
   src/
     api/             # client.ts (single API entry) + opencode.ts
-    components/      # chat, company, map, stream, canvas, inspector, settings…
+    components/      # ceo, company, conversations, inbox, stream, canvas, studio, settings…
     data/ types/ utils/
   electron/          # main.cjs, preload.cjs, splash.html
-  e2e/               # r1..r5 + studio specs
+  e2e/               # r1..r5 + studio + ceo specs (47 tests, mock runtime)
   vite.config.ts (base './' — لا تحذفها، مطلوبة لـ file://)
 pyinstaller/         # build-backend.ps1, smoke-test.ps1
 docs/                # architecture.html, ceo-control-plan.md
@@ -153,7 +160,7 @@ npm run desktop:dist   # release/AgentOS-Setup-<version>.exe
 ## ✅ الاختبارات | Testing
 
 ```powershell
-# Backend (48 test)
+# Backend (143 test)
 backend\.venv\Scripts\pytest.exe backend\tests -v
 
 # Frontend typecheck + lint + build
@@ -162,13 +169,15 @@ npx tsc -b
 npm run lint
 npm run build
 
-# E2E (26 test, Chromium)
+# E2E (47 test, Chromium — mock runtime)
 npx playwright test
 # ملف واحد: npx playwright test e2e/r1_executive_chat.spec.ts
 ```
 
 التفاصيل: `TEST_INFRA.md` (هرم الـ 5 tiers + مصفوفة R1–R5) و `TEST_READY.md`
 (أوامر التشغيل لكل milestone). البوابة: **100% pass** قبل أي release.
+CI (`.github/workflows/ci.yml`): backend pytest + frontend tsc/lint/build + Playwright
+E2E (mock runtime) + secrets scan.
 
 ## 🔒 الأمان | Security
 

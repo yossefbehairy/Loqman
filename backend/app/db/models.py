@@ -36,7 +36,7 @@ class PendingAction(Base):
     __tablename__ = "pending_actions"
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
-    # e.g. "update_contract" | "new_profile".
+    # e.g. "update_contract" | "new_profile" | "new_team".
     kind = Column(String(64), nullable=False, index=True)
     # Proposed data + expected_updated_at of the target row (optimistic concurrency).
     payload_json = Column(Text, nullable=False, default="{}")

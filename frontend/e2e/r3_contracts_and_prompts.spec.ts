@@ -1,130 +1,146 @@
 import { test, expect, type Page } from '@playwright/test';
+import { DEPARTMENTS, createTeam, gotoCompany, switchCompanyView, teamChip } from './helpers';
 
-async function navigateToCompanyContracts(page: Page) {
-  await page.goto('/');
-  const companyNav = page.locator('[data-nav="company"], button:has-text("الشركة والعقود"), button:has-text("Company & Contracts"), button:has-text("إدارات الشركة"), button:has-text("Company")').first();
-  await companyNav.waitFor({ state: 'visible', timeout: 10000 });
-  await companyNav.click();
-  await page.waitForTimeout(300);
+/**
+ * R3: Custom System Prompts & Strict Execution Contracts.
+ *
+ * The former "Company & Contracts" view is now the Company view; execution
+ * contracts are edited from the detail inspector's Contract modal. The
+ * retry bound ("max attempts") lives in Settings as "Retries on failure".
+ */
+async function openManagerContract(page: Page): Promise<void> {
+  await gotoCompany(page);
+  const planning = DEPARTMENTS.planning;
+  await createTeam(page, planning.name, planning.manager, planning.managerRole);
+  await switchCompanyView(page, 'org');
+  await page.getByRole('button', { name: /د\. سارة/ }).first().click();
+  await page.getByRole('button', { name: 'Edit contract' }).click();
+  await expect(page.getByRole('heading', { name: 'Edit Contract' })).toBeVisible();
+}
+
+function contractModal(page: Page) {
+  return page.locator('div.fixed:has(h3:has-text("Edit Contract"))');
 }
 
 test.describe('R3: Custom System Prompts & Strict Execution Contracts', () => {
-  test('"Company & Contracts" view renders department members and their execution contracts', async ({
-    page,
-  }) => {
-    await navigateToCompanyContracts(page);
+  test('Company view renders department members and their execution contracts', async ({ page }) => {
+    await gotoCompany(page);
+    const planning = DEPARTMENTS.planning;
+    await createTeam(page, planning.name, planning.manager, planning.managerRole);
 
-    // Verify view container
-    await expect(page.locator('text=/Company & Contracts|إدارات الشركة|Contracts/i').first()).toBeVisible();
+    // Verify the department desk and its member are rendered
+    await expect(teamChip(page, 'Planning & Strategy')).toBeVisible();
+    await switchCompanyView(page, 'org');
+    await page.getByRole('button', { name: /د\. سارة/ }).first().click();
 
-    // Verify member cards or table rows exist
-    const editContractBtns = page.locator('button:has-text("Edit Contract"), button:has-text("Edit"), button:has-text("تعديل العقد"), [data-action="edit-contract"]');
-    await expect(editContractBtns.first()).toBeVisible();
-    const count = await editContractBtns.count();
-    expect(count).toBeGreaterThanOrEqual(1);
+    // Execution contract surface: inspector metadata + Edit contract action
+    const panel = page.locator('main aside.os-card');
+    await expect(panel.getByText('Model', { exact: true })).toBeVisible();
+    await expect(panel.getByText('System Prompt', { exact: true })).toBeVisible();
+    const editContractBtn = page.getByRole('button', { name: 'Edit contract' });
+    await expect(editContractBtn).toBeVisible();
+
+    // The contract editor exposes the member's contract values
+    await editContractBtn.click();
+    await expect(page.getByRole('heading', { name: 'Edit Contract' })).toBeVisible();
+    await expect(page.getByPlaceholder('e.g. Layla Haddad...')).toHaveValue('د. سارة');
+    await expect(page.getByPlaceholder('e.g. Planning Specialist, Risk Analyst...')).toHaveValue(
+      'مدير التخطيط والإستراتيجية'
+    );
   });
 
   test('Editing System Prompt for a persona persists instructions', async ({ page }) => {
-    await navigateToCompanyContracts(page);
-
-    // Click the first Edit Contract button or member card
-    const editBtn = page.locator('button:has-text("Edit Contract"), button:has-text("Edit"), button:has-text("تعديل العقد"), [data-action="edit-contract"]').first();
-    await editBtn.click();
-
-    // Verify Contract Editor modal is visible
-    const modal = page.locator('[role="dialog"], .contract-modal, [data-testid="contract-editor-modal"]').first();
-    await expect(modal).toBeVisible();
+    await openManagerContract(page);
 
     // Locate System Prompt textarea
-    const promptTextarea = modal.locator('textarea[name="instructions"], textarea[name="system_prompt"], textarea').first();
+    const promptTextarea = page.getByPlaceholder(
+      'Instructions and operating boundaries for this employee...'
+    );
     await expect(promptTextarea).toBeVisible();
 
     // Modify prompt
-    const customPrompt = 'You are an elite AI director. Ensure all milestones are strictly verified and conform to enterprise security protocols.';
+    const customPrompt =
+      'You are an elite AI director. Ensure all milestones are strictly verified and conform to enterprise security protocols.';
     await promptTextarea.fill(customPrompt);
 
     // Click Save
-    const saveBtn = modal.locator('button:has-text("Save"), button:has-text("حفظ"), button[type="submit"]').first();
-    await saveBtn.click();
+    await page.getByRole('button', { name: 'Save contract' }).click();
+    await expect(page.getByRole('heading', { name: 'Edit Contract' })).not.toBeVisible();
+    await expect(page.getByRole('status')).toContainText('Contract updated successfully');
 
-    // Verify modal closes
-    await expect(modal).not.toBeVisible({ timeout: 5000 });
+    // Reopen the contract and verify the custom instructions persisted
+    await page.getByRole('button', { name: 'Edit contract' }).click();
+    await expect(page.getByRole('heading', { name: 'Edit Contract' })).toBeVisible();
+    await expect(promptTextarea).toHaveValue(customPrompt);
   });
 
   test('Editing Execution Contract: strict JSON format, max attempts bound, timeout limit', async ({
     page,
   }) => {
-    await navigateToCompanyContracts(page);
+    await openManagerContract(page);
+    const modal = contractModal(page);
 
-    // Open contract editor
-    const editBtn = page.locator('button:has-text("Edit Contract"), button:has-text("Edit"), button:has-text("تعديل العقد"), [data-action="edit-contract"]').first();
-    await editBtn.click();
+    // 1. Strict JSON Format select
+    const strictJson = modal.locator('div:has(> label:text-is("Strict JSON Output")) > select');
+    await expect(strictJson).toBeVisible();
+    await expect(strictJson).toHaveValue('yes');
+    await strictJson.selectOption('no');
 
-    const modal = page.locator('[role="dialog"], .contract-modal, [data-testid="contract-editor-modal"]').first();
-    await expect(modal).toBeVisible();
-
-    // 1. Strict JSON Format checkbox / switch
-    const strictJsonToggle = modal.locator('input[type="checkbox"], [data-testid="strict-json-toggle"], label:has-text("Strict JSON")').first();
-    if (await strictJsonToggle.isVisible()) {
-      if (await strictJsonToggle.isEnabled()) {
-        await strictJsonToggle.check().catch(() => strictJsonToggle.click());
-      }
-    }
-
-    // 2. Maximum Attempts Bound (1-3)
-    const attemptsInput = modal.locator('input[name="max_retries"], input[name="max_attempts"], input[type="number"]').first();
-    if (await attemptsInput.isVisible()) {
-      await attemptsInput.fill('2');
-    }
-
-    // 3. Timeout Limit (e.g. 10 - 300 seconds)
-    const timeoutInput = modal.locator('input[name="timeout"], input[name="timeout_seconds"], input[type="number"]').nth(1);
-    if (await timeoutInput.isVisible()) {
-      await timeoutInput.fill('90');
-    }
+    // 2. Timeout Limit (seconds)
+    const timeoutInput = modal.locator('div:has(> label:text-is("Timeout (seconds)")) > input');
+    await expect(timeoutInput).toBeVisible();
+    await timeoutInput.fill('90');
 
     // Save Contract
-    const saveBtn = modal.locator('button:has-text("Save"), button:has-text("حفظ"), button[type="submit"]').first();
-    await saveBtn.click();
-    await expect(modal).not.toBeVisible({ timeout: 5000 });
+    await modal.getByRole('button', { name: 'Save contract' }).click();
+    await expect(page.getByRole('heading', { name: 'Edit Contract' })).not.toBeVisible();
+
+    // Reopen to verify both values persisted
+    await page.getByRole('button', { name: 'Edit contract' }).click();
+    await expect(page.getByRole('heading', { name: 'Edit Contract' })).toBeVisible();
+    await expect(strictJson).toHaveValue('no');
+    await expect(timeoutInput).toHaveValue('90');
+    await modal.getByRole('button', { name: 'Cancel' }).click();
+    await expect(page.getByRole('heading', { name: 'Edit Contract' })).not.toBeVisible();
+
+    // 3. Maximum attempts bound lives in Settings as "Retries on failure"
+    await page.goto('/#settings');
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    const retriesInput = page.locator('div:has(> div > b:text-is("Retries on failure")) > input');
+    await expect(retriesInput).toBeVisible();
+    await expect(retriesInput).toHaveAttribute('min', '0');
+    await expect(retriesInput).toHaveAttribute('max', '5');
+    await retriesInput.fill('3');
+    await expect(retriesInput).toHaveValue('3');
   });
 
   test('Zero-cost verified models in dropdown with reasoning variants (low, high, max)', async ({
     page,
   }) => {
-    await navigateToCompanyContracts(page);
+    await openManagerContract(page);
+    const modal = contractModal(page);
 
-    // Open contract editor
-    const editBtn = page.locator('button:has-text("Edit Contract"), button:has-text("Edit"), button:has-text("تعديل العقد"), [data-action="edit-contract"]').first();
-    await editBtn.click();
-
-    const modal = page.locator('[role="dialog"], .contract-modal, [data-testid="contract-editor-modal"]').first();
-    await expect(modal).toBeVisible();
-
-    // Verify model select contains DeepSeek Free and Muse Spark options
-    const modelSelect = modal.locator('select').first();
+    // Verify model select contains the free DeepSeek and Muse Spark options
+    const modelSelect = modal.locator('div:has(> label:text-is("Model")) > select');
     await expect(modelSelect).toBeVisible();
+    await expect(modelSelect.locator('option[value="deepseek-v4.1-flash-free"]')).toBeAttached();
+    await expect(modelSelect.locator('option[value="muse-spark-1.3-contributor-free"]')).toBeAttached();
 
-    // Select DeepSeek free model
-    await modelSelect.selectOption({ value: 'deepseek-v4.1-flash-free' });
+    // Select the DeepSeek free model
+    await modelSelect.selectOption('deepseek-v4.1-flash-free');
+    await expect(modelSelect).toHaveValue('deepseek-v4.1-flash-free');
 
-    // Verify Reasoning Variants selector exists
-    const variantSelect = modal.locator('select').nth(1);
-    if (await variantSelect.isVisible()) {
-      await expect(variantSelect.locator('option[value="low"]')).toBeAttached();
-      await expect(variantSelect.locator('option[value="high"]')).toBeAttached();
-      await expect(variantSelect.locator('option[value="max"]')).toBeAttached();
+    // Verify reasoning variants and choose 'max'
+    const variantSelect = modal.locator('div:has(> label:text-is("Reasoning")) > select');
+    await expect(variantSelect).toBeVisible();
+    await expect(variantSelect.locator('option[value="low"]')).toBeAttached();
+    await expect(variantSelect.locator('option[value="high"]')).toBeAttached();
+    await expect(variantSelect.locator('option[value="max"]')).toBeAttached();
+    await variantSelect.selectOption('max');
+    await expect(variantSelect).toHaveValue('max');
 
-      // Choose 'max' reasoning variant
-      await variantSelect.selectOption('max');
-    }
-
-    // Cancel or close modal
-    const closeBtn = modal.locator('button:has-text("Cancel"), button:has-text("Close"), button:has-text("إلغاء")').first();
-    if (await closeBtn.isVisible()) {
-      await closeBtn.click();
-    } else {
-      await page.keyboard.press('Escape');
-    }
+    // Cancel without saving
+    await modal.getByRole('button', { name: 'Cancel' }).click();
+    await expect(page.getByRole('heading', { name: 'Edit Contract' })).not.toBeVisible();
   });
 });

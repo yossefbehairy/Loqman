@@ -60,6 +60,8 @@ export interface AgentProfile {
   description: string;
   instructions: string;
   task_depth: TaskDepth;
+  default_model_id?: string | null;
+  default_variant_id?: string | null;
 }
 
 export interface ValidationResult {
@@ -254,5 +256,45 @@ export interface MissionOut {
   created_at?: string;
   started_at?: string;
   finished_at?: string;
+}
+
+// ==========================================
+// CEO control plane — ask the CEO, approve proposals
+// ==========================================
+
+export type CeoActionKind = 'update_contract' | 'new_profile' | 'new_team';
+
+export type CeoActionStatus = 'pending' | 'approved' | 'denied' | 'failed';
+
+export interface CeoProposedAction {
+  id: string;
+  kind: CeoActionKind;
+  summary: string;
+}
+
+export interface CeoAskResponse {
+  reply: string;
+  actions_proposed: CeoProposedAction[];
+  iterations: number;
+}
+
+export interface CeoCreatedProfile {
+  id: string;
+  name: string;
+  role_type: string;
+}
+
+export interface CeoAction {
+  id: string;
+  kind: CeoActionKind;
+  summary: string;
+  status: CeoActionStatus;
+  created_by?: string | null;
+  decided_at?: string | null;
+  decision_note?: string | null;
+  /** Profiles really created by an approved new_profile/new_team action. */
+  created_profiles?: CeoCreatedProfile[];
+  /** Proposed team name for an approved new_team action. */
+  team_name?: string | null;
 }
 

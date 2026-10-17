@@ -128,18 +128,11 @@ async def _handle_consultation(
     clean_text = sanitize_model_output(result.text)
 
     reply: Optional[str] = None
-    suggested_mission: Optional[SuggestedMission] = None
 
     try:
         data = json.loads(clean_text)
         if isinstance(data, dict):
             reply = data.get("reply") or data.get("guidance") or data.get("summary")
-            raw_mission = data.get("suggested_mission")
-            if isinstance(raw_mission, dict) and "title" in raw_mission:
-                suggested_mission = SuggestedMission(
-                    title=raw_mission["title"],
-                    input_json=raw_mission.get("input_json", {})
-                )
     except Exception:
         pass
 

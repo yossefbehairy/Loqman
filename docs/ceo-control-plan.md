@@ -120,3 +120,18 @@ POST /api/ceo/actions/{id}/deny      → رفض مسجل
 | موديل مجاني يهلوس استدعاءات | سكيمة Pydantic صارمة + حد 6 دورات + كل نتيجة أداة حقيقية من DB (لا يخترع بيانات) |
 | نمو سياق الحلقة يبطئ الرد | excerpts مقطوعة (1500 حرف كالتلخيص الحالي) + حد الدورات |
 | كسر الـ 87 اختباراً | mock يُمدد لا يُعدل؛ عقود `/api/chat` و`/api/missions` untouched |
+
+---
+
+## 8) حالة التنفيذ (محدَّثة)
+
+| المرحلة | الحالة | الدليل |
+|---|---|---|
+| **P1 — اسأل الـ CEO (read-only)** | ✅ مكتمل | `orchestration/agent_loop.py` + `orchestration/ceo_tools.py` (4 أدوات قراءة) + `POST /api/ceo/ask` — `tests/test_ceo_ask.py` |
+| **P2 — اقتراح + تأكيد** | ✅ مكتمل | جدول `pending_actions` + approve/deny بهيدر `X-AgentOS-Confirm` (403 بدونه، 409 للتكرار، optimistic concurrency للعقود) + SSE `ceo.action.decided` — `tests/test_ceo_actions.py` |
+| **P3 — فرق بأمره** | ✅ مكتمل | دور `security_auditor` + أداة `propose_new_team` (1–8 أعضاء، سكيمة Pydantic، تحقق الباتش كامل قبل أول كتابة، صفر zombie rows) + approve ذري يرجع `created_profiles`/`team_name` + **واجهة CEO كاملة** (أول عنصر في الـ nav: Ask + صندوق موافقات بتأكيد داخل التطبيق) + **مادية الفريق في شاشة الشركة** (الاعتماد → Team + Agents مرتبطين بـ profileId) — `tests/test_ceo_team.py` + E2E `e2e/ceo_control_plane.spec.ts` |
+
+**ملاحظات:**
+- عقد `suggested_mission = None` لم يتغير. الاختبارات الـ 7 challenger القديمة التي كانت تؤكد العقد السابق تم تحديثها لتؤكد العقد الحالي (`is None`) بدل بقائها حمراء/مستبعدة — نفس القرار، اختبارات متسقة معه.
+- الإجمالي الآن: **143 اختبار backend** + **47 اختبار E2E** (9 ملفات، `RUNTIME_MODE=mock`) — كلها خضراء محليًا، وبوابة CI تشمل E2E.
+- "توحيد Team مع الفرونتند" نُفِّذ بدون نقل الفرق من `localStorage` إلى DB: الاعتماد يبني `Team` + `Agent` في حالة الفرونت (مربوطين بالـ `profileId` الحقيقي) فيظهرون فورًا في Company. النقل الكامل لـ DB يبقى خيارًا مستقبليًا لو احتجناه.

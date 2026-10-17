@@ -3,6 +3,7 @@ MockRuntime Implementation
 Provides deterministic, zero-cost AI responses for testing and offline demo fallback.
 """
 
+import re
 import time
 import json
 from typing import List, Optional
@@ -14,6 +15,25 @@ from backend.app.runtime.base import (
     ExecuteAgentTask,
     AgentResult,
 )
+
+# Team-creation phrasing (additive routing for the CEO tools mock branch).
+# Listing questions ("who is on the team?") must NOT match.
+_TEAM_CREATION_AR = (
+    "اعمل فريق", "أعمل فريق", "اعمللي فريق", "انشئ فريق", "أنشئ فريق",
+    "انشأ فريق", "كوّن فريق", "كون فريق", "شكّل فريق", "شكل فريق",
+    "أسس فريق", "فريق جديد", "فريق مراجعة أمنية", "فريق أمني", "فريق الأمن",
+)
+# English: a creation verb shortly before the noun "team"
+# ("create a security team"); "who is on the team?" never matches.
+_EN_TEAM_CREATION_RE = re.compile(
+    r"\b(create|build|form|make|start|assemble|set\s?up)\b[^.?!]{0,40}\bteam\b"
+)
+
+
+def _looks_like_team_creation(qtext: str) -> bool:
+    if any(marker in qtext for marker in _TEAM_CREATION_AR):
+        return True
+    return bool(_EN_TEAM_CREATION_RE.search(qtext.lower()))
 
 
 class MockRuntime:
@@ -140,6 +160,31 @@ class MockRuntime:
                                                    "args": {"name": "Nadia (نادية)",
                                                             "role": "researcher",
                                                             "instructions": "You are Nadia, research specialist."}}}
+                elif _looks_like_team_creation(_qtext):
+                    mock_envelope = {"tool_call": {"name": "propose_new_team",
+                                                   "args": {
+                                                       "name": "Security Review Team (فريق المراجعة الأمنية)",
+                                                       "members": [
+                                                           {"name": "Hassan (حسن)",
+                                                            "role_type": "security_auditor",
+                                                            "description": "Lead security auditor.",
+                                                            "instructions": "You are Hassan (حسن), Lead Security Auditor. "
+                                                                            "Audit artifacts for vulnerabilities and return STRICT JSON.",
+                                                            "default_variant_id": "high"},
+                                                           {"name": "Farida (فريدة)",
+                                                            "role_type": "reviewer",
+                                                            "description": "Compliance and quality reviewer.",
+                                                            "instructions": "You are Farida (فريدة), Compliance Reviewer. "
+                                                                            "Cross-check audit findings against policy and return STRICT JSON.",
+                                                            "default_variant_id": "high"},
+                                                           {"name": "Kareem (كريم)",
+                                                            "role_type": "analyst",
+                                                            "description": "Risk analyst for audit findings.",
+                                                            "instructions": "You are Kareem (كريم), Risk Analyst. "
+                                                                            "Quantify and prioritize audit risks and return STRICT JSON.",
+                                                            "default_variant_id": "max"},
+                                                       ],
+                                                   }}}
                 elif (any(w in q for w in _mission_words)):
                     mock_envelope = {"tool_call": {"name": "list_missions", "args": {"limit": 5}}}
                 elif ("profile" in q or "team" in q or "فريق" in _qtext

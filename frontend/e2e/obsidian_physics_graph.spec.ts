@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { createTeam } from './helpers';
 
 test.describe('Obsidian-Style Physics Graph (react-force-graph)', () => {
   test.beforeEach(async ({ page }) => {
@@ -77,6 +78,11 @@ test.describe('Obsidian-Style Physics Graph (react-force-graph)', () => {
   });
 
   test('should interact with department chips and highlight clusters', async ({ page }) => {
+    // The workspace starts clean — create two department desks so their
+    // focus chips exist.
+    await createTeam(page, 'Planning & Strategy', 'د. سارة', 'مدير التخطيط والإستراتيجية');
+    await createTeam(page, 'Research & Feasibility', 'م. طارق', 'مدير التحليل والمخاطر');
+
     // Click Planning & Strategy chip
     const planningChip = page.locator('button:has-text("Planning & Strategy")');
     await expect(planningChip).toBeVisible();

@@ -68,6 +68,20 @@ class ProposeNewProfileArgs(BaseModel):
     default_variant_id: Optional[str] = None
 
 
+class TeamMemberArgs(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    role_type: str = Field(min_length=1, max_length=64)
+    description: Optional[str] = None
+    instructions: str = Field(min_length=1)
+    default_model_id: Optional[str] = None
+    default_variant_id: Optional[str] = None
+
+
+class ProposeNewTeamArgs(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    members: List[TeamMemberArgs] = Field(min_length=1, max_length=8)
+
+
 # -- handlers (db: Session, args) -> observation str -------------------------
 
 def _handle_list_missions(db: Session, args: ListMissionsArgs) -> str:
@@ -184,6 +198,39 @@ def _handle_propose_new_profile(db: Session, args: ProposeNewProfileArgs) -> str
             f"Tell the user the proposal awaits approval.")
 
 
+def _handle_propose_new_team(db: Session, args: ProposeNewTeamArgs) -> str:
+    """Record a whole-team proposal. Never creates profiles inside the loop."""
+    unknown = sorted({m.role_type.strip().lower() for m in args.members} - KNOWN_ROLES)
+    if unknown:
+        return f"ERROR: unknown role(s) {unknown} — proposal NOT recorded."
+    members = [
+        {
+            "name": m.name.strip(),
+            "role_type": m.role_type.strip().lower(),
+            "description": m.description,
+            "instructions": m.instructions,
+            "default_model_id": m.default_model_id,
+            "default_variant_id": m.default_variant_id,
+        }
+        for m in args.members
+    ]
+    payload = {"name": args.name.strip(), "members": members}
+    roles = ", ".join(m["role_type"] for m in members)
+    action = PendingAction(
+        kind="new_team",
+        payload_json=json.dumps(payload, ensure_ascii=False),
+        summary=f"New team '{args.name.strip()}' with {len(members)} member(s): {roles}",
+        status="pending",
+        created_by="ceo-loop",
+    )
+    db.add(action)
+    db.commit()
+    db.refresh(action)
+    return (f"Proposal recorded with id={action.id} and status=pending. "
+            f"Do NOT call this tool again for the same team. "
+            f"Tell the user the proposal awaits approval.")
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -208,6 +255,10 @@ TOOLS: Dict[str, ToolSpec] = {
     "propose_new_profile": ToolSpec("propose_new_profile", "write", ProposeNewProfileArgs,
                                     _handle_propose_new_profile,
                                     "PROPOSAL ONLY — never executes. Records a new profile for approval."),
+    "propose_new_team": ToolSpec("propose_new_team", "write", ProposeNewTeamArgs,
+                                 _handle_propose_new_team,
+                                 "PROPOSAL ONLY — never executes. Records a new team of 1-8 member "
+                                 "profiles (name, role_type, instructions each) for approval."),
 }
 
 

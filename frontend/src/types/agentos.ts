@@ -1,4 +1,4 @@
-export type Page = 'company' | 'inbox' | 'conversations' | 'stream' | 'results' | 'calendar' | 'settings';
+export type Page = 'ceo' | 'company' | 'studio' | 'inbox' | 'conversations' | 'stream' | 'results' | 'calendar' | 'settings';
 
 export type CompanyViewMode = 'graph' | 'org';
 

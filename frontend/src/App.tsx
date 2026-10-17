@@ -13,6 +13,8 @@ import type {
   CameraState,
   Message,
   TaskDeliverable,
+  TeamTurn,
+  ModelReasoning,
 } from './types/agentos';
 import {
   INITIAL_TEAMS,
@@ -26,6 +28,8 @@ import {
   TEAM_COLORS,
 } from './data/agentosDefaults';
 import { CompanyView } from './components/company/CompanyView';
+import { CeoControlView } from './components/ceo/CeoControlView';
+import { StudioView } from './components/studio/StudioView';
 import { InboxView } from './components/inbox/InboxView';
 import { ConversationsView } from './components/conversations/ConversationsView';
 import { TeamStreamView } from './components/stream/TeamStreamView';
@@ -39,12 +43,14 @@ import { SourceModal } from './components/modals/SourceModal';
 import { TaskInspectionModal } from './components/modals/TaskInspectionModal';
 import {
   Building2,
+  Crown,
   Inbox,
   MessageSquare,
   BarChart3,
   Calendar,
   Settings,
   Radio,
+  Workflow,
 } from 'lucide-react';
 import { createDelegatedMission, createMission, getAgentProfiles, getFreeModels, getMission, getRuntimeHealth, createAgentProfile, deleteAgentProfile } from './api/client';
 import type { AgentProfile, MissionOut, ModelCatalogEntry, SuggestedMission } from './types';
@@ -65,11 +71,48 @@ function safeParse<T>(key: string, fallback: T): T {
   }
 }
 
+const REASONING_VALUES: ModelReasoning[] = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+];
+
+const isReasoning = (value: string | null | undefined): value is ModelReasoning =>
+  !!value && (REASONING_VALUES as string[]).includes(value);
+
+/** 'security_auditor' -> 'Security Auditor'; unknown values stay readable. */
+function humanizeRoleType(roleType: string): string {
+  const cleaned = roleType.replace(/[_-]+/g, ' ').trim();
+  if (!cleaned) return 'Specialist';
+  return cleaned.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+/**
+ * R5: the manager-side synthesis text of a finished mission, derived only from
+ * real mission data. `final_summary` is a plain string for CEO missions and
+ * `{ result }` for explicit delegations; anything else is serialized as-is.
+ * Returns null when the mission carries no summary (failed / cancelled).
+ */
+function missionSynthesisText(mission: MissionOut): string | null {
+  const summary = mission.final_summary;
+  if (summary === null || summary === undefined) return null;
+  if (typeof summary === 'string') {
+    return summary.trim() ? summary.slice(0, 1200) : null;
+  }
+  const result = (summary as { result?: unknown }).result;
+  const text = typeof result === 'string' ? result : JSON.stringify(summary);
+  return text.trim() ? text.slice(0, 1200) : null;
+}
+
 export function App() {
   // Navigation State
   const [page, setPage] = useState<Page>(() => {
     const hash = window.location.hash.replace('#', '') as Page;
-    const valid: Page[] = ['company', 'inbox', 'conversations', 'stream', 'results', 'calendar', 'settings'];
+    const valid: Page[] = ['ceo', 'company', 'studio', 'inbox', 'conversations', 'stream', 'results', 'calendar', 'settings'];
     return valid.includes(hash) ? hash : 'company';
   });
 
@@ -260,7 +303,7 @@ export function App() {
   useEffect(() => {
     const onHashChange = () => {
       const hash = window.location.hash.replace('#', '') as Page;
-      const valid: Page[] = ['company', 'inbox', 'conversations', 'stream', 'results', 'calendar', 'settings'];
+      const valid: Page[] = ['ceo', 'company', 'studio', 'inbox', 'conversations', 'stream', 'results', 'calendar', 'settings'];
       if (valid.includes(hash)) {
         setPage(hash);
       }
@@ -400,9 +443,182 @@ export function App() {
     []
   );
 
+  // ---- R5: real handover recording on the employee agents' `activeTask` ----
+  // Team Stream and the active-task inspector read `agent.activeTask.turns`;
+  // every recorded turn traces back to the live mission payload (no seeded data).
+
+  /** Turn 1 — record the delegation the moment it is dispatched to an employee. */
+  const recordDelegationStart = useCallback(
+    (
+      employeeAgentId: string,
+      manager: { name: string; role: string },
+      mission: { id: string; title: string },
+      instructions: string
+    ) => {
+      const time = nowTime();
+      setAgents((prev) =>
+        prev.map((agent) => {
+          if (agent.id !== employeeAgentId) return agent;
+          const team = teams.find((t) => t.id === agent.team);
+          const text = (instructions.trim() || mission.title).slice(0, 400);
+          const activeTask: TaskDeliverable = {
+            id: `deliv_${mission.id.slice(0, 8)}`,
+            title: mission.title.slice(0, 160),
+            agentId: agent.id,
+            agentName: agent.name,
+            department: team ? team.name : agent.role,
+            status: 'running',
+            summary: text,
+            fullJson: { mission_id: mission.id, delegated_by: manager.name, title: mission.title },
+            turns: [
+              {
+                turn: 1,
+                from: manager.name,
+                to: agent.name,
+                role: manager.role,
+                time,
+                text,
+                fullOutput: {
+                  mission_id: mission.id,
+                  delegated_by: manager.name,
+                  title: mission.title,
+                  instructions,
+                },
+              },
+            ],
+          };
+          return { ...agent, activeTask };
+        })
+      );
+    },
+    [teams]
+  );
+
+  /**
+   * Turns 1-3 — finalize each employee agent's recorded handover from the real
+   * terminal mission payload: the deliverable on success, the error text on
+   * failure/cancel, and the manager's synthesis as turn 3. One mission can fill
+   * several employees' ledgers (task `employee_role` → company employee agent).
+   */
+  const recordMissionHandover = useCallback(
+    (mission: MissionOut, managerName: string, managerRole: string, employeeAgentId?: string) => {
+      const time = nowTime();
+      const synthesis = missionSynthesisText(mission);
+      setAgents((prevAgents) => {
+        const employees = resolveCompanyEmployees(prevAgents, employeeProfiles);
+        const byRole = new Map<string, Agent>();
+        employees.forEach(({ agent, profile }) => {
+          byRole.set(profile.role_type.toLowerCase(), agent);
+          byRole.set(profile.id.toLowerCase(), agent);
+        });
+
+        const updated = new Map<string, TaskDeliverable>();
+        const currentTask = (agentId: string) =>
+          updated.get(agentId) ?? prevAgents.find((a) => a.id === agentId)?.activeTask;
+
+        for (const task of mission.tasks) {
+          const employee =
+            byRole.get((task.employee_role || '').toLowerCase()) ||
+            (employeeAgentId && mission.tasks.length === 1
+              ? prevAgents.find((a) => a.id === employeeAgentId)
+              : undefined);
+          if (!employee) continue;
+
+          const result = (task.output as any)?.result ?? task.output;
+          const succeeded = task.status === 'succeeded';
+          const errorText = String(task.error_message || mission.error_summary || '').trim();
+          const deliverableText = succeeded
+            ? String(
+                typeof result === 'object' && result !== null ? JSON.stringify(result) : result ?? 'No output'
+              ).slice(0, 220)
+            : String(errorText || `Task ${task.task_key} ended: ${task.status}`).slice(0, 300);
+
+          // Preserve the start-time Turn 1 when this mission already recorded its delegation.
+          const previous = currentTask(employee.id);
+          const sameMission =
+            !!previous &&
+            (previous.fullJson?.mission_id === mission.id ||
+              previous.id.startsWith(`deliv_${mission.id.slice(0, 8)}`));
+          const turns: TeamTurn[] = sameMission && previous ? [...previous.turns] : [];
+          const base = turns.length;
+          const deliverableId = `deliv_${mission.id.slice(0, 8)}_${task.task_key}`;
+
+          if (base === 0) {
+            turns.push({
+              turn: 1,
+              from: managerName,
+              to: employee.name,
+              role: managerRole,
+              time,
+              text: task.title,
+              fullOutput: { mission_id: mission.id, delegated_by: managerName, title: task.title },
+            });
+          }
+
+          const pairStart = Math.max(base, 1) + 1;
+          turns.push({
+            turn: pairStart,
+            from: employee.name,
+            to: managerName,
+            role: employee.role,
+            time,
+            text: deliverableText,
+            fullOutput:
+              succeeded && result && typeof result === 'object'
+                ? (result as Record<string, any>)
+                : undefined,
+          });
+          turns.push({
+            turn: pairStart + 1,
+            from: managerName,
+            to: employee.name,
+            role: managerRole,
+            time,
+            text:
+              synthesis ??
+              `Reviewed deliverable ${deliverableId}: ${task.status}${errorText ? ` — ${errorText}` : ''}`,
+            fullOutput:
+              mission.final_summary && typeof mission.final_summary === 'object'
+                ? (mission.final_summary as Record<string, any>)
+                : undefined,
+          });
+
+          const team = teams.find((t) => t.id === employee.team);
+          updated.set(employee.id, {
+            id: deliverableId,
+            title: task.title,
+            agentId: employee.id,
+            agentName: employee.name,
+            department: team ? team.name : employee.role,
+            status: task.status,
+            summary: deliverableText,
+            fullJson: succeeded
+              ? result && typeof result === 'object'
+                ? (result as Record<string, any>)
+                : { output: result ?? null }
+              : { status: task.status, error: errorText || null },
+            turns,
+          });
+        }
+
+        if (updated.size === 0) return prevAgents;
+        return prevAgents.map((agent) =>
+          updated.has(agent.id) ? { ...agent, activeTask: updated.get(agent.id)! } : agent
+        );
+      });
+    },
+    [employeeProfiles, teams]
+  );
+
   const pollMission = useCallback(
-    (missionId: string, agentId: string) => {
+    (
+      missionId: string,
+      agentId: string,
+      handover?: { managerName: string; managerRole: string; employeeAgentId?: string }
+    ) => {
       if (missionPollersRef.current[missionId]) return;
+      const managerName = handover?.managerName || 'CEO';
+      const managerRole = handover?.managerRole || 'CEO';
       const timer = window.setInterval(async () => {
         let m: MissionOut;
         try {
@@ -422,6 +638,8 @@ export function App() {
         }
         window.clearInterval(missionPollersRef.current[missionId]);
         delete missionPollersRef.current[missionId];
+        // R5: finalize the employees' recorded handover with the real outcome.
+        recordMissionHandover(m, managerName, managerRole, handover?.employeeAgentId);
         if (m.status === 'succeeded' || m.status === 'partially_succeeded') {
           const summaryText =
             typeof m.final_summary === 'string'
@@ -444,7 +662,7 @@ export function App() {
       }, 2500);
       missionPollersRef.current[missionId] = timer;
     },
-    [appendMessage, deliverMissionToInbox]
+    [appendMessage, deliverMissionToInbox, recordMissionHandover]
   );
 
   const handleSendMessage = useCallback(
@@ -465,6 +683,9 @@ export function App() {
         return;
       }
       if (roleEntry) {
+        const manager = agents.find((a) => a.id === agentId);
+        const managerName = manager?.name || 'CEO';
+        const managerRole = manager?.role || 'CEO';
         (async () => {
           try {
             const model = freeModels.find((item) => item.id === settings.defModel);
@@ -480,7 +701,17 @@ export function App() {
               variant,
             });
             appendMessage(agentId, `📋 Task ${mission.id.slice(0, 8)} assigned to ${roleEntry.agent.name}. Its result will appear in Inbox.`);
-            pollMission(mission.id, agentId);
+            recordDelegationStart(
+              roleEntry.agent.id,
+              { name: managerName, role: managerRole },
+              mission,
+              text
+            );
+            pollMission(mission.id, agentId, {
+              managerName,
+              managerRole,
+              employeeAgentId: roleEntry.agent.id,
+            });
           } catch (e: any) {
             appendMessage(agentId, `❌ Could not delegate task: ${e?.message || e}`);
           }
@@ -508,7 +739,7 @@ export function App() {
         }
       })();
     },
-    [appendAgentReply, appendMessage, agents, employeeProfiles, freeModels, pollMission, settings.defModel, settings.reason]
+    [appendAgentReply, appendMessage, agents, employeeProfiles, freeModels, pollMission, recordDelegationStart, settings.defModel, settings.reason]
   );
 
   const handleDelegateTask = useCallback(async (payload: {
@@ -517,8 +748,28 @@ export function App() {
   }) => {
     const mission = await createDelegatedMission({ ...payload, conversation_id: activeConvoId });
     appendMessage(activeConvoId, `📋 Employee task ${mission.id.slice(0, 8)} assigned to ${payload.employee_role}. The result will be available in Inbox.`);
-    pollMission(mission.id, activeConvoId);
-  }, [activeConvoId, appendMessage, pollMission]);
+    const manager = agents.find((a) => a.id === activeConvoId);
+    const managerName = manager?.name || 'CEO';
+    const managerRole = manager?.role || 'CEO';
+    const employee = resolveCompanyEmployees(agents, employeeProfiles).find(
+      ({ profile }) =>
+        (payload.agent_profile_id && profile.id === payload.agent_profile_id) ||
+        (!payload.agent_profile_id && profile.role_type.toLowerCase() === payload.employee_role.toLowerCase())
+    )?.agent;
+    if (employee) {
+      recordDelegationStart(
+        employee.id,
+        { name: managerName, role: managerRole },
+        mission,
+        payload.instructions || payload.title
+      );
+    }
+    pollMission(mission.id, activeConvoId, {
+      managerName,
+      managerRole,
+      employeeAgentId: employee?.id,
+    });
+  }, [activeConvoId, agents, appendMessage, employeeProfiles, pollMission, recordDelegationStart]);
 
   const handleLaunchMission = useCallback((agentId: string, suggested: SuggestedMission) => {
     const goal = suggested.input_json?.goal;
@@ -536,7 +787,8 @@ export function App() {
             : (freeModels.find((model) => model.id === settings.defModel)?.variants[0] || undefined),
         });
         appendMessage(agentId, `📋 Mission ${mission.id.slice(0, 8)} started. The AI team is planning with ${mission.model_id || settings.defModel}.`);
-        pollMission(mission.id, agentId);
+        // Employees are only known per task here — turns are recorded on completion.
+        pollMission(mission.id, agentId, { managerName: 'CEO', managerRole: 'CEO' });
       } catch (e: any) {
         appendMessage(agentId, `❌ Could not start mission: ${e?.message || e}`);
       }
@@ -668,6 +920,69 @@ export function App() {
       showToast('Team created · Add a specialist to activate desk');
     },
     [teams.length, settings, showToast]
+  );
+
+  // P3: an approved CEO team/hire is materialized in the company (agentos teams
+  // + agents state) using the profiles the approve response reports as created.
+  // Full profiles are re-fetched for instructions/model/variant; if that fetch
+  // fails the shallow approve payload is enough to still show the team.
+  const handleCeoProfilesCreated = useCallback(
+    (
+      profiles: { id: string; name: string; role_type: string }[],
+      teamName: string | null
+    ) => {
+      if (profiles.length === 0) return;
+      void (async () => {
+        let fullProfiles = employeeProfiles;
+        try {
+          const fetched = await getAgentProfiles();
+          fullProfiles = fetched;
+          setEmployeeProfiles(fetched);
+        } catch {
+          // Keep the shallow data from the approve response.
+        }
+        const byId = new Map(fullProfiles.map((profile) => [profile.id, profile]));
+        const teamId = `t_ceo_${Date.now().toString(36)}`;
+        const newTeam: Team = {
+          id: teamId,
+          name: teamName?.trim() || 'فريق من CEO',
+          desc: 'Created by CEO approval',
+          mgr: null,
+          color: TEAM_COLORS[teams.length % TEAM_COLORS.length],
+        };
+        const newAgents: Agent[] = profiles.map((profile) => {
+          const full = byId.get(profile.id);
+          const role = humanizeRoleType(profile.role_type);
+          const model = full?.default_model_id || settings.defModel;
+          const candidate = full?.default_variant_id;
+          const supported = freeModels.find((entry) => entry.id === model);
+          const reason: ModelReasoning =
+            isReasoning(candidate) && (!supported || supported.variants.includes(candidate))
+              ? candidate
+              : settings.reason;
+          return {
+            id: `a_ceo_${profile.id}`,
+            name: profile.name,
+            role,
+            team: teamId,
+            mgr: false,
+            model,
+            reason,
+            timeout: settings.timeout,
+            json: settings.json,
+            prompt: full?.instructions || `You are ${profile.name}, ${role}.`,
+            status: 'Active',
+            profileId: profile.id,
+          };
+        });
+        setTeams((prev) => [...prev, newTeam]);
+        setAgents((prev) => {
+          const existing = new Set(prev.map((agent) => agent.id));
+          return [...prev, ...newAgents.filter((agent) => !existing.has(agent.id))];
+        });
+      })();
+    },
+    [employeeProfiles, freeModels, settings, teams.length]
   );
 
   // Delete Team
@@ -955,7 +1270,9 @@ export function App() {
 
   // Navigation Items
   const navItems: { id: Page; label: string; icon: React.FC<{ size?: number; className?: string }> }[] = [
+    { id: 'ceo', label: 'CEO', icon: Crown },
     { id: 'company', label: 'Company', icon: Building2 },
+    { id: 'studio', label: 'Studio', icon: Workflow },
     { id: 'inbox', label: 'Inbox', icon: Inbox },
     { id: 'conversations', label: 'Conversations', icon: MessageSquare },
     { id: 'stream', label: 'Team Stream', icon: Radio },
@@ -1039,6 +1356,14 @@ export function App() {
         )}
 
         <main className="flex-1 overflow-y-auto p-5 sm:p-6 lg:p-7 min-h-0 relative">
+          {page === 'ceo' && (
+            <CeoControlView
+              selectedModelId={settings.defModel}
+              selectedVariant={settings.reason}
+              onProfilesCreated={handleCeoProfilesCreated}
+            />
+          )}
+
           {page === 'company' && (
             <CompanyView
               agents={agents}
@@ -1070,6 +1395,10 @@ export function App() {
               onToggleStream={() => setIsStreamMode((prev) => !prev)}
               onInspectAgentTask={handleInspectAgentTask}
             />
+          )}
+
+          {page === 'studio' && (
+            <StudioView />
           )}
 
           {page === 'inbox' && (

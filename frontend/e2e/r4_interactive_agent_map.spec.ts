@@ -1,79 +1,91 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect } from '@playwright/test';
+import {
+  DEPARTMENTS,
+  addSpecialist,
+  createTeam,
+  expectAssignedAck,
+  expectTaskCompletion,
+  gotoCompany,
+  inspectDialog,
+  openNewestInboxReview,
+  seedDepartments,
+  sendDelegatedMission,
+  switchCompanyView,
+  teamChip,
+} from './helpers';
 
-async function navigateToAgentMap(page: Page) {
-  await page.goto('/');
-  const mapNav = page.locator('[data-nav="map"], button:has-text("Interactive Agent Map"), button:has-text("الخريطة التفاعلية"), button:has-text("Agent Map")').first();
-  if (await mapNav.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await mapNav.click();
-    await page.waitForTimeout(300);
-  }
-}
-
+/**
+ * R4: Live Interactive Agent Map & Execution Halos.
+ *
+ * The Interactive Agent Map is now the Company graph canvas
+ * (react-force-graph). Departments are focus chips/zone groupings; node
+ * selection is reachable through the org chart; completed executions surface
+ * their duration (ms) in the Inbox review feed.
+ */
 test.describe('R4: Live Interactive Agent Map & Execution Halos', () => {
-  test('Renders interactive map canvas with department zone groupings/boundaries', async ({ page }) => {
-    await navigateToAgentMap(page);
-
-    // 1. Verify Map Canvas Container is rendered
-    const mapContainer = page.locator('.react-flow, [data-testid="agent-map-canvas"], .interactive-map-container').first();
-    await expect(mapContainer).toBeVisible();
-
-    // 2. Verify Department Zone groupings / boundary labels
-    const planningZone = page.locator('text=/Planning & Strategy Zone|إدارة التخطيط|Planning/i').first();
-    const researchZone = page.locator('text=/Research & Feasibility Zone|Analysis & Risk|التحليل والمخاطر|Research/i').first();
-    const qaZone = page.locator('text=/Quality Assurance & Review Zone|Quality & Review|الجودة والاعتماد|QA/i').first();
-
-    await expect(planningZone).toBeVisible();
-    await expect(researchZone).toBeVisible();
-    await expect(qaZone).toBeVisible();
-
-    // 3. Verify Agent Nodes exist in the map
-    const nodes = page.locator('.react-flow__node, [data-testid="agent-node"]');
-    await expect(nodes.first()).toBeVisible();
-    const count = await nodes.count();
-    expect(count).toBeGreaterThanOrEqual(3);
-  });
-
-  test('Status indicator halos: running nodes pulse, completed nodes turn emerald green with ms duration', async ({
+  test('Renders interactive map canvas with department zone groupings/boundaries', async ({
     page,
   }) => {
-    test.setTimeout(60000);
-    await navigateToAgentMap(page);
+    await seedDepartments(page, ['planning', 'research', 'quality']);
 
-    // Trigger run if run button is available on map view or header
-    const runBtn = page.locator('button:has-text("Run Pipeline"), button:has-text("Run Mission"), button:has-text("تشغيل"), [data-action="run"]').first();
-    if (await runBtn.isVisible()) {
-      await runBtn.click();
+    // 1. Verify the graph canvas container is rendered
+    const mapContainer = page.locator('canvas').first();
+    await expect(mapContainer).toBeVisible();
 
-      // Verify running pulse halo appears during execution
-      const runningHalo = page.locator('.animate-pulse, [data-status="running"], .status-halo-running, .ring-blue-500, .ring-amber-500').first();
-      await expect(runningHalo).toBeVisible({ timeout: 10000 });
+    // 2. Verify department zone groupings (focus chips) for the three desks
+    await expect(teamChip(page, 'Planning & Strategy')).toBeVisible();
+    await expect(teamChip(page, 'Research & Feasibility')).toBeVisible();
+    await expect(teamChip(page, 'Quality & Review')).toBeVisible();
 
-      // Verify completed nodes turn emerald green and display execution duration in milliseconds
-      const completedNode = page.locator('[data-status="completed"], [data-status="succeeded"], .border-emerald-500, .bg-emerald-950').or(page.locator('text=/ms|مللي ثانية/i')).first();
-      await expect(completedNode).toBeVisible({ timeout: 20000 });
-    } else {
-      // Direct inspection of status styling classes
-      const nodeElements = page.locator('.react-flow__node');
-      await expect(nodeElements.first()).toBeVisible();
-    }
+    // 3. Verify all agents are present as graph nodes — the canvas draws
+    // nodes outside the DOM, so member counts come from the header stats.
+    await expect(page.getByText('0 specialists · 1 CEO · 3 managers · 3 teams')).toBeVisible();
+
+    // Canvas HUD stays available for map interactions
+    await expect(page.getByRole('button', { name: 'Zoom in' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Reheat simulation' })).toBeVisible();
+  });
+
+  test('Completed tasks report ms duration after the running phase', async ({ page }) => {
+    test.setTimeout(120000);
+    await seedDepartments(page, ['planning']);
+
+    // Trigger a real employee run through the delegated mission flow
+    await sendDelegatedMission(page, 'Delegate this mission to planner: مراجعة مخاطر التنفيذ وتحديث خطة الإطلاق');
+    await expectAssignedAck(page);
+    await expectTaskCompletion(page);
+
+    // Completion is reported in the Inbox review feed with its duration in ms
+    const reviewCard = await openNewestInboxReview(page);
+    await expect(reviewCard.getByText('Waiting for review')).toBeVisible();
+    await expect(
+      reviewCard.getByText(/planner · succeeded · deepseek-v4\.1-flash-free · \d+ms/)
+    ).toBeVisible();
   });
 
   test('Clicking a node opens Contract Card and output preview', async ({ page }) => {
-    await navigateToAgentMap(page);
+    await gotoCompany(page);
+    const planning = DEPARTMENTS.planning;
+    await createTeam(page, planning.name, planning.manager, planning.managerRole);
+    await addSpecialist(page, 'أحمد', 'أخصائي البرمجة والتنفيذ');
+    await switchCompanyView(page, 'org');
 
-    // Click on any agent node
-    const agentNode = page.locator('.react-flow__node:has-text("Planner"), .react-flow__node:has-text("Analyst"), .react-flow__node:has-text("سارة"), .react-flow__node:has-text("طارق"), [data-testid="agent-node"]').first();
-    await agentNode.click();
+    // Select the agent node (canvas nodes have no DOM; org chart is the
+    // accessible selection surface for the same people).
+    await page.getByRole('button', { name: /أحمد/ }).first().click();
 
-    // Verify Inspector / Contract Card panel opens
-    const contractCard = page.locator('[data-testid="node-contract-card"], [data-testid="contract-card-modal"], [data-testid="node-inspector"]').or(page.locator('text=/Node Inspector|Contract Card|بطاقة العقد/i')).first();
-    await expect(contractCard).toBeVisible();
+    // Verify the contract card panel opens with execution metadata
+    const panel = page.locator('main aside.os-card');
+    await expect(panel.getByText('Model', { exact: true })).toBeVisible();
+    await expect(panel.getByText('System Prompt', { exact: true })).toBeVisible();
+    await expect(panel.getByText('Reasoning', { exact: true })).toBeVisible();
 
-    // Verify contract metadata is visible (role, instructions/prompt, model)
-    await expect(page.locator('text=/Model|Instructions|System Prompt|Task Depth|الدور/i').first()).toBeVisible();
-
-    // Verify output preview tab or section is accessible
-    const outputSection = page.locator('text=/Output|Deliverable|المخرجات|Output Preview/i').first();
-    await expect(outputSection).toBeVisible();
+    // Verify the output preview is accessible from the active-task inspector
+    await page.getByRole('button', { name: /View active task & dialogue/ }).click();
+    const dialog = inspectDialog(page);
+    await expect(dialog.locator('h2')).toContainText('Active Work & Coordination');
+    await dialog.getByRole('button', { name: /المخرجات والتقرير الفني/ }).click();
+    await expect(dialog.getByText('Structured Deliverable JSON Schema').or(dialog.getByText('No structured JSON payload attached to this task.'))).toBeVisible();
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click();
   });
 });

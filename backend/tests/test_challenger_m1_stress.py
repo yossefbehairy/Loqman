@@ -3,7 +3,7 @@ Empirical Stress-Testing & Adversarial Challenge Suite for Milestone 1 Backend A
 Tests:
 1. PUT /api/agent-profiles/{profile_id} with stress payloads (empty, partial, length limits, special chars, Arabic, aliases, 404s).
 2. POST /api/chat with all 4 manager IDs (dr_sara, eng_tarek, prof_yasmin, general_manager) and primary keys.
-3. Structured suggested_mission and persona verification.
+3. Persona verification and the no-auto-mission contract (suggested_mission is always None).
 4. Clean 404 responses for invalid manager IDs.
 5. Edge cases: long messages, multi-turn history, malformed inputs.
 6. Bug hunting & vulnerability reproduction: settings_json non-dict types causing unhandled AttributeError in chat.
@@ -200,7 +200,7 @@ def test_stress_profile_not_found(client: TestClient):
 # 2. Executive Chat Consultation Tests (POST /api/chat & /api/managers/{id}/consult)
 # ============================================================================
 
-def test_stress_chat_all_4_managers_personas_and_suggested_missions(client: TestClient):
+def test_stress_chat_all_4_managers_personas_and_no_auto_mission(client: TestClient):
     """
     Empirically verifies POST /api/chat for all 4 required manager personas:
     1. dr_sara -> Planning & Strategy Manager (د. سارة)
@@ -208,7 +208,8 @@ def test_stress_chat_all_4_managers_personas_and_suggested_missions(client: Test
     3. prof_yasmin -> Quality & Review Manager (أ. ياسمين)
     4. general_manager -> General Manager (المدير العام)
 
-    Verifies persona-specific reply, manager metadata, and structured suggested_mission.
+    Verifies persona-specific reply, manager metadata, and that consultation
+    chats never auto-suggest a mission.
     """
     test_cases = [
         {
@@ -264,15 +265,9 @@ def test_stress_chat_all_4_managers_personas_and_suggested_missions(client: Test
         assert len(data["reply"]) > 20
         assert tc["name_keyword"] in data["reply"] or tc["title_keyword"] in data["reply"]
 
-        # 3. Structured suggested_mission check
-        assert data["suggested_mission"] is not None
-        mission = data["suggested_mission"]
-        assert isinstance(mission["title"], str) and len(mission["title"]) > 5
-        assert isinstance(mission["input_json"], dict)
-        assert mission["input_json"]["department"] == tc["expected_department"]
-        assert tc["mission_key"] in mission["input_json"]
-        assert isinstance(mission["input_json"][tc["mission_key"]], list)
-        assert len(mission["input_json"][tc["mission_key"]]) > 0
+        # 3. No auto-mission contract check
+        # Contract: consultations never auto-suggest missions (see chat.py + docs/ceo-control-plan.md).
+        assert data["suggested_mission"] is None
 
 
 def test_stress_chat_with_primary_keys(client: TestClient):
@@ -292,7 +287,7 @@ def test_stress_chat_with_primary_keys(client: TestClient):
         assert res.status_code == 200
         data = res.json()
         assert expected_name in data["manager_name"]
-        assert data["suggested_mission"]["input_json"]["department"] == expected_dept
+        assert data["suggested_mission"] is None
 
 
 def test_stress_chat_path_endpoint(client: TestClient):
@@ -305,7 +300,7 @@ def test_stress_chat_path_endpoint(client: TestClient):
         assert res.status_code == 200
         data = res.json()
         assert data["manager_id"] == mid
-        assert data["suggested_mission"] is not None
+        assert data["suggested_mission"] is None
 
 
 def test_stress_chat_clean_404_for_invalid_manager_ids(client: TestClient):
@@ -360,7 +355,7 @@ def test_stress_chat_payload_edge_cases(client: TestClient):
     long_msg = "وصف تفصيلي جداً للمشروع: " + ("نطاق العمل والتحديات التقنية " * 500)
     res_long = client.post("/api/chat", json={"manager_id": "dr_sara", "message": long_msg})
     assert res_long.status_code == 200
-    assert res_long.json()["suggested_mission"] is not None
+    assert res_long.json()["suggested_mission"] is None
 
     # 6. Deep conversation history (20 turns)
     history = []
@@ -397,7 +392,7 @@ def test_vulnerability_settings_json_non_dict_causes_chat_crash(client: TestClie
     data = chat_res.json()
     assert data["manager_id"] == "dr_sara"
     assert "سارة" in data["manager_name"]
-    assert data["suggested_mission"] is not None
+    assert data["suggested_mission"] is None
 
 
 def test_vulnerability_settings_json_null_and_scalars_cause_chat_crash(client: TestClient):
@@ -460,5 +455,5 @@ def test_stress_rapid_profile_updates_and_chat_queries(client: TestClient):
             "message": f"طلب استشارة رقم {i}"
         })
         assert c_res.status_code == 200
-        assert c_res.json()["suggested_mission"] is not None
+        assert c_res.json()["suggested_mission"] is None
 

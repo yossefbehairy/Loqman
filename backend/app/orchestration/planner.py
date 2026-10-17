@@ -22,7 +22,8 @@ from pydantic import BaseModel, Field, field_validator
 
 KNOWN_ROLES = {
     "planner", "researcher", "analyst", "reviewer", "data_extractor",
-    "summarizer", "report_writer", "coder", "translator", "custom",
+    "summarizer", "report_writer", "coder", "translator",
+    "security_auditor", "custom",
 }
 
 

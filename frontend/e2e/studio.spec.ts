@@ -1,13 +1,19 @@
 import { test, expect, type Page } from '@playwright/test';
 
+/**
+ * Legacy Studio acceptance suite — restored against the rebuilt `StudioView`.
+ *
+ * Ported from the git history version of this spec. The ONLY adaptation is the
+ * navigation preamble: the legacy `[data-nav="map"]` / "Interactive Agent Map"
+ * discovery has no equivalent in the current app shell, so the helper now
+ * clicks the sidebar's "Studio" nav item and waits for the studio header.
+ * Every assertion below is unchanged from the legacy contract.
+ */
 async function navigateToStudioMap(page: Page) {
   await page.goto('/');
-  // If modern navigation sidebar is present, navigate to Interactive Agent Map
-  const mapNav = page.locator('[data-nav="map"], button:has-text("Interactive Agent Map"), button:has-text("الخريطة التفاعلية"), button:has-text("Agent Map")').first();
-  if (await mapNav.isVisible({ timeout: 1500 }).catch(() => false)) {
-    await mapNav.click();
-    await page.waitForTimeout(300);
-  }
+  // Open the restored Studio workspace via the sidebar navigation.
+  await page.getByRole('button', { name: 'Studio', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Validate DAG' })).toBeVisible();
 }
 
 test.describe('AgentOS Studio — Visual Canvas, Inspector & Team Chat E2E', () => {

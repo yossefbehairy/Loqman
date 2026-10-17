@@ -680,4 +680,5 @@ def test_manager_consultation_uses_updated_zero_cost_model(disk_client):
     assert chat_data["manager_id"] == "general_manager"
     assert "المدير العام" in chat_data["manager_name"]
     assert len(chat_data["reply"]) > 20
-    assert chat_data["suggested_mission"] is not None
+    # Contract: consultations never auto-suggest missions (see chat.py + docs/ceo-control-plan.md).
+    assert chat_data["suggested_mission"] is None

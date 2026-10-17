@@ -34,7 +34,6 @@ let mainWindow = null;
 let splashWindow = null;
 /** @type {import('node:child_process').ChildProcess | null} */
 let backendProcess = null;
-let backendPort = 0;
 let backendRestartCount = 0;
 let restartingBackend = false;
 let quitting = false;
@@ -132,7 +131,6 @@ function resolveBackendCommand(port) {
 }
 
 function spawnBackend(port) {
-  backendPort = port;
   const { command, args, options } = resolveBackendCommand(port);
   logBackend(`spawning: ${command} ${args.join(' ')}`);
 

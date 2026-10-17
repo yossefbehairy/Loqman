@@ -55,7 +55,10 @@ export const ConversationsView: React.FC<Props> = ({
   const activeAgent = agents.find((a) => a.id === activeConvoId) || agents[0];
   const activeTeam = teams.find((t) => t.id === activeAgent?.team);
 
-  const currentMessages = activeAgent ? messages[activeAgent.id] || [] : [];
+  const currentMessages = useMemo(
+    () => (activeAgent ? messages[activeAgent.id] || [] : []),
+    [messages, activeAgent]
+  );
 
   const filteredAgents = agents.filter((m) => {
     const q = filterQuery.toLowerCase();
