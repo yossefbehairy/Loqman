@@ -12,7 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     APP_NAME: str = "AgentOS"
-    APP_VERSION: str = "0.2.0"
+    APP_VERSION: str = "0.2.1"
     DEBUG: bool = False
 
     # Server binding (Strictly 127.0.0.1 for local security)
