@@ -1,8 +1,8 @@
 # Loqman
 
 [![CI](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml/badge.svg)](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml)
-![Version](https://img.shields.io/badge/version-0.2.1-blue)
-![Tests](https://img.shields.io/badge/tests-143%20backend%20%7C%2047%20E2E-brightgreen)
+![Version](https://img.shields.io/badge/version-0.2.2-blue)
+![Tests](https://img.shields.io/badge/tests-145%20backend%20%7C%2040%20E2E-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![Node](https://img.shields.io/badge/node-22-green)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
@@ -14,19 +14,17 @@ Everything runs on your machine: SQLite for state, a free-model-only AI runtime,
 
 ## Product surfaces
 
-The sidebar opens nine surfaces:
+The sidebar opens seven surfaces:
 
 | Surface | What it does |
 | --- | --- |
-| **CEO** | Ask the general manager in natural language. Answers come from live database rows, and every write proposal waits for your approval. |
-| **Company** | Interactive physics graph and org chart of your departments, with department focus chips, agent inspection, and execution contract editing. |
-| **Studio** | DAG workflow canvas. Validate a pipeline, run it, follow the live team chat drawer, and browse execution history. |
+| **CEO** | Ask the general manager in natural language. Pick the model and reasoning effort right on the card, watch live progress while it works, and every write proposal waits for your approval. |
+| **Company** | Interactive physics graph and org chart of your departments, with department focus chips, agent inspection, and execution contract editing against the live free-model catalog. |
 | **Inbox** | Deliverables and review items that reached your desk, with structured JSON output and statuses. |
 | **Conversations** | Direct chats with managers and employees. Delegations become real missions with recorded handover turns. |
 | **Team Stream** | Chronological ledger of inter-agent handovers: delegation, deliverable, and review, with expandable JSON payloads. |
 | **Results** | Run receipts and success metrics for completed work. |
-| **Calendar** | Scheduled pipeline runs. |
-| **Settings** | Default model, reasoning variant, timeouts, and notification preferences. |
+| **Settings** | Default model, reasoning variant, timeouts, and notification preferences — always populated from the live free-model catalog. |
 
 ## Architecture
 
@@ -66,6 +64,7 @@ The CEO surface answers questions and proposes changes, with a strict separation
 - Write tools never mutate inside the loop. `propose_update_contract`, `propose_new_profile`, and `propose_new_team` record one row in `pending_actions` and return its id.
 - Approve and deny require the `X-AgentOS-Confirm: true` header, which only the local UI sends. A decided action cannot transition again.
 - Team approvals validate every member before the first write, then create all profiles in one pass. A failed batch leaves no partial rows.
+- A small in-memory registry tracks every in-flight ask: the UI generates a `request_id`, polls `GET /api/ceo/ask-progress/{request_id}`, and shows the live stage (thinking, calling a tool, writing the final answer) plus an elapsed timer — so a slow free-model round trip is visible instead of a silent spinner.
 
 ```mermaid
 sequenceDiagram
@@ -161,15 +160,15 @@ Copy `.env.example` to `.env` in the repository root and adjust what you need:
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Keep it on loopback. `cli.py` accepts `--host`, `--port`, and `--data-dir`. |
 | `RUNTIME_MODE` | `real` | Use `mock` for deterministic tests. |
 | `OPENCODE_BASE_URL` | `http://127.0.0.1:49100` | The AI runtime lives outside the desktop bundle. |
-| `DEFAULT_MODEL_ID` | `muse-spark-1.3-contributor-free` | Revalidated against the live catalog before every execution. |
+| `DEFAULT_MODEL_ID` | `deepseek-v4.1-flash-free` | Revalidated against the live catalog before every execution. |
 | `AGENTOS_DATA_DIR` | set by Electron | Points `agentos.db` at the app data folder. |
 
 ## Testing
 
-The suite covers 143 backend tests (21 pytest suites) and 47 end-to-end tests (9 Playwright spec files) on Chromium.
+The suite covers 145 backend tests (21 pytest suites) and 40 end-to-end tests (8 Playwright spec files) on Chromium.
 
 ```powershell
-# Backend: 143 tests
+# Backend: 145 tests
 backend\.venv\Scripts\pytest.exe backend\tests -v
 
 # Frontend gates: types, lint, production build
@@ -178,7 +177,7 @@ npx tsc -b
 npm run lint
 npm run build
 
-# End to end: 47 tests on a deterministic mock runtime
+# End to end: 40 tests on a deterministic mock runtime
 npx playwright test
 ```
 
@@ -188,9 +187,9 @@ Continuous integration runs four jobs on every push:
 
 ```mermaid
 flowchart LR
-    Push["Push or pull request"] --> Backend["backend: pytest (143 tests)"]
+    Push["Push or pull request"] --> Backend["backend: pytest (145 tests)"]
     Push --> Frontend["frontend: tsc, oxlint, vite build"]
-    Push --> E2E["e2e: Playwright (47 tests, mock runtime)"]
+    Push --> E2E["e2e: Playwright (40 tests, mock runtime)"]
     Push --> Scan["secrets scan"]
 ```
 
@@ -207,14 +206,14 @@ backend/
     engine/          # executor, state machine, validator, context, events
     orchestration/   # CEO ReAct loop, tool registry, planner
     runtime/         # OpenCode transport, deterministic mock runtime
-  tests/             # 21 pytest suites, 143 tests
+  tests/             # 21 pytest suites, 145 tests
 frontend/
   src/
     api/             # typed API client
-    components/      # ceo, company, studio, conversations, stream, inbox, settings
+    components/      # ceo, company, conversations, stream, inbox, settings
     data/ types/ utils/
   electron/          # main, preload, splash
-  e2e/               # 9 Playwright specs, 47 tests
+  e2e/               # 8 Playwright specs, 40 tests
 pyinstaller/         # backend freeze and smoke test scripts
 docs/                # architecture notes, CEO control plan
 ```

@@ -168,7 +168,7 @@ export const SettingsView: React.FC<Props> = ({
             <div>
               <b className="text-sm text-[var(--text)] block">Strict JSON output</b>
               <small className="text-xs text-[var(--muted)]">
-                Force valid JSON schema parseable by pipelines.
+                Force valid JSON output from employees.
               </small>
             </div>
             <label className="os-switch">
@@ -276,7 +276,7 @@ export const SettingsView: React.FC<Props> = ({
             <div>
               <b className="text-sm text-[var(--text)] block">Export everything</b>
               <small className="text-xs text-[var(--muted)]">
-                Download all teams, employees, pipelines, schedules and run receipts as JSON.
+                Download all teams, employees, inbox items, run receipts and settings as JSON.
               </small>
             </div>
             <button onClick={onExportJSON} className="os-btn os-btn-ghost os-btn-sm">
@@ -289,7 +289,7 @@ export const SettingsView: React.FC<Props> = ({
             <div>
               <b className="text-sm text-[var(--text)] block">Reset workspace</b>
               <small className="text-xs text-[var(--muted)]">
-                Clears all teams, employees, inbox, runs and schedules back to an empty workspace.
+                Clears all teams, employees, inbox, runs and settings back to an empty workspace.
               </small>
             </div>
             <button onClick={onResetDemo} className="os-btn os-btn-danger os-btn-sm">

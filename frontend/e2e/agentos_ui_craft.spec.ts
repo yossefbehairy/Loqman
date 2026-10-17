@@ -33,7 +33,7 @@ test.describe('AgentOS Impeccable UI Verification', () => {
     await expect(page.getByText('Local workspace')).toBeVisible();
 
     // Verify Navigation Links
-    for (const label of ['Company', 'Conversations', 'Results', 'Calendar', 'Settings']) {
+    for (const label of ['Company', 'Conversations', 'Results', 'Settings']) {
       await expect(page.getByRole('button', { name: label, exact: true })).toBeVisible();
     }
     await expect(page.getByRole('button', { name: /^Inbox/ })).toBeVisible();
@@ -146,14 +146,7 @@ test.describe('AgentOS Impeccable UI Verification', () => {
     await expect(page.locator('text=Execution Run Receipts')).toBeVisible();
   });
 
-  test('should render Calendar scheduling and open Settings', async ({ page }) => {
-    await page.goto('/#calendar');
-    await expect(page.locator('h1:has-text("Calendar")')).toBeVisible();
-    await expect(page.getByText('Schedule New Pipeline Run')).toBeVisible();
-    await expect(
-      page.getByText('No scheduled runs yet. Create one above to run pipelines on a schedule.')
-    ).toBeVisible();
-
+  test('should render Settings page with the OpenCode engine online', async ({ page }) => {
     await page.goto('/#settings');
     await expect(page.locator('h1:has-text("Settings")')).toBeVisible();
     await expect(page.locator('text=OpenCode Engine')).toBeVisible();

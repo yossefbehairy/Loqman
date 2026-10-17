@@ -57,6 +57,26 @@ def test_self_correction_on_unknown_tool(client):
     assert len(data["reply"]) > 0
 
 
+def test_ask_progress_reports_done_with_request_id(client):
+    r = client.post("/api/ceo/ask", json={
+        "question": "صباح الخير",
+        "request_id": "prog-done-1",
+    })
+    assert r.status_code == 200, r.text
+    p = client.get("/api/ceo/ask-progress/prog-done-1")
+    assert p.status_code == 200, p.text
+    data = p.json()
+    assert data["done"] is True
+    assert data["stage"] == "done"
+    assert data["iteration"] >= 1
+    assert data["started_at"] and data["updated_at"]
+
+
+def test_ask_progress_unknown_id_404(client):
+    r = client.get("/api/ceo/ask-progress/does-not-exist")
+    assert r.status_code == 404
+
+
 def test_reads_create_no_mission_or_profile_rows(client, db_session):
     missions_before = db_session.query(Mission).count()
     tasks_before = db_session.query(MissionTask).count()

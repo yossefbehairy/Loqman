@@ -12,7 +12,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     APP_NAME: str = "AgentOS"
-    APP_VERSION: str = "0.2.1"
+    APP_VERSION: str = "0.2.2"
     DEBUG: bool = False
 
     # Server binding (Strictly 127.0.0.1 for local security)
@@ -28,7 +28,8 @@ class Settings(BaseSettings):
 
     # AI Runtime Configuration
     OPENCODE_BASE_URL: str = "http://127.0.0.1:49100"
-    DEFAULT_MODEL_ID: str = "muse-spark-1.3-contributor-free"
+    # Must exist in the live free catalog; revalidated before every execution.
+    DEFAULT_MODEL_ID: str = "deepseek-v4.1-flash-free"
     RUNTIME_MODE: Literal["real", "mock"] = "real"
 
     # CEO mission orchestration limits (local MVP, no Redis)

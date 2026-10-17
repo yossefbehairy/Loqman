@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,8 @@ def build_loop_system_prompt(question: str) -> str:
         "- Every reply must be EXACTLY one JSON object, no other text, no markdown fences:\n"
         '  {"tool_call": {"name": "<tool>", "args": {...}}}  OR  {"final": "<answer>"}.\n'
         "- Use tools to look up real data before answering factual questions.\n"
+        "- Greetings and small talk need no company data: answer immediately with "
+        '{"final": "<answer>"} and no tool calls.\n'
         "- propose_* tools only RECORD a proposal (status pending) — never execute anything. "
         "After recording one, do NOT call it again for the same change; "
         "mention in your final answer that it awaits approval.\n"
@@ -52,6 +54,17 @@ def _parse_envelope(text: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+def _emit(progress: Optional[Callable[[str, str, int], None]], stage: str,
+          detail: str, iteration: int) -> None:
+    """Report loop progress; reporting must never break the ask itself."""
+    if progress is None:
+        return
+    try:
+        progress(stage, detail, iteration)
+    except Exception:
+        pass
+
+
 async def run_ceo_ask(
     question: str,
     model_id: str,
@@ -61,6 +74,7 @@ async def run_ceo_ask(
     db: Optional[Session] = None,
     max_iterations: int = MAX_ITERATIONS,
     timeout: int = 120,
+    progress: Optional[Callable[[str, str, int], None]] = None,
 ) -> Dict[str, Any]:
     """Run the bounded tool loop. Returns {reply, actions_proposed, iterations}."""
     if runtime is None or db is None:
@@ -79,6 +93,7 @@ async def run_ceo_ask(
 
     for i in range(max_iterations):
         iterations = i + 1
+        _emit(progress, "thinking", "", iterations)
         prompt = system
         if transcript:
             prompt += "\n\nConversation so far:\n" + "\n".join(transcript)
@@ -105,6 +120,7 @@ async def run_ceo_ask(
             continue
         if isinstance(envelope.get("final"), str):
             reply = envelope["final"].strip() or _fallback_summary(observations)
+            _emit(progress, "final", "", iterations)
             return _result(db, baseline_pending, reply, iterations)
         call = envelope.get("tool_call")
         if not isinstance(call, dict):
@@ -135,7 +151,9 @@ async def run_ceo_ask(
         observation = ceo_tools.run_tool(db, name, args)
         observations.append(observation)
         transcript.append(f"[tool_observation] {observation}")
+        _emit(progress, "tool", str(name), iterations)
 
+    _emit(progress, "final", "limit", iterations)
     return _result(
         db, baseline_pending,
         _fallback_summary(observations) + " (Reached the reasoning limit; partial answer.)",

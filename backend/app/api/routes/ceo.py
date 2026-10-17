@@ -40,6 +40,9 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     model_id: Optional[str] = None
     variant: Optional[str] = None
+    # Optional client-generated id: while the sync ask runs, the client can poll
+    # GET /api/ceo/ask-progress/{request_id} to show a live stage in the UI.
+    request_id: Optional[str] = Field(default=None, max_length=64)
 
 
 class ProposedActionOut(BaseModel):
@@ -58,6 +61,35 @@ class CreatedProfileOut(BaseModel):
     id: str
     name: str
     role_type: str
+
+
+class AskProgressOut(BaseModel):
+    stage: str
+    detail: str = ""
+    iteration: int = 0
+    started_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    done: bool = False
+
+
+# Live progress registry for synchronous CEO asks. The desktop app is a single
+# backend process and every client polls only while its own POST is in flight,
+# so a small bounded dict is enough (no Redis, no background workers).
+_ASK_PROGRESS: Dict[str, Dict[str, Any]] = {}
+_ASK_PROGRESS_LIMIT = 100
+
+
+def _progress_write(request_id: str, stage: str, detail: str = "",
+                    iteration: Optional[int] = None, done: bool = False) -> None:
+    record = _ASK_PROGRESS.get(request_id)
+    if record is None:
+        return
+    record["stage"] = stage
+    record["detail"] = (detail or "")[:200]
+    if iteration is not None:
+        record["iteration"] = iteration
+    record["done"] = done
+    record["updated_at"] = datetime.now(timezone.utc).isoformat()
 
 
 class ActionOut(BaseModel):
@@ -119,6 +151,22 @@ async def ceo_ask(
             status_code=400,
             detail=f"Variant '{payload.variant}' is not supported by model '{model_id}'.",
         )
+    progress_id = (payload.request_id or "").strip()
+    if progress_id:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        _ASK_PROGRESS[progress_id] = {
+            "stage": "starting", "detail": "", "iteration": 0,
+            "started_at": now_iso, "updated_at": now_iso, "done": False,
+        }
+        # Bounded registry: drop the oldest entries first.
+        if len(_ASK_PROGRESS) > _ASK_PROGRESS_LIMIT:
+            for stale in list(_ASK_PROGRESS)[:-_ASK_PROGRESS_LIMIT]:
+                _ASK_PROGRESS.pop(stale, None)
+
+    def _report(stage: str, detail: str, iteration: int) -> None:
+        if progress_id:
+            _progress_write(progress_id, stage, detail, iteration)
+
     try:
         result = await run_ceo_ask(
             question=question,
@@ -127,14 +175,28 @@ async def ceo_ask(
             variant=payload.variant,
             runtime=runtime,
             db=db,
+            progress=_report if progress_id else None,
         )
     except Exception as e:
+        if progress_id:
+            _progress_write(progress_id, "error", str(e), done=True)
         raise HTTPException(status_code=502, detail=f"CEO ask failed: {str(e)[:300]}")
+    if progress_id:
+        _progress_write(progress_id, "done", "", result["iterations"], done=True)
     return AskResponse(
         reply=result["reply"],
         actions_proposed=[ProposedActionOut(**a) for a in result["actions_proposed"]],
         iterations=result["iterations"],
     )
+
+
+@router.get("/ask-progress/{request_id}", response_model=AskProgressOut)
+def get_ask_progress(request_id: str):
+    """Live stage of an in-flight (or just finished) CEO ask."""
+    record = _ASK_PROGRESS.get(request_id.strip())
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown ask request id.")
+    return AskProgressOut(**record)
 
 
 @router.get("/actions", response_model=List[ActionOut])

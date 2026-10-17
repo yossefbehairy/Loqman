@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import type { CeoAction, CeoActionStatus, CeoCreatedProfile, CeoProposedAction } from '../../types';
-import { askCeo, approveCeoAction, denyCeoAction, listCeoActions } from '../../api/client';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import type { CeoAction, CeoActionStatus, CeoCreatedProfile, CeoProposedAction, ModelCatalogEntry } from '../../types';
+import { askCeo, approveCeoAction, denyCeoAction, getCeoAskProgress, listCeoActions } from '../../api/client';
 import {
   AlertTriangle,
   Check,
@@ -24,6 +24,10 @@ interface Props {
   selectedModelId: string;
   /** Reasoning variant for that model, when supported. */
   selectedVariant: string;
+  /** Live free catalog (GET /api/models/free) for the inline model picker. */
+  models?: ModelCatalogEntry[];
+  /** Persist a new model/variant choice into the shared app settings. */
+  onModelChange?: (modelId: string, variant: string) => void;
   /** Called after an approval that really created employee profiles. */
   onProfilesCreated?: (profiles: CeoCreatedProfile[], teamName: string | null) => void;
 }
@@ -95,9 +99,31 @@ function humanizeError(error: unknown): string {
   return raw;
 }
 
+/** Maps backend ask-progress stages to short Arabic status text. */
+function progressLabel(stage: string, detail: string): string {
+  switch (stage) {
+    case 'starting':
+      return 'بيهيّئ جلسة المحادثة…';
+    case 'thinking':
+      return 'المدير العام بيفكر…';
+    case 'tool':
+      return `بيجمع بيانات: ${detail || 'أداة داخلية'}`;
+    case 'final':
+      return 'بيكتب الرد النهائي…';
+    case 'done':
+      return 'الرد جاهز';
+    case 'error':
+      return 'حصل خطأ — بنقفل المحاولة…';
+    default:
+      return 'المدير العام يراجع بيانات الشركة…';
+  }
+}
+
 export const CeoControlView: React.FC<Props> = ({
   selectedModelId,
   selectedVariant,
+  models,
+  onModelChange,
   onProfilesCreated,
 }) => {
   // Ask surface
@@ -109,6 +135,36 @@ export const CeoControlView: React.FC<Props> = ({
   // Proposals recorded in this session carry a local creation time (the API
   // exposes decided_at but not created_at).
   const [localCreatedAt, setLocalCreatedAt] = useState<Record<string, number>>({});
+
+  // Live ask progress (polled while the synchronous ask is in flight)
+  const [progressStage, setProgressStage] = useState('');
+  const [progressDetail, setProgressDetail] = useState('');
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const tickRef = useRef<number | null>(null);
+  const pollRef = useRef<number | null>(null);
+
+  const stopAskWatchers = useCallback(() => {
+    if (tickRef.current !== null) {
+      window.clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+    if (pollRef.current !== null) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => stopAskWatchers, [stopAskWatchers]);
+
+  const variantOptions = (models || []).find((m) => m.id === selectedModelId)?.variants || [];
+
+  const handleModelSelect = (nextId: string) => {
+    const picked = (models || []).find((m) => m.id === nextId);
+    const nextVariant = picked?.variants.includes(selectedVariant)
+      ? selectedVariant
+      : picked?.variants[0] || selectedVariant;
+    onModelChange?.(nextId, nextVariant);
+  };
 
   // Approvals inbox
   const [tab, setTab] = useState<CeoActionStatus>('pending');
@@ -168,11 +224,35 @@ export const CeoControlView: React.FC<Props> = ({
     if (!trimmed || sending) return;
     setSending(true);
     setAskError('');
+    setProgressStage('starting');
+    setProgressDetail('');
+    setElapsedSec(0);
+
+    // Client-generated id: the backend records live stages for it while the
+    // sync POST runs, so the UI can show what the CEO is doing right now.
+    const requestId =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `ask-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const startedAt = Date.now();
+    tickRef.current = window.setInterval(() => {
+      setElapsedSec(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    pollRef.current = window.setInterval(() => {
+      void getCeoAskProgress(requestId)
+        .then((progress) => {
+          setProgressStage(progress.stage);
+          setProgressDetail(progress.detail || '');
+        })
+        .catch(() => undefined); // 404 until the backend registers the id
+    }, 1200);
+
     try {
       const response = await askCeo(
         trimmed,
         selectedModelId || undefined,
-        selectedVariant || undefined
+        selectedVariant || undefined,
+        requestId
       );
       setReply(response.reply);
       setProposed(response.actions_proposed);
@@ -191,6 +271,9 @@ export const CeoControlView: React.FC<Props> = ({
     } catch (error) {
       setAskError(humanizeError(error));
     } finally {
+      stopAskWatchers();
+      setProgressStage('');
+      setProgressDetail('');
       setSending(false);
     }
   };
@@ -254,10 +337,44 @@ export const CeoControlView: React.FC<Props> = ({
             </span>
             <div className="min-w-0 flex-1">
               <h2 className="text-sm font-semibold text-[var(--text)] m-0">اسأل المدير العام</h2>
-              <div className="mono text-[10px] text-[var(--dim)] truncate">
-                {selectedModelId || 'default model'}
-                {selectedVariant ? ` · ${selectedVariant}` : ''}
-              </div>
+              {models && models.length > 0 ? (
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <select
+                    value={models.some((m) => m.id === selectedModelId) ? selectedModelId : ''}
+                    onChange={(e) => handleModelSelect(e.target.value)}
+                    aria-label="موديل المدير العام"
+                    className="mono text-[10px] py-0.5 px-1.5 rounded-lg bg-[var(--card2)] border border-[var(--line)] text-[var(--text)] max-w-[240px]"
+                  >
+                    {!models.some((m) => m.id === selectedModelId) && (
+                      <option value="">{selectedModelId || 'default model'} (غير متحقق)</option>
+                    )}
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.name}
+                      </option>
+                    ))}
+                  </select>
+                  {variantOptions.length > 0 && (
+                    <select
+                      value={selectedVariant}
+                      onChange={(e) => onModelChange?.(selectedModelId, e.target.value)}
+                      aria-label="مستوى التفكير"
+                      className="mono text-[10px] py-0.5 px-1.5 rounded-lg bg-[var(--card2)] border border-[var(--line)] text-[var(--text)]"
+                    >
+                      {variantOptions.map((v) => (
+                        <option key={v} value={v}>
+                          {v}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              ) : (
+                <div className="mono text-[10px] text-[var(--dim)] truncate">
+                  {selectedModelId || 'default model'}
+                  {selectedVariant ? ` · ${selectedVariant}` : ''}
+                </div>
+              )}
             </div>
           </div>
 
@@ -290,9 +407,10 @@ export const CeoControlView: React.FC<Props> = ({
           </div>
 
           {sending && (
-            <div className="flex items-center gap-2 text-xs text-[var(--muted)]" role="status">
+            <div className="flex items-center gap-2 text-xs text-[var(--muted)] flex-wrap" role="status">
               <span className="w-1.5 h-1.5 rounded-full bg-[var(--acc)] animate-pulse inline-block" />
-              المدير العام يراجع بيانات الشركة…
+              <span>{progressLabel(progressStage, progressDetail)}</span>
+              <span className="mono text-[10px] text-[var(--dim)]">· {elapsedSec}s</span>
             </div>
           )}
 

@@ -1,4 +1,4 @@
-export type Page = 'ceo' | 'company' | 'studio' | 'inbox' | 'conversations' | 'stream' | 'results' | 'calendar' | 'settings';
+export type Page = 'ceo' | 'company' | 'inbox' | 'conversations' | 'stream' | 'results' | 'settings';
 
 export type CompanyViewMode = 'graph' | 'org';
 
@@ -87,23 +87,6 @@ export interface RunReceipt {
   st: 'success' | 'failed';
   dur: number;
   tok: number;
-}
-
-export interface Pipeline {
-  id: string;
-  name: string;
-  steps: string[];
-  status: 'Idle' | 'Running' | 'Done';
-  cur: number;
-  valid: { ok: boolean; msg: string } | null;
-}
-
-export interface ScheduleItem {
-  id: string;
-  pipe: string;
-  time: string;
-  rep: 'Daily' | 'Weekdays' | 'Weekly';
-  on: boolean;
 }
 
 export interface AppSettings {

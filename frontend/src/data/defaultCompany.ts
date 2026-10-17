@@ -145,7 +145,7 @@ export const DEFAULT_COMPANY_MEMBERS: CompanyMember[] = [
     system_prompt:
       'أنت د. سارة، مديرة إدارة التخطيط والإستراتيجية. خبرتك في الهندسة المعمارية للنظم البرمجية، تفكيك المتطلبات الكبيرة إلى مراحل واضحة (Phases & Milestones)، وتحديد المخرجات المتوقعة بدقة رياضية صارمة.',
     contract: {
-      model_id: 'muse-spark-1.3-contributor-free',
+      model_id: 'deepseek-v4.1-flash-free',
       variant: 'high',
       task_depth: 'Standard',
       timeout_sec: 120,
@@ -165,7 +165,7 @@ export const DEFAULT_COMPANY_MEMBERS: CompanyMember[] = [
     system_prompt:
       'أنت أحمد، مهندس التخطيط المعماري المتخصص تحت إشراف د. سارة. تتولى صياغة مخططات التسلسل، وهيكلة واجهات البيانات، وحساب تقديرات زمن التنفيذ.',
     contract: {
-      model_id: 'muse-spark-1.3-contributor-free',
+      model_id: 'deepseek-v4.1-flash-free',
       variant: 'high',
       task_depth: 'Standard',
       timeout_sec: 90,
@@ -187,7 +187,7 @@ export const DEFAULT_COMPANY_MEMBERS: CompanyMember[] = [
     system_prompt:
       'أنت المهندس طارق، مدير إدارة التحليل والمخاطر الفنية. مهمتك مراجعة مقترحات التخطيط وتحديد نقاط الضعف، ونقاط الاختناق المتزامنة، ومخاطر الأمان والاعتماديات قبل التنفيذ.',
     contract: {
-      model_id: 'muse-spark-1.3-contributor-free',
+      model_id: 'deepseek-v4.1-flash-free',
       variant: 'high',
       task_depth: 'Deep',
       timeout_sec: 150,
@@ -229,7 +229,7 @@ export const DEFAULT_COMPANY_MEMBERS: CompanyMember[] = [
     system_prompt:
       'أنت الأستاذة ياسمين، مديرة إدارة الجودة والحوكمة والاعتماد النهائي. مهمتك فحص كافة مخرجات الإدارات السابقة، والتأكد من مطابقة العقود التنفيذية الصارمة، وإعطاء قرار الاعتماد النهائي (Approval / Rejection).',
     contract: {
-      model_id: 'muse-spark-1.3-contributor-free',
+      model_id: 'deepseek-v4.1-flash-free',
       variant: 'max',
       task_depth: 'Deep',
       timeout_sec: 180,

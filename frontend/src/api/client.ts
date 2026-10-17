@@ -1,8 +1,4 @@
 import type {
-  Workflow,
-  ValidationResult,
-  WorkflowExecution,
-  TeamMessageListResponse,
   ModelCatalogEntry,
   RuntimeHealth,
   AgentProfile,
@@ -58,28 +54,6 @@ export const getRuntimeHealth = () => request<RuntimeHealth>('/runtime/health');
 export const getFreeModels = () => request<ModelCatalogEntry[]>('/models/free');
 export const refreshModels = () => request<ModelCatalogEntry[]>('/models/refresh', { method: 'POST' });
 export const getAgentProfiles = () => request<AgentProfile[]>('/agent-profiles');
-
-// Workflows
-export const listWorkflows = () => request<Workflow[]>('/workflows');
-export const getWorkflow = (id: string) => request<Workflow>(`/workflows/${id}`);
-export const createWorkflow = (payload: { name: string; description?: string; definition_json: string }) =>
-  request<Workflow>('/workflows', { method: 'POST', body: JSON.stringify(payload) });
-export const updateWorkflow = (id: string, payload: { name?: string; description?: string; definition_json?: string }) =>
-  request<Workflow>(`/workflows/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
-export const deleteWorkflow = (id: string) => request<void>(`/workflows/${id}`, { method: 'DELETE' });
-export const validateWorkflow = (id: string) => request<ValidationResult>(`/workflows/${id}/validate`, { method: 'POST' });
-export const runWorkflow = (id: string, input?: any, sync: boolean = false) =>
-  request<{ execution_id: string; status: string; topological_order: string[]; result?: any }>(
-    `/workflows/${id}/run`,
-    { method: 'POST', body: JSON.stringify({ input: input || 'Start workflow', sync }) }
-  );
-
-// Executions
-export const listExecutions = (skip: number = 0, limit: number = 50) =>
-  request<WorkflowExecution[]>(`/executions?skip=${skip}&limit=${limit}`);
-export const getExecution = (id: string) => request<WorkflowExecution>(`/executions/${id}`);
-export const cancelExecution = (id: string) => request<{ status: string; message: string }>(`/executions/${id}/cancel`, { method: 'POST' });
-export const getTeamMessages = (id: string) => request<TeamMessageListResponse>(`/executions/${id}/messages`);
 
 // Executive Chat & Consultation (R1)
 export const consultManager = (
@@ -158,15 +132,20 @@ export const missionEventsUrl = (id: string) => `${API_BASE}/missions/${id}/even
 // CEO control plane — ask (read-only reasoning loop) + approval-gated actions.
 // Decide endpoints REQUIRE the local confirmation header; without it the
 // backend refuses with 403 (external callers cannot auto-approve proposals).
-export const askCeo = (question: string, modelId?: string, variant?: string) =>
+export const askCeo = (question: string, modelId?: string, variant?: string, requestId?: string) =>
   request<CeoAskResponse>('/ceo/ask', {
     method: 'POST',
     body: JSON.stringify({
       question,
       ...(modelId ? { model_id: modelId } : {}),
       ...(variant ? { variant } : {}),
+      ...(requestId ? { request_id: requestId } : {}),
     }),
   });
+
+/** Live stage of an in-flight ask (polled while POST /ceo/ask is running). */
+export const getCeoAskProgress = (requestId: string) =>
+  request<import('../types').CeoAskProgress>(`/ceo/ask-progress/${encodeURIComponent(requestId)}`);
 
 export const listCeoActions = (status: CeoActionStatus = 'pending') =>
   request<CeoAction[]>(`/ceo/actions?status=${status}`);

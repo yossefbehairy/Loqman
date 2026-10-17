@@ -6,8 +6,6 @@ import type {
   Agent,
   InboxItem,
   RunReceipt,
-  Pipeline,
-  ScheduleItem,
   AppSettings,
   GraphOptions,
   CameraState,
@@ -21,20 +19,16 @@ import {
   INITIAL_AGENTS,
   INITIAL_INBOX,
   INITIAL_RUNS,
-  INITIAL_PIPELINES,
-  INITIAL_SCHEDULE,
   INITIAL_MESSAGES,
   INITIAL_SETTINGS,
   TEAM_COLORS,
 } from './data/agentosDefaults';
 import { CompanyView } from './components/company/CompanyView';
 import { CeoControlView } from './components/ceo/CeoControlView';
-import { StudioView } from './components/studio/StudioView';
 import { InboxView } from './components/inbox/InboxView';
 import { ConversationsView } from './components/conversations/ConversationsView';
 import { TeamStreamView } from './components/stream/TeamStreamView';
 import { ResultsView } from './components/results/ResultsView';
-import { CalendarView } from './components/calendar/CalendarView';
 import { SettingsView } from './components/settings/SettingsView';
 import { ContractModal } from './components/modals/ContractModal';
 import { NewTeamModal } from './components/modals/NewTeamModal';
@@ -47,10 +41,8 @@ import {
   Inbox,
   MessageSquare,
   BarChart3,
-  Calendar,
   Settings,
   Radio,
-  Workflow,
 } from 'lucide-react';
 import { createDelegatedMission, createMission, getAgentProfiles, getFreeModels, getMission, getRuntimeHealth, createAgentProfile, deleteAgentProfile } from './api/client';
 import type { AgentProfile, MissionOut, ModelCatalogEntry, SuggestedMission } from './types';
@@ -112,7 +104,7 @@ export function App() {
   // Navigation State
   const [page, setPage] = useState<Page>(() => {
     const hash = window.location.hash.replace('#', '') as Page;
-    const valid: Page[] = ['ceo', 'company', 'studio', 'inbox', 'conversations', 'stream', 'results', 'calendar', 'settings'];
+    const valid: Page[] = ['ceo', 'company', 'inbox', 'conversations', 'stream', 'results', 'settings'];
     return valid.includes(hash) ? hash : 'company';
   });
 
@@ -140,12 +132,6 @@ export function App() {
   const [inbox, setInbox] = useState<InboxItem[]>(() => safeParse('agentos_inbox_v2', INITIAL_INBOX));
 
   const [runs, setRuns] = useState<RunReceipt[]>(() => safeParse('agentos_runs_v2', INITIAL_RUNS));
-
-  const [pipelines, setPipelines] = useState<Pipeline[]>(() => safeParse('agentos_pipes_v2', INITIAL_PIPELINES));
-
-  const [schedules, setSchedules] = useState<ScheduleItem[]>(() =>
-    safeParse('agentos_sched_v2', INITIAL_SCHEDULE)
-  );
 
   const [messages, setMessages] = useState<Record<string, Message[]>>(() =>
     safeParse('agentos_msgs_v2', INITIAL_MESSAGES)
@@ -278,14 +264,6 @@ export function App() {
   }, [runs]);
 
   useEffect(() => {
-    localStorage.setItem('agentos_pipes_v2', JSON.stringify(pipelines));
-  }, [pipelines]);
-
-  useEffect(() => {
-    localStorage.setItem('agentos_sched_v2', JSON.stringify(schedules));
-  }, [schedules]);
-
-  useEffect(() => {
     localStorage.setItem('agentos_msgs_v2', JSON.stringify(messages));
   }, [messages]);
 
@@ -303,7 +281,7 @@ export function App() {
   useEffect(() => {
     const onHashChange = () => {
       const hash = window.location.hash.replace('#', '') as Page;
-      const valid: Page[] = ['ceo', 'company', 'studio', 'inbox', 'conversations', 'stream', 'results', 'calendar', 'settings'];
+      const valid: Page[] = ['ceo', 'company', 'inbox', 'conversations', 'stream', 'results', 'settings'];
       if (valid.includes(hash)) {
         setPage(hash);
       }
@@ -1158,40 +1136,6 @@ export function App() {
     [agents, teams]
   );
 
-  // Schedules
-  const handleAddSchedule = useCallback(
-    (pipeId: string, time: string, rep: 'Daily' | 'Weekdays' | 'Weekly') => {
-      const newSchedule: ScheduleItem = {
-        id: `s_${Date.now().toString(36)}`,
-        pipe: pipeId,
-        time,
-        rep,
-        on: true,
-      };
-      setSchedules((prev) => [...prev, newSchedule]);
-      showToast('Schedule added');
-    },
-    [showToast]
-  );
-
-  const handleToggleSchedule = useCallback(
-    (id: string, active: boolean) => {
-      setSchedules((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, on: active } : s))
-      );
-      showToast(active ? 'Schedule resumed' : 'Schedule paused');
-    },
-    [showToast]
-  );
-
-  const handleDeleteSchedule = useCallback(
-    (id: string) => {
-      setSchedules((prev) => prev.filter((s) => s.id !== id));
-      showToast('Schedule removed');
-    },
-    [showToast]
-  );
-
   // Export CSV
   const handleExportCSV = useCallback(
     (periodVal: string) => {
@@ -1217,7 +1161,7 @@ export function App() {
 
   // Export JSON
   const handleExportJSON = useCallback(() => {
-    const payload = { teams, agents, pipelines, schedules, runs, inbox, settings };
+    const payload = { teams, agents, runs, inbox, settings };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1228,7 +1172,7 @@ export function App() {
     a.remove();
     URL.revokeObjectURL(url);
     showToast('Full workspace exported as JSON');
-  }, [teams, agents, pipelines, schedules, runs, inbox, settings, showToast]);
+  }, [teams, agents, runs, inbox, settings, showToast]);
 
   // Reset Workspace (back to the clean initial state)
   const handleResetDemo = useCallback(() => {
@@ -1237,8 +1181,6 @@ export function App() {
       'agentos_agents_v2',
       'agentos_inbox_v2',
       'agentos_runs_v2',
-      'agentos_pipes_v2',
-      'agentos_sched_v2',
       'agentos_msgs_v2',
       'agentos_settings',
     ];
@@ -1253,8 +1195,6 @@ export function App() {
     setAgents(INITIAL_AGENTS);
     setInbox(INITIAL_INBOX);
     setRuns(INITIAL_RUNS);
-    setPipelines(INITIAL_PIPELINES);
-    setSchedules(INITIAL_SCHEDULE);
     setMessages(INITIAL_MESSAGES);
     setSettings(INITIAL_SETTINGS);
     setSelectedAgentId(null);
@@ -1272,12 +1212,10 @@ export function App() {
   const navItems: { id: Page; label: string; icon: React.FC<{ size?: number; className?: string }> }[] = [
     { id: 'ceo', label: 'CEO', icon: Crown },
     { id: 'company', label: 'Company', icon: Building2 },
-    { id: 'studio', label: 'Studio', icon: Workflow },
     { id: 'inbox', label: 'Inbox', icon: Inbox },
     { id: 'conversations', label: 'Conversations', icon: MessageSquare },
     { id: 'stream', label: 'Team Stream', icon: Radio },
     { id: 'results', label: 'Results', icon: BarChart3 },
-    { id: 'calendar', label: 'Calendar', icon: Calendar },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -1360,6 +1298,15 @@ export function App() {
             <CeoControlView
               selectedModelId={settings.defModel}
               selectedVariant={settings.reason}
+              models={freeModels}
+              onModelChange={(modelId, variant) => {
+                setSettings((prev) => ({
+                  ...prev,
+                  defModel: modelId,
+                  ...(isReasoning(variant) ? { reason: variant } : {}),
+                }));
+                showToast('CEO model updated');
+              }}
               onProfilesCreated={handleCeoProfilesCreated}
             />
           )}
@@ -1395,10 +1342,6 @@ export function App() {
               onToggleStream={() => setIsStreamMode((prev) => !prev)}
               onInspectAgentTask={handleInspectAgentTask}
             />
-          )}
-
-          {page === 'studio' && (
-            <StudioView />
           )}
 
           {page === 'inbox' && (
@@ -1450,16 +1393,6 @@ export function App() {
                 showToast('No external data source connected. Metrics stay unavailable until verified.')
               }
               onExportCSV={handleExportCSV}
-            />
-          )}
-
-          {page === 'calendar' && (
-            <CalendarView
-              schedules={schedules}
-              pipelines={pipelines}
-              onAddSchedule={handleAddSchedule}
-              onToggleSchedule={handleToggleSchedule}
-              onDeleteSchedule={handleDeleteSchedule}
             />
           )}
 
@@ -1522,7 +1455,6 @@ export function App() {
           mode={graphOptions.source}
           agentsCount={agents.length}
           teamsCount={teams.length}
-          pipelinesCount={pipelines.length}
           runsCount={runs.length}
           onClose={() => setModalState(null)}
         />

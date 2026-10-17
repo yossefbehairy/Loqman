@@ -3,9 +3,9 @@
 ## 1. Test Suite Status
 The comprehensive End-to-End (E2E) Playwright testing track for AgentOS is **fully authored, validated, and green** against the current UI (M1 through M6 verification).
 
-- **Total E2E Test Files**: 9 files
-- **Total E2E Test Cases**: 47 tests
-- **Last Full Suite Result**: `47 passed` (0 failed, 0 skipped) with `RUNTIME_MODE=mock`
+- **Total E2E Test Files**: 8 files
+- **Total E2E Test Cases**: 40 tests
+- **Last Full Suite Result**: `40 passed` (0 failed, 0 skipped) with `RUNTIME_MODE=mock`
 - **Linter Status**: 0 errors, 0 warnings (`oxlint`)
 - **TypeScript Status**: Clean compilation (`tsc -b`)
 - **Vite Build**: Success (`vite build`)
@@ -41,7 +41,6 @@ Run targeted specs matching individual feature tracks (set `$env:RUNTIME_MODE='m
 | **Obsidian Physics Graph** | `frontend/e2e/obsidian_physics_graph.spec.ts` | 4 | `npx playwright test e2e/obsidian_physics_graph.spec.ts` |
 | **Workspace UI Craft Sweep** | `frontend/e2e/agentos_ui_craft.spec.ts` | 10 | `npx playwright test e2e/agentos_ui_craft.spec.ts` |
 | **CEO Control Plane** | `frontend/e2e/ceo_control_plane.spec.ts` | 6 | `npx playwright test e2e/ceo_control_plane.spec.ts` |
-| **Legacy Studio (DAG Canvas & Team Chat)** | `frontend/e2e/studio.spec.ts` | 7 | `npx playwright test e2e/studio.spec.ts` |
 
 ### 2.3 Backend Pytest Execution
 Run all 142 backend integration and unit tests:
@@ -58,7 +57,7 @@ d:\AgentOS\backend\.venv\Scripts\pytest.exe backend\tests -v
 1. **Clean Minimalist Landing**: Verifies the app opens into the Company workspace with the sidebar shell ready, without legacy canvas clutter (`Start Trigger`, `Lead Planner`, `Validate DAG`, `Run Pipeline` hidden); the conversation composer is one navigation away.
 2. **Persona List Selection**: Verifies the Conversations agent list offers `Adel Mansour` plus the seeded managers `د. سارة`, `م. طارق`, `أ. ياسمين`, and that selecting a persona rewires the active chat header (`OpenCode · {name}`).
 3. **Delegated Manager Consultation**: Submits an explicit delegation message to `د. سارة` and verifies the user turn, the assignment acknowledgement naming the assignee, and the completed employee task report in the same thread.
-4. **Seamless 7-View Sidebar Navigation**: Validates 1-click switching across Company, Conversations, Team Stream, Results, Calendar, Settings and Inbox with no full page reloads.
+4. **Seamless 7-View Sidebar Navigation**: Validates 1-click switching across CEO, Company, Conversations, Team Stream, Results, Settings and Inbox with no full page reloads.
 
 ### Suite 2: `frontend/e2e/r2_organization_hierarchy.spec.ts` (R2 Coverage, 4 tests)
 1. **Three Core Department Desks**: Creates Planning & Strategy, Research & Feasibility and Quality & Review through the New team modal; header stats (`0 specialists · 1 CEO · 3 managers · 3 teams`) and the org chart confirm each desk.
@@ -96,7 +95,7 @@ d:\AgentOS\backend\.venv\Scripts\pytest.exe backend\tests -v
 3. **Inbox Reviews & Notices**: Verifies a delegated deliverable lands as a "Waiting for review" item, the Reviews / Notices / All filters behave, and Approve all / Mark all as read report their toasts.
 4. **Conversations Live Mission**: Sends a delegation to `د. سارة` and verifies the assignment acknowledgement and completion report arrive live.
 5. **Results Metrics**: Verifies the run metrics cards and the Execution Run Receipts table render.
-6. **Calendar & Settings**: Verifies the scheduling empty state renders and Settings shows the OpenCode engine online.
+6. **Settings Surface**: Verifies Settings shows the OpenCode engine online, its runtime status, and the default model control.
 7. **Contract & Help Modals**: Verifies the contract modal opens prefilled and cancels cleanly, and Help opens with the `h` shortcut and closes with "Got it".
 8. **Inbox Review Inspection**: Clicks a review card and verifies the inspection modal opens on the inter-agent dialogue with the structured output tab.
 9. **Agent Active Task Inspector**: Verifies the org chart inspector's "View active task & dialogue" action opens the agent's active work, dialogue summary and empty deliverable payload state.
@@ -109,13 +108,4 @@ d:\AgentOS\backend\.venv\Scripts\pytest.exe backend\tests -v
 4. **Approved Team Materializes in the Company**: After approving the team proposal, opens the sidebar `Company` view and switches to `Org chart`, then verifies the new team (`Security Review Team (فريق المراجعة الأمنية)`) and all three created members (`Hassan (حسن)`, `Farida (فريدة)`, `Kareem (كريم)`) are present — the approve response's `created_profiles`/`team_name` are materialized into the local company state.
 5. **Gated Denial**: Verifies `رفض` shows `تأكيد رفض هذا الإجراء؟ لن يُنفَّذ شيء.`; confirming reports `تم رفض الإجراء — لم يُنفَّذ شيء.`, removes the card from pending, and files it under the `مرفوضة` tab as `مرفوض`.
 6. **Empty Question Guard**: Verifies send stays disabled for empty and whitespace-only questions (no reply region ever appears) and enables only for a real question.
-
-### Suite 9: `frontend/e2e/studio.spec.ts` (Legacy Studio, 7 tests)
-1. **Demo Pipeline Canvas**: Verifies the `AgentOS` / `Studio` header, `Validate DAG` and `Run Pipeline` controls, the 5 demo nodes (`Start Trigger` → `Lead Planner` → `Risk Analyst` → `Quality Reviewer` → `Capstone Deliverable`) and the `muse-spark-1.3-contributor-free` free-model badge.
-2. **Node Inspector**: Clicking `Lead Planner` opens the Node Inspector with the `AI Employee Role Library`, the free-contributor privacy notice and the Quick / Standard / Deep task-depth controls.
-3. **DAG Validation**: `Validate DAG` runs the real client-side topological check (Kahn's algorithm plus terminal/reachability checks) against the demo graph without raising the `DAG Graph Validation Issues` overlay.
-4. **Pipeline Run & Team Chat**: `Run Pipeline` saves the graph through the workflows API, starts a real backend execution, opens the Execution Drawer and streams the persisted team-chat turns (Turn 1-3) into the `Live Team Chat & Handover Stream`; the Node Outputs tab lists the `Pipeline Stages`.
-5. **Execution History**: The `History` modal lists previous runs from SQLite with `Replay / Inspect`.
-6. **Studio Palette**: The floating palette's `Add AI Agent Node` appends a `New Agent` node and opens its inspector.
-7. **Reasoning Variants**: Selecting `deepseek-v4.1-flash-free` in the inspector re-renders the native reasoning variant dropdown from the live model catalog (low/high/max).
 

@@ -5,7 +5,6 @@ interface Props {
   mode: 'live' | 'sample';
   agentsCount: number;
   teamsCount: number;
-  pipelinesCount: number;
   runsCount: number;
   onClose: () => void;
 }
@@ -14,7 +13,6 @@ export const SourceModal: React.FC<Props> = ({
   mode,
   agentsCount,
   teamsCount,
-  pipelinesCount,
   runsCount,
   onClose,
 }) => {
@@ -42,7 +40,7 @@ export const SourceModal: React.FC<Props> = ({
           </div>
 
           <p>
-            Operating with <b>{agentsCount}</b> people across <b>{teamsCount}</b> teams, <b>{pipelinesCount}</b> pipeline workflows, and <b>{runsCount}</b> logged run receipts.
+            Operating with <b>{agentsCount}</b> people across <b>{teamsCount}</b> teams and <b>{runsCount}</b> logged run receipts.
           </p>
 
           <div className="flex items-start gap-2.5 p-3 rounded-xl bg-[var(--green)]/10 border border-[var(--green)]/30 text-[var(--green)]">

@@ -106,13 +106,16 @@ test.describe('R1: Minimalist Executive Chat & Manager Direct Consultation', () 
     });
 
     // 1. Verify all 7 core navigation items exist in the sidebar
-    const navLabels = ['Company', 'Conversations', 'Team Stream', 'Results', 'Calendar', 'Settings'];
+    const navLabels = ['CEO', 'Company', 'Conversations', 'Team Stream', 'Results', 'Settings'];
     for (const label of navLabels) {
       await expect(page.getByRole('button', { name: label, exact: true })).toBeVisible();
     }
     await expect(page.getByRole('button', { name: /^Inbox/ })).toBeVisible();
 
     // 2. Navigate through every view
+    await page.getByRole('button', { name: 'CEO', exact: true }).click();
+    await expect(page.getByRole('heading', { name: /CEO Control Plane/ })).toBeVisible();
+
     await page.getByRole('button', { name: 'Conversations', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'OpenCode Chat' })).toBeVisible();
 
@@ -121,9 +124,6 @@ test.describe('R1: Minimalist Executive Chat & Manager Direct Consultation', () 
 
     await page.getByRole('button', { name: 'Results', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Results', exact: true })).toBeVisible();
-
-    await page.getByRole('button', { name: 'Calendar', exact: true }).click();
-    await expect(page.getByRole('heading', { name: 'Calendar', exact: true })).toBeVisible();
 
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible();

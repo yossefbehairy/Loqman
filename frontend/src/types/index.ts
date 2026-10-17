@@ -1,42 +1,4 @@
-export type NodeExecutionStatus =
-  | 'pending'
-  | 'ready'
-  | 'running'
-  | 'succeeded'
-  | 'failed'
-  | 'skipped'
-  | 'cancelled';
-
 export type TaskDepth = 'Quick' | 'Standard' | 'Deep';
-
-export interface AgentNodeData {
-  display_name?: string;
-  role_type?: string;
-  model_id?: string;
-  variant?: string;
-  task_depth?: TaskDepth;
-  instructions?: string;
-  timeout?: number;
-  // Live execution state injected dynamically
-  executionStatus?: NodeExecutionStatus;
-  attemptCount?: number;
-  durationMs?: number;
-  output?: any;
-  errorMessage?: string;
-}
-
-export interface StartNodeData {
-  label?: string;
-  initialInput?: string;
-  executionStatus?: NodeExecutionStatus;
-  output?: any;
-}
-
-export interface OutputNodeData {
-  label?: string;
-  executionStatus?: NodeExecutionStatus;
-  output?: any;
-}
 
 export interface ModelCost {
   input: number;
@@ -62,88 +24,6 @@ export interface AgentProfile {
   task_depth: TaskDepth;
   default_model_id?: string | null;
   default_variant_id?: string | null;
-}
-
-export interface ValidationResult {
-  valid: boolean;
-  errors: string[];
-  topological_order: string[];
-}
-
-export interface WorkflowDefinition {
-  nodes: any[];
-  edges: any[];
-}
-
-export interface Workflow {
-  id: string;
-  name: string;
-  description?: string;
-  definition_json: string;
-  version: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface NodeExecution {
-  id: string;
-  execution_id: string;
-  node_id: string;
-  role_type?: string;
-  model_id?: string;
-  native_variant_id?: string;
-  task_depth: string;
-  status: NodeExecutionStatus;
-  attempt_count: number;
-  input_json?: string;
-  output_json?: string;
-  error_message?: string;
-  started_at?: string;
-  finished_at?: string;
-  duration_ms?: number;
-}
-
-export interface ExecutionEvent {
-  id: string;
-  execution_id: string;
-  node_execution_id?: string;
-  event_type: string;
-  event_json: string;
-  created_at: string;
-}
-
-export interface WorkflowExecution {
-  id: string;
-  workflow_id: string;
-  status: string;
-  input_json?: string;
-  final_output_json?: string;
-  workflow_snapshot_json?: string;
-  runtime_status?: string;
-  started_at?: string;
-  finished_at?: string;
-  error_summary?: string;
-  node_executions: NodeExecution[];
-  events: ExecutionEvent[];
-}
-
-export interface TeamMessage {
-  execution_id: string;
-  turn: number;
-  from_node_id: string;
-  from_display_name: string;
-  from_role: string;
-  to_node_ids: string[];
-  excerpt: string;
-  full_output_ref: string;
-  timestamp: string;
-  created_at?: string;
-}
-
-export interface TeamMessageListResponse {
-  execution_id: string;
-  count: number;
-  messages: TeamMessage[];
 }
 
 export interface RuntimeHealth {
@@ -276,6 +156,16 @@ export interface CeoAskResponse {
   reply: string;
   actions_proposed: CeoProposedAction[];
   iterations: number;
+}
+
+/** Live stage of an in-flight CEO ask (GET /api/ceo/ask-progress/{id}). */
+export interface CeoAskProgress {
+  stage: string;
+  detail: string;
+  iteration: number;
+  started_at?: string | null;
+  updated_at?: string | null;
+  done: boolean;
 }
 
 export interface CeoCreatedProfile {

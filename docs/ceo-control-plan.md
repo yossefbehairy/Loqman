@@ -65,9 +65,16 @@ backend/app/db/models.py
 
 ```
 POST /api/ceo/ask
-  body:    { question: str(1..2000), model_id?: free-only, variant? }
+  body:    { question: str(1..2000), model_id?: free-only, variant?, request_id?: str(≤64) }
   returns: { reply: str, actions_proposed: [{id, kind, summary}], iterations: n }
-  errors:  400 سؤال فارغ · 502 runtime/فشل موديل (نفس أسلوب missions)
+  errors:  400 سؤال فارغ/موديل غير معتمد · 502 runtime/فشل موديل (نفس أسلوب missions)
+
+GET  /api/ceo/ask-progress/{request_id}
+  returns: { stage, detail, iteration, started_at, updated_at, done }
+  errors:  404 لمعرّف غير معروف
+  ملاحظة: عند تمرير request_id من الواجهة، يسجّل الباكند المرحلة الحية
+  (starting → thinking → tool → final → done) داخل نفس الطلب المتزامن،
+  والواجهة تستقصيها كل ~1.2 ثانية وتعرض شريط حالة + عدّاد ثوانٍ بدل سبينر صامت.
 
 POST /api/ceo/actions                 → إنشاء اقتراح يدوي (اختياري v1.1)
 GET  /api/ceo/actions?status=pending  → قائمة المعلّق
@@ -130,8 +137,9 @@ POST /api/ceo/actions/{id}/deny      → رفض مسجل
 | **P1 — اسأل الـ CEO (read-only)** | ✅ مكتمل | `orchestration/agent_loop.py` + `orchestration/ceo_tools.py` (4 أدوات قراءة) + `POST /api/ceo/ask` — `tests/test_ceo_ask.py` |
 | **P2 — اقتراح + تأكيد** | ✅ مكتمل | جدول `pending_actions` + approve/deny بهيدر `X-AgentOS-Confirm` (403 بدونه، 409 للتكرار، optimistic concurrency للعقود) + SSE `ceo.action.decided` — `tests/test_ceo_actions.py` |
 | **P3 — فرق بأمره** | ✅ مكتمل | دور `security_auditor` + أداة `propose_new_team` (1–8 أعضاء، سكيمة Pydantic، تحقق الباتش كامل قبل أول كتابة، صفر zombie rows) + approve ذري يرجع `created_profiles`/`team_name` + **واجهة CEO كاملة** (أول عنصر في الـ nav: Ask + صندوق موافقات بتأكيد داخل التطبيق) + **مادية الفريق في شاشة الشركة** (الاعتماد → Team + Agents مرتبطين بـ profileId) — `tests/test_ceo_team.py` + E2E `e2e/ceo_control_plane.spec.ts` |
+| **P4 — تحكم حي في الموديل + تقدم مرئي** | ✅ مكتمل | محدد موديل/فارينت مبني على الكاتالوج الحي (`/api/models/free`) مباشرة في كارت الـ CEO + سجل تقدم `GET /api/ceo/ask-progress/{request_id}` مع عدّاد ثوانٍ في الواجهة + كل قوائم الموديلات في التطبيق (الإعدادات، محرر العقود) تُبنى من الكاتالوج الحي بدل قوائم مكتوبة يدويًا — `tests/test_ceo_ask.py` |
 
 **ملاحظات:**
 - عقد `suggested_mission = None` لم يتغير. الاختبارات الـ 7 challenger القديمة التي كانت تؤكد العقد السابق تم تحديثها لتؤكد العقد الحالي (`is None`) بدل بقائها حمراء/مستبعدة — نفس القرار، اختبارات متسقة معه.
-- الإجمالي الآن: **143 اختبار backend** + **47 اختبار E2E** (9 ملفات، `RUNTIME_MODE=mock`) — كلها خضراء محليًا، وبوابة CI تشمل E2E.
+- الإجمالي الآن: **145 اختبار backend** + **40 اختبار E2E** (8 ملفات، `RUNTIME_MODE=mock`) — كلها خضراء محليًا، وبوابة CI تشمل E2E.
 - "توحيد Team مع الفرونتند" نُفِّذ بدون نقل الفرق من `localStorage` إلى DB: الاعتماد يبني `Team` + `Agent` في حالة الفرونت (مربوطين بالـ `profileId` الحقيقي) فيظهرون فورًا في Company. النقل الكامل لـ DB يبقى خيارًا مستقبليًا لو احتجناه.

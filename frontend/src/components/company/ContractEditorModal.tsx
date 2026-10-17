@@ -11,8 +11,17 @@ import {
   User,
   Sliders,
 } from 'lucide-react';
-import type { CompanyMember, TaskDepth } from '../../types';
-import { updateAgentProfile } from '../../api/client';
+import type { CompanyMember, ModelCatalogEntry, TaskDepth } from '../../types';
+import { getFreeModels, updateAgentProfile } from '../../api/client';
+
+// Rendered only while the live catalog is unreachable. Ids mirror the static
+// fallback list in data/agentosDefaults.ts (all exist in the real free catalog).
+const FALLBACK_FREE_MODELS: { id: string; name: string }[] = [
+  { id: 'deepseek-v4.1-flash-free', name: 'DeepSeek V4.1 Flash Free' },
+  { id: 'deepseek-ai/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash (Nvidia)' },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash (AgentRouter)' },
+  { id: 'nemotron-3.5-super-vl-free', name: 'Nemotron 3.5 Super VL Free' },
+];
 
 interface ContractEditorModalProps {
   member: CompanyMember | null;
@@ -43,6 +52,42 @@ const ContractEditorForm: React.FC<ContractEditorFormProps> = ({
   const [strictJson, setStrictJson] = useState(member.contract?.strict_json ?? true);
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // Live free catalog: the dropdown must only offer models that really exist
+  // and are verified free. Falls back to FALLBACK_FREE_MODELS when offline.
+  const [models, setModels] = useState<ModelCatalogEntry[]>([]);
+
+  useEffect(() => {
+    let ignore = false;
+    getFreeModels()
+      .then((list) => {
+        if (!ignore) setModels(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  const knownIds = models.length > 0 ? models.map((m) => m.id) : FALLBACK_FREE_MODELS.map((m) => m.id);
+  const modelUnknown = Boolean(modelId) && !knownIds.includes(modelId);
+  const selectedModel = models.find((m) => m.id === modelId);
+  const variantChoices = (() => {
+    if (selectedModel?.variants?.length) {
+      return selectedModel.variants.includes(variant)
+        ? selectedModel.variants
+        : [variant, ...selectedModel.variants];
+    }
+    const base = ['low', 'high', 'max'];
+    return base.includes(variant) ? base : [variant, ...base];
+  })();
+
+  const handleModelPick = (nextId: string) => {
+    setModelId(nextId);
+    const picked = models.find((m) => m.id === nextId);
+    if (picked?.variants?.length && !picked.variants.includes(variant)) {
+      setVariant(picked.variants[0]);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -228,30 +273,30 @@ const ContractEditorForm: React.FC<ContractEditorFormProps> = ({
               <select
                 name="model_id"
                 value={modelId}
-                onChange={(e) => setModelId(e.target.value)}
+                onChange={(e) => handleModelPick(e.target.value)}
                 className="w-full px-3 py-2 bg-gray-950 border border-gray-800 rounded-lg text-sm text-white focus:outline-none focus:border-indigo-500"
               >
-                <optgroup label="DeepSeek Free Models">
-                  <option value="deepseek-v4.1-flash-free">
-                    DeepSeek V4.1 Flash Free (Zero Cost)
-                  </option>
-                  <option value="deepseek-ai/deepseek-v4.1-flash">
-                    DeepSeek V4.1 Flash (Nvidia Free)
-                  </option>
-                  <option value="deepseek-v4-flash">
-                    DeepSeek V4 Flash (AgentRouter Free)
-                  </option>
-                </optgroup>
-                <optgroup label="Muse Contributor Free">
-                  <option value="muse-spark-1.3-contributor-free">
-                    Muse Spark 1.3 Contributor Free
-                  </option>
-                </optgroup>
-                <optgroup label="Nemotron Multimodal Free">
-                  <option value="nemotron-3.5-super-vl-free">
-                    Nemotron 3.5 Super VL Free
-                  </option>
-                </optgroup>
+                {models.length === 0 &&
+                  FALLBACK_FREE_MODELS.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name}
+                    </option>
+                  ))}
+                {models.length > 0 &&
+                  Array.from(new Set(models.map((m) => m.provider_id))).map((provider) => (
+                    <optgroup key={provider} label={provider}>
+                      {models
+                        .filter((m) => m.provider_id === provider)
+                        .map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.name}
+                          </option>
+                        ))}
+                    </optgroup>
+                  ))}
+                {modelUnknown && (
+                  <option value={modelId}>{modelId} (not in the live free catalog)</option>
+                )}
               </select>
             </div>
 
@@ -265,9 +310,18 @@ const ContractEditorForm: React.FC<ContractEditorFormProps> = ({
                 onChange={(e) => setVariant(e.target.value)}
                 className="w-full px-3 py-2 bg-gray-950 border border-gray-800 rounded-lg text-sm text-white focus:outline-none focus:border-indigo-500"
               >
-                <option value="low">low (Fast response / low tokens)</option>
-                <option value="high">high (Standard reasoning depth)</option>
-                <option value="max">max (Maximum reasoning depth)</option>
+                {variantChoices.map((choice) => (
+                  <option key={choice} value={choice}>
+                    {choice}
+                    {choice === 'none' ? ' (No extended reasoning)' : ''}
+                    {choice === 'minimal' ? ' (Minimal reasoning)' : ''}
+                    {choice === 'low' ? ' (Fast response / low tokens)' : ''}
+                    {choice === 'medium' ? ' (Balanced reasoning depth)' : ''}
+                    {choice === 'high' ? ' (Standard reasoning depth)' : ''}
+                    {choice === 'xhigh' ? ' (Extra-high reasoning depth)' : ''}
+                    {choice === 'max' ? ' (Maximum reasoning depth)' : ''}
+                  </option>
+                ))}
               </select>
             </div>
           </div>
