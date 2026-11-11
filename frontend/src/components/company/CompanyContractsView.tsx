@@ -16,7 +16,7 @@ import { ContractEditorModal } from './ContractEditorModal';
 import { getAgentProfiles } from '../../api/client';
 
 export const CompanyContractsView: React.FC = () => {
-  const [selectedDept, setSelectedDept] = useState<'all' | DepartmentId | 'qa'>('all');
+  const [selectedDept, setSelectedDept] = useState<'all' | DepartmentId>('all');
   const [members, setMembers] = useState<CompanyMember[]>(DEFAULT_COMPANY_MEMBERS);
   const [editingMember, setEditingMember] = useState<CompanyMember | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -44,8 +44,8 @@ export const CompanyContractsView: React.FC = () => {
                 return {
                   ...member,
                   natural_name:
-                    parsedSettings.arabic_name ||
                     matchedProfile.name ||
+                    member.english_name ||
                     member.natural_name,
                   title: parsedSettings.title || member.title,
                   system_prompt:
@@ -90,12 +90,11 @@ export const CompanyContractsView: React.FC = () => {
     );
   };
 
-  const departmentKeys: DepartmentId[] = ['planning', 'research', 'quality'];
-  const normalizedDept = selectedDept === 'qa' ? 'quality' : selectedDept;
+  const departmentKeys: DepartmentId[] = ['planning', 'execution'];
   const activeDepartments =
-    normalizedDept === 'all'
+    selectedDept === 'all'
       ? departmentKeys
-      : departmentKeys.filter((id) => id === normalizedDept);
+      : departmentKeys.filter((id) => id === selectedDept);
 
   const executiveMembers = members.filter((m) => m.department === 'executive');
 
@@ -147,33 +146,20 @@ export const CompanyContractsView: React.FC = () => {
                     : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
                 }`}
               >
-                <span>Planning (التخطيط)</span>
+                <span>Planning (البوصلة)</span>
               </button>
 
               <button
                 type="button"
-                data-dept-tab="research"
-                onClick={() => setSelectedDept('research')}
+                data-dept-tab="execution"
+                onClick={() => setSelectedDept('execution')}
                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap flex items-center gap-1.5 ${
-                  selectedDept === 'research'
+                  selectedDept === 'execution'
                     ? 'bg-amber-600 text-white shadow-md shadow-amber-600/30'
                     : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
                 }`}
               >
-                <span>Research (التحليل)</span>
-              </button>
-
-              <button
-                type="button"
-                data-dept-tab="qa"
-                onClick={() => setSelectedDept('qa')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all whitespace-nowrap flex items-center gap-1.5 ${
-                  selectedDept === 'qa'
-                    ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30'
-                    : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800'
-                }`}
-              >
-                <span>Quality (الجودة)</span>
+                <span>Execution (الإنجاز)</span>
               </button>
             </div>
           </div>
@@ -210,9 +196,6 @@ export const CompanyContractsView: React.FC = () => {
                           <h4 className="text-lg font-bold text-white">
                             {member.natural_name}
                           </h4>
-                          <span className="text-xs text-gray-400">
-                            ({member.english_name})
-                          </span>
                         </div>
                         <p className="text-xs text-gray-300 font-arabic">
                           {member.title}
@@ -338,9 +321,6 @@ export const CompanyContractsView: React.FC = () => {
                                 <h4 className="text-base font-bold text-white">
                                   {member.natural_name}
                                 </h4>
-                                <span className="text-xs text-gray-400">
-                                  ({member.english_name})
-                                </span>
                               </div>
                               <p className="text-xs text-gray-400 font-arabic">
                                 {member.title}

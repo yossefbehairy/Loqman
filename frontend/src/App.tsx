@@ -24,7 +24,7 @@ import {
   TEAM_COLORS,
 } from './data/agentosDefaults';
 import { CompanyView } from './components/company/CompanyView';
-import { CeoControlView } from './components/ceo/CeoControlView';
+import { CeoChatView } from './components/ceo/CeoChatView';
 import { InboxView } from './components/inbox/InboxView';
 import { ConversationsView } from './components/conversations/ConversationsView';
 import { TeamStreamView } from './components/stream/TeamStreamView';
@@ -36,18 +36,77 @@ import { HelpModal } from './components/modals/HelpModal';
 import { SourceModal } from './components/modals/SourceModal';
 import { TaskInspectionModal } from './components/modals/TaskInspectionModal';
 import {
+  BarChart3,
+  Bell,
   Building2,
+  ChevronRight,
+  CircleHelp,
   Crown,
   Inbox,
+  MessageCircle,
   MessageSquare,
-  BarChart3,
-  Settings,
+  MoreHorizontal,
+  PanelLeftClose,
+  PanelRight,
+  Plus,
   Radio,
+  Search,
+  Settings,
+  Sparkles,
+  X,
+  Zap,
 } from 'lucide-react';
-import { createDelegatedMission, createMission, getAgentProfiles, getFreeModels, getMission, getRuntimeHealth, createAgentProfile, deleteAgentProfile } from './api/client';
-import type { AgentProfile, MissionOut, ModelCatalogEntry, SuggestedMission } from './types';
+import { createDelegatedMission, createMission, getAgentProfiles, getFreeModels, getMission, getRuntimeHealth, createAgentProfile, deleteAgentProfile, listCeoActions } from './api/client';
+import { openMissionEvents } from './api/transport';
+import type { AgentProfile, CeoThread, MissionOut, ModelCatalogEntry, RuntimeHealth, SuggestedMission } from './types';
 import { sendOpenCodeMessage } from './api/opencode';
 import { resolveCompanyEmployees, suggestRoleType } from './utils/employeeLink';
+
+const ORG_SEED_KEY = 'agentos_org_seed_v1';
+const ORG_NAMES_KEY = 'agentos_org_names_v2';
+
+// Display names are English; the Arabic names remain in the contracts copy.
+const ORG_NAME_MAP: Record<string, string> = {
+  'Loqman (لقمان)': 'Loqman',
+  'د. سارة': 'Dr. Sara',
+  'م. طارق': 'Eng. Tarek',
+  'أ. ياسمين': 'Prof. Yasmin',
+  'خالد': 'Khaled',
+  'ليلى': 'Layla',
+  'نور': 'Nour',
+  'أحمد': 'Ahmed',
+  'عمر': 'Omar',
+  'منى': 'Mona',
+};
+
+function englishifyOrgText(value: string): string {
+  return value
+    .replace(/فريق البوصلة\s*·\s*Compass/g, 'Compass')
+    .replace(/فريق الإنجاز\s*·\s*Forge/g, 'Forge')
+    .replace(/فريق البوصلة\s*\(Compass\)/g, 'Compass')
+    .replace(/فريق الإنجاز\s*\(Forge\)/g, 'Forge')
+    .replace(/Compass\s*\(البوصلة\)/g, 'Compass')
+    .replace(/Forge\s*\(الإنجاز\)/g, 'Forge')
+    .replace(/فريق البوصلة/g, 'Compass')
+    .replace(/فريق الإنجاز/g, 'Forge')
+    .replace(/للبوصلة/g, 'لـ Compass')
+    .replace(/بالبوصلة/g, 'بـ Compass')
+    .replace(/والبوصلة/g, 'و Compass')
+    .replace(/البوصلة/g, 'Compass')
+    .replace(/للإنجاز/g, 'لـ Forge')
+    .replace(/بالإنجاز/g, 'بـ Forge')
+    .replace(/والإنجاز/g, 'و Forge')
+    .replace(/الإنجاز/g, 'Forge')
+    .replace(/Loqman\s*\(لقمان\)/g, 'Loqman')
+    .replace(/Dr\. Sara\s*\(د\. سارة\)/g, 'Dr. Sara')
+    .replace(/Eng\. Tarek\s*\(م\. طارق\)/g, 'Eng. Tarek')
+    .replace(/Prof\. Yasmin\s*\(أ\. ياسمين\)/g, 'Prof. Yasmin')
+    .replace(/د\. سارة/g, 'Dr. Sara')
+    .replace(/م\. طارق/g, 'Eng. Tarek')
+    .replace(/أ\. ياسمين/g, 'Prof. Yasmin')
+    .replace(/ياسمين/g, 'Prof. Yasmin')
+    .replace(/لقمان/g, 'Loqman');
+}
 
 function safeParse<T>(key: string, fallback: T): T {
   try {
@@ -100,6 +159,31 @@ function missionSynthesisText(mission: MissionOut): string | null {
   return text.trim() ? text.slice(0, 1200) : null;
 }
 
+/** Sidebar sections for the CEO ask history (newest first, filtered by query). */
+function buildThreadGroups(
+  threads: CeoThread[],
+  query: string
+): { label: string; items: CeoThread[] }[] {
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const q = query.trim().toLowerCase();
+  const visible = [...threads]
+    .sort((a, b) => b.ts - a.ts)
+    .filter((t) => !q || t.question.toLowerCase().includes(q));
+  const groups: { label: string; items: CeoThread[] }[] = [
+    { label: 'Today', items: [] },
+    { label: 'Previous 7 days', items: [] },
+    { label: 'Previous 30 days', items: [] },
+  ];
+  visible.forEach((thread) => {
+    const age = now - thread.ts;
+    if (age < day) groups[0].items.push(thread);
+    else if (age < 7 * day) groups[1].items.push(thread);
+    else groups[2].items.push(thread);
+  });
+  return groups.filter((group) => group.items.length > 0);
+}
+
 export function App() {
   // Navigation State
   const [page, setPage] = useState<Page>(() => {
@@ -143,6 +227,56 @@ export function App() {
   const [freeModels, setFreeModels] = useState<ModelCatalogEntry[]>([]);
   const [employeeProfiles, setEmployeeProfiles] = useState<AgentProfile[]>([]);
   const [busyConversations, setBusyConversations] = useState<Record<string, boolean>>({});
+
+  // Shell & CEO console UI state (local-only)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() =>
+    safeParse('agentos_sidebar_collapsed', false)
+  );
+  const [ceoThreads, setCeoThreads] = useState<CeoThread[]>(() =>
+    safeParse('agentos_ceo_threads_v1', [] as CeoThread[]).map((t: CeoThread) => ({
+      // v1 threads stored a single Q&A; normalize into turns so the same
+      // thread can collect follow-up questions from here on.
+      ...t,
+      turns:
+        t.turns && t.turns.length > 0
+          ? t.turns
+          : [{ question: t.question, reply: t.reply, error: t.error, proposed: t.proposed ?? [], ts: t.ts }],
+    }))
+  );
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [threadSearch, setThreadSearch] = useState('');
+  const [runtimeInfo, setRuntimeInfo] = useState<RuntimeHealth | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState(0);
+  // The CEO approvals inbox dialog — opened by the topbar bell.
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
+
+  const refreshRuntime = useCallback(() => {
+    getRuntimeHealth()
+      .then(setRuntimeInfo)
+      .catch(() => setRuntimeInfo(null));
+  }, []);
+
+  useEffect(() => {
+    refreshRuntime();
+  }, [refreshRuntime]);
+
+  // Topbar bell: best-effort count of the CEO's pending proposals.
+  useEffect(() => {
+    let ignore = false;
+    const pull = () => {
+      listCeoActions('pending')
+        .then((actions) => {
+          if (!ignore) setPendingApprovals(actions.length);
+        })
+        .catch(() => undefined);
+    };
+    pull();
+    const id = window.setInterval(pull, 20000);
+    return () => {
+      ignore = true;
+      window.clearInterval(id);
+    };
+  }, []);
 
   useEffect(() => {
     let ignore = false;
@@ -272,6 +406,99 @@ export function App() {
     document.documentElement.dataset.theme = settings.theme;
   }, [settings]);
 
+  useEffect(() => {
+    localStorage.setItem('agentos_sidebar_collapsed', JSON.stringify(sidebarCollapsed));
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem('agentos_ceo_threads_v1', JSON.stringify(ceoThreads));
+  }, [ceoThreads]);
+
+  // One-time organization migration: existing workspaces move onto the Loqman
+  // company (CEO Loqman + Compass planning + Forge execution). Missing teams
+  // and members are added once; user-created work is never overwritten.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(ORG_SEED_KEY)) return;
+      const norm = (value: string) =>
+        (value || '').toLowerCase().replace(/[^a-z\u0600-\u06ff0-9]+/g, ' ').trim();
+      const seedCeo = INITIAL_AGENTS.find((a) => a.mgr && !a.team) || null;
+
+      setAgents((prev) => {
+        const hasCeo = prev.some((a) => a.mgr && !a.team);
+        let next = prev.map((agent) => {
+          if (!hasCeo || !agent.mgr || agent.team) return agent;
+          const legacyName = ['adel mansour', 'general manager', 'المدير العام', 'ceo'].includes(
+            norm(agent.name)
+          );
+          if (!legacyName) return agent;
+          return {
+            ...agent,
+            name: seedCeo?.name || 'Loqman',
+            role: seedCeo?.role || 'الرئيس التنفيذي · CEO',
+            profileId: agent.profileId || seedCeo?.profileId || 'custom',
+            prompt: seedCeo?.prompt || agent.prompt,
+          };
+        });
+        if (!next.some((a) => a.mgr && !a.team) && seedCeo) {
+          next = [seedCeo, ...next];
+        }
+        const ids = new Set(next.map((a) => a.id));
+        const profileIds = new Set(next.map((a) => a.profileId).filter(Boolean) as string[]);
+        const names = new Set(next.map((a) => norm(a.name)));
+        const missing = INITIAL_AGENTS.filter(
+          (a) =>
+            !ids.has(a.id) &&
+            !(a.profileId && profileIds.has(a.profileId)) &&
+            !names.has(norm(a.name)) &&
+            !(a.mgr && !a.team) // never add a second CEO
+        );
+        return [...next, ...missing];
+      });
+
+      setTeams((prev) => {
+        const ids = new Set(prev.map((t) => t.id));
+        const names = new Set(prev.map((t) => norm(t.name)));
+        const missing = INITIAL_TEAMS.filter(
+          (t) => !ids.has(t.id) && !names.has(norm(t.name))
+        );
+        return [...prev, ...missing];
+      });
+
+      localStorage.setItem(ORG_SEED_KEY, '1');
+    } catch {
+      /* storage unavailable — INITIAL_* defaults still apply */
+    }
+    // Runs once on mount; the flag keeps it idempotent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // One-time name pass: earlier Loqman workspaces used Arabic/bilingual display
+  // names. Translate only the shipped names; a user's custom name is untouched.
+  useEffect(() => {
+    try {
+      if (localStorage.getItem(ORG_NAMES_KEY)) return;
+      setAgents((prev) =>
+        prev.map((agent) => ({
+          ...agent,
+          name: ORG_NAME_MAP[agent.name] ?? englishifyOrgText(agent.name),
+          prompt: englishifyOrgText(agent.prompt),
+        }))
+      );
+      setTeams((prev) =>
+        prev.map((team) => ({
+          ...team,
+          name: englishifyOrgText(team.name),
+          desc: englishifyOrgText(team.desc),
+        }))
+      );
+      localStorage.setItem(ORG_NAMES_KEY, '1');
+    } catch {
+      /* storage unavailable — defaults already use English names */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Sync Page to Hash
   const navigateTo = useCallback((newPage: Page) => {
     setPage(newPage);
@@ -345,11 +572,12 @@ export function App() {
   );
 
   // The main conversation uses a persistent OpenCode SDK session. Mission creation is explicit.
-  const missionPollersRef = React.useRef<Record<string, number>>({});
+  // PR4: missions stream over SSE (replay + live) instead of 2.5s polling.
+  const missionWatchersRef = React.useRef<Record<string, ReturnType<typeof openMissionEvents>>>({});
   useEffect(() => {
-    const pollers = missionPollersRef.current;
+    const watchers = missionWatchersRef.current;
     return () => {
-      Object.values(pollers).forEach((id) => window.clearInterval(id));
+      Object.values(watchers).forEach((es) => es.close());
     };
   }, []);
 
@@ -588,34 +816,30 @@ export function App() {
     [employeeProfiles, teams]
   );
 
-  const pollMission = useCallback(
+  const watchMission = useCallback(
     (
       missionId: string,
       agentId: string,
       handover?: { managerName: string; managerRole: string; employeeAgentId?: string }
     ) => {
-      if (missionPollersRef.current[missionId]) return;
+      if (missionWatchersRef.current[missionId]) return;
       const managerName = handover?.managerName || 'CEO';
       const managerRole = handover?.managerRole || 'CEO';
-      const timer = window.setInterval(async () => {
-        let m: MissionOut;
-        try {
-          m = await getMission(missionId);
-        } catch (e: any) {
-          appendMessage(agentId, `⚠️ Lost contact with mission ${missionId.slice(0, 8)}: ${e?.message || e}. It keeps running on the server; check Inbox later.`);
-          window.clearInterval(missionPollersRef.current[missionId]);
-          delete missionPollersRef.current[missionId];
-          return;
+      // Live stream: the backend replays the mission state, then pushes every
+      // status change. No polling loop; one snapshot fetch per event burst.
+      const es = openMissionEvents(missionId);
+      missionWatchersRef.current[missionId] = es;
+
+      let lastProgressKey = '';
+      let snapTimer: number | null = null;
+
+      const finalize = (m: MissionOut) => {
+        es.close();
+        delete missionWatchersRef.current[missionId];
+        if (snapTimer !== null) {
+          window.clearTimeout(snapTimer);
+          snapTimer = null;
         }
-        if (m.status === 'planning' || m.status === 'running' || m.status === 'queued') {
-          const done = m.tasks.filter((t) => t.status === 'succeeded' || t.status === 'failed').length;
-          if (done > 0 && m.status === 'running') {
-            appendMessage(agentId, `⏳ Mission ${missionId.slice(0, 8)} running: ${done}/${m.tasks.length} employee tasks finished.`);
-          }
-          return;
-        }
-        window.clearInterval(missionPollersRef.current[missionId]);
-        delete missionPollersRef.current[missionId];
         // R5: finalize the employees' recorded handover with the real outcome.
         recordMissionHandover(m, managerName, managerRole, handover?.employeeAgentId);
         if (m.status === 'succeeded' || m.status === 'partially_succeeded') {
@@ -637,8 +861,54 @@ export function App() {
             `❌ Employee task ${missionId.slice(0, 8)} failed: ${(m.error_summary || 'unknown error').slice(0, 500)}`
           );
         }
-      }, 2500);
-      missionPollersRef.current[missionId] = timer;
+      };
+
+      const handleSnapshot = async (reason: 'event' | 'catch-up') => {
+        let m: MissionOut;
+        try {
+          m = await getMission(missionId);
+        } catch (e: any) {
+          if (reason === 'catch-up' && missionWatchersRef.current[missionId] === es) {
+            es.close();
+            delete missionWatchersRef.current[missionId];
+            appendMessage(agentId, `⚠️ Lost contact with mission ${missionId.slice(0, 8)}: ${e?.message || e}. It keeps running on the server; check Inbox later.`);
+          }
+          return;
+        }
+        if (!missionWatchersRef.current[missionId]) return; // finalized meanwhile
+        if (m.status === 'planning' || m.status === 'running' || m.status === 'queued') {
+          const done = m.tasks.filter((t) => t.status === 'succeeded' || t.status === 'failed').length;
+          const progressKey = `${m.status}:${done}/${m.tasks.length}`;
+          if (done > 0 && m.status === 'running' && progressKey !== lastProgressKey) {
+            lastProgressKey = progressKey;
+            appendMessage(agentId, `⏳ Mission ${missionId.slice(0, 8)} running: ${done}/${m.tasks.length} employee tasks finished.`);
+          }
+          return;
+        }
+        finalize(m);
+      };
+
+      const scheduleSnapshot = (reason: 'event' | 'catch-up') => {
+        if (!missionWatchersRef.current[missionId]) return;
+        if (reason === 'event') {
+          if (snapTimer !== null) return; // debounce bursts of task events
+          snapTimer = window.setTimeout(() => {
+            snapTimer = null;
+            void handleSnapshot('event');
+          }, 300);
+          return;
+        }
+        void handleSnapshot(reason);
+      };
+
+      const onLiveEvent = () => scheduleSnapshot('event');
+      ['mission.status.changed', 'task.status.changed'].forEach((name) =>
+        es.addEventListener(name, onLiveEvent)
+      );
+      // EventSource reconnects on its own; catch up on anything missed while
+      // the stream was down so no status change is ever dropped silently.
+      es.onerror = () => scheduleSnapshot('catch-up');
+      es.onopen = () => scheduleSnapshot('catch-up');
     },
     [appendMessage, deliverMissionToInbox, recordMissionHandover]
   );
@@ -685,7 +955,7 @@ export function App() {
               mission,
               text
             );
-            pollMission(mission.id, agentId, {
+            watchMission(mission.id, agentId, {
               managerName,
               managerRole,
               employeeAgentId: roleEntry.agent.id,
@@ -717,7 +987,7 @@ export function App() {
         }
       })();
     },
-    [appendAgentReply, appendMessage, agents, employeeProfiles, freeModels, pollMission, recordDelegationStart, settings.defModel, settings.reason]
+    [appendAgentReply, appendMessage, agents, employeeProfiles, freeModels, watchMission, recordDelegationStart, settings.defModel, settings.reason]
   );
 
   const handleDelegateTask = useCallback(async (payload: {
@@ -742,12 +1012,12 @@ export function App() {
         payload.instructions || payload.title
       );
     }
-    pollMission(mission.id, activeConvoId, {
+    watchMission(mission.id, activeConvoId, {
       managerName,
       managerRole,
       employeeAgentId: employee?.id,
     });
-  }, [activeConvoId, agents, appendMessage, employeeProfiles, pollMission, recordDelegationStart]);
+  }, [activeConvoId, agents, appendMessage, employeeProfiles, watchMission, recordDelegationStart]);
 
   const handleLaunchMission = useCallback((agentId: string, suggested: SuggestedMission) => {
     const goal = suggested.input_json?.goal;
@@ -766,12 +1036,12 @@ export function App() {
         });
         appendMessage(agentId, `📋 Mission ${mission.id.slice(0, 8)} started. The AI team is planning with ${mission.model_id || settings.defModel}.`);
         // Employees are only known per task here — turns are recorded on completion.
-        pollMission(mission.id, agentId, { managerName: 'CEO', managerRole: 'CEO' });
+        watchMission(mission.id, agentId, { managerName: 'CEO', managerRole: 'CEO' });
       } catch (e: any) {
         appendMessage(agentId, `❌ Could not start mission: ${e?.message || e}`);
       }
     })();
-  }, [appendMessage, freeModels, pollMission, settings.defModel, settings.reason]);
+  }, [appendMessage, freeModels, watchMission, settings.defModel, settings.reason]);
 
   // Contract Saving & Editing
   const handleSaveContract = useCallback(
@@ -1073,7 +1343,7 @@ export function App() {
             id: `task_${item.id}`,
             title: item.title,
             agentId: item.target || 'a1',
-            agentName: targetAgent ? targetAgent.name : 'AgentOS Employee',
+            agentName: targetAgent ? targetAgent.name : 'Loqman Employee',
             department: 'Operations',
             status: item.st || 'Informational',
             summary: item.sub,
@@ -1183,6 +1453,7 @@ export function App() {
       'agentos_runs_v2',
       'agentos_msgs_v2',
       'agentos_settings',
+      'agentos_ceo_threads_v1',
     ];
     keys.forEach((k) => {
       try {
@@ -1197,6 +1468,8 @@ export function App() {
     setRuns(INITIAL_RUNS);
     setMessages(INITIAL_MESSAGES);
     setSettings(INITIAL_SETTINGS);
+    setCeoThreads([]);
+    setActiveThreadId(null);
     setSelectedAgentId(null);
     setFocusTeamId(null);
     setViewMode('graph');
@@ -1219,17 +1492,69 @@ export function App() {
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
+  const pageLabel: Record<Page, string> = {
+    ceo: 'CEO',
+    company: 'Company',
+    inbox: 'Inbox',
+    conversations: 'Conversations',
+    stream: 'Team Stream',
+    results: 'Results',
+    settings: 'Settings',
+  };
+
+  // CEO ask history for the sidebar (Today / Previous 7 days / Previous 30 days).
+  const threadGroups = useMemo(
+    () => buildThreadGroups(ceoThreads, threadSearch),
+    [ceoThreads, threadSearch]
+  );
+
+  const handleNewThread = useCallback(() => {
+    setActiveThreadId(null);
+    navigateTo('ceo');
+  }, [navigateTo]);
+
+  const handleSelectThread = useCallback(
+    (id: string) => {
+      setActiveThreadId(id);
+      navigateTo('ceo');
+    },
+    [navigateTo]
+  );
+
   return (
-    <div
-      className={`h-screen w-screen overflow-hidden grid transition-all duration-200 ${
-        isStreamMode ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-[220px_1fr]'
-      }`}
-    >
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       {/* Sidebar Navigation */}
       {!isStreamMode && (
-        <aside className="border-r border-[var(--line)] p-4 flex flex-col gap-2 bg-[var(--card2)]/40 backdrop-blur-xl select-none">
-          {/* Navigation Links */}
-          <nav className="flex flex-col gap-1 flex-1">
+        <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
+          <div className="sidebar-topline">
+            <button
+              className="brand-button"
+              onClick={() => navigateTo('ceo')}
+              title="Loqman"
+              aria-label="Loqman"
+            >
+              <span className="brand-mark">
+                <span />
+                <span />
+                <span />
+              </span>
+              {!sidebarCollapsed && (
+                <span className="brand-name">
+                  Loq<span>man</span>
+                </span>
+              )}
+            </button>
+            <button
+              className="icon-button sidebar-toggle"
+              title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              onClick={() => setSidebarCollapsed((v) => !v)}
+            >
+              {sidebarCollapsed ? <PanelRight size={15} /> : <PanelLeftClose size={15} />}
+            </button>
+          </div>
+
+          <nav className="primary-nav" aria-label="Main navigation">
             {navItems.map((item) => {
               const Icon = item.icon;
               const isActive = page === item.id;
@@ -1239,49 +1564,184 @@ export function App() {
                 <button
                   key={item.id}
                   onClick={() => navigateTo(item.id)}
-                  className={`flex items-center justify-between gap-3 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
-                    isActive
-                      ? 'bg-[var(--acc)]/15 text-[var(--text)] border-l-2 border-[var(--acc)]'
-                      : 'text-[var(--muted)] hover:text-[var(--text)] hover:bg-white/5'
-                  }`}
+                  className={`nav-item ${isActive ? 'active' : ''}`}
+                  title={sidebarCollapsed ? item.label : undefined}
                 >
-                  <span className="flex items-center gap-2.5">
-                    <Icon size={16} className={isActive ? 'text-[var(--acc)]' : 'text-[var(--dim)]'} />
-                    <span>{item.label}</span>
-                  </span>
-
-                  {showBadge && (
-                    <span className="min-w-5 h-[18px] px-1.5 rounded-full bg-[var(--acc)] text-[#18181b] font-bold text-[10px] flex items-center justify-center">
+                  <Icon size={16} />
+                  {!sidebarCollapsed && <span className="nav-item-label">{item.label}</span>}
+                  {!sidebarCollapsed && showBadge && (
+                    <span className="nav-count" aria-hidden="true">
                       {pendingInboxCount}
                     </span>
                   )}
+                  {!sidebarCollapsed && isActive && <span className="active-dot" aria-hidden="true" />}
                 </button>
               );
             })}
           </nav>
 
-          {/* Sidebar Footer */}
-          <div className="mt-auto p-3 border border-[var(--line)] rounded-xl text-xs text-[var(--muted)] bg-[var(--card)]/60">
-            <b className="text-[var(--text)] block font-semibold mb-0.5">Local workspace</b>
-            <div className="flex items-center gap-1.5 text-[11px] text-[var(--dim)]">
-              <span>OpenCode</span>
-              <span>·</span>
-              <span className="flex items-center gap-1 text-[var(--green)]">
-                <span className="w-1.5 h-1.5 rounded-full bg-[var(--green)] inline-block" />
-                Online
-              </span>
+          {!sidebarCollapsed && (
+            <>
+              <div className="sidebar-divider" />
+              <div className="conversation-toolbar">
+                <div className="section-label">RECENT QUESTIONS</div>
+                <button
+                  className="mini-icon-button"
+                  title="New question"
+                  aria-label="New question"
+                  onClick={handleNewThread}
+                >
+                  <Plus size={15} />
+                </button>
+              </div>
+              <label className="conversation-search">
+                <Search size={13} />
+                <input
+                  value={threadSearch}
+                  onChange={(e) => setThreadSearch(e.target.value)}
+                  placeholder="Search questions"
+                  aria-label="Search questions"
+                />
+              </label>
+              <div className="conversation-list">
+                {threadGroups.map((group) => (
+                  <div className="conversation-group" key={group.label}>
+                    <div className="group-label">{group.label}</div>
+                    {group.items.map((thread) => (
+                      <button
+                        key={thread.id}
+                        className={`conversation-item ${
+                          activeThreadId === thread.id && page === 'ceo' ? 'selected' : ''
+                        }`}
+                        onClick={() => handleSelectThread(thread.id)}
+                        title={thread.question}
+                      >
+                        <MessageCircle size={14} />
+                        <span className="conversation-item-title" dir="auto">
+                          {thread.question.length > 40
+                            ? `${thread.question.slice(0, 40).trim()}…`
+                            : thread.question}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                ))}
+                {threadGroups.length === 0 && (
+                  <div className="no-search-results">
+                    {ceoThreads.length === 0 ? 'اسأل لقمان عشان تبدأ' : 'مفيش نتائج'}
+                  </div>
+                )}
+              </div>
+              <div className="sidebar-bottom">
+                <div className="workspace-status-card">
+                  <span className="workspace-status-icon">
+                    <Zap size={15} />
+                  </span>
+                  <span className="workspace-status-copy">
+                    <strong>Local workspace</strong>
+                    <small className="workspace-status-meta">
+                      <span>OpenCode</span>
+                      <span>·</span>
+                      <span className="ok">
+                        <i className="status-inline-dot" />
+                        Online
+                      </span>
+                    </small>
+                  </span>
+                </div>
+                <button className="profile-row" onClick={() => navigateTo('settings')}>
+                  <div className="profile-avatar">YB</div>
+                  <span className="profile-copy">
+                    <strong>Youssef Behairy</strong>
+                    <small>Loqman workspace</small>
+                  </span>
+                  <MoreHorizontal size={16} className="muted" />
+                </button>
+              </div>
+            </>
+          )}
+
+          {sidebarCollapsed && (
+            <div className="collapsed-actions">
+              <button
+                className="icon-button"
+                title="New question"
+                aria-label="New question"
+                onClick={handleNewThread}
+              >
+                <Plus size={17} />
+              </button>
+              <button
+                className="icon-button"
+                title="Expand sidebar"
+                aria-label="Expand sidebar"
+                onClick={() => setSidebarCollapsed(false)}
+              >
+                <ChevronRight size={17} />
+              </button>
             </div>
-          </div>
+          )}
         </aside>
       )}
 
       {/* Main Container */}
-      <div className="flex flex-col min-w-0 min-h-0 overflow-hidden relative">
+      <div className="main-area">
+        {/* Topbar */}
+        {!isStreamMode && (
+          <header className="topbar">
+            <div className="topbar-left">
+              <div className="breadcrumb">
+                <span>Workspace</span>
+                <ChevronRight size={13} />
+                <strong>{pageLabel[page]}</strong>
+              </div>
+            </div>
+            <div className="topbar-actions">
+              <button
+                className="status-pill"
+                title="Re-check runtime"
+                onClick={() => {
+                  refreshRuntime();
+                  showToast('Runtime health re-checked');
+                }}
+              >
+                <span className="status-dot" />
+                <span>
+                  {runtimeInfo
+                    ? `Runtime ${runtimeInfo.status} · ${runtimeInfo.free_models_count} free models`
+                    : 'Checking runtime…'}
+                </span>
+              </button>
+              <button
+                className="icon-button"
+                title="Help"
+                aria-label="Help"
+                onClick={() => setModalState({ type: 'help' })}
+              >
+                <CircleHelp size={17} />
+              </button>
+              <button
+                className="icon-button notification-button"
+                title="Pending approvals"
+                aria-label="Pending approvals"
+                onClick={() => {
+                  navigateTo('ceo');
+                  setApprovalsOpen(true);
+                }}
+              >
+                <Bell size={17} />
+                {pendingApprovals > 0 ? <span aria-hidden="true" /> : null}
+              </button>
+              <div className="topbar-avatar">YB</div>
+            </div>
+          </header>
+        )}
+
         {/* Stream mode banner when active */}
         {isStreamMode && (
-          <div className="px-4 py-1.5 bg-[var(--card2)] border-b border-[var(--line)] flex items-center justify-between text-xs text-[var(--muted)] z-30">
+          <div className="stream-banner">
             <span className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-[var(--acc)] animate-ping" />
+              <span className="ping" />
               Stream View Active (Press <kbd>F</kbd> or <kbd>Esc</kbd> to return to standard view)
             </span>
             <button
@@ -1293,12 +1753,12 @@ export function App() {
           </div>
         )}
 
-        <main className="flex-1 overflow-y-auto p-5 sm:p-6 lg:p-7 min-h-0 relative">
-          {page === 'ceo' && (
-            <CeoControlView
+        <main className="content-host">
+          {page === 'ceo' ? (
+            <CeoChatView
+              models={freeModels}
               selectedModelId={settings.defModel}
               selectedVariant={settings.reason}
-              models={freeModels}
               onModelChange={(modelId, variant) => {
                 setSettings((prev) => ({
                   ...prev,
@@ -1308,8 +1768,17 @@ export function App() {
                 showToast('CEO model updated');
               }}
               onProfilesCreated={handleCeoProfilesCreated}
+              threads={ceoThreads}
+              activeThreadId={activeThreadId}
+              onSelectThread={handleSelectThread}
+              onNewThread={handleNewThread}
+              setThreads={setCeoThreads}
+              onToast={showToast}
+              approvalsOpen={approvalsOpen}
+              onApprovalsOpenChange={setApprovalsOpen}
             />
-          )}
+          ) : (
+            <div className="view-scroll">
 
           {page === 'company' && (
             <CompanyView
@@ -1422,6 +1891,8 @@ export function App() {
               onResetDemo={handleResetDemo}
             />
           )}
+            </div>
+          )}
         </main>
       </div>
 
@@ -1474,12 +1945,18 @@ export function App() {
 
       {/* Floating Toast Notification */}
       {toastMessage && (
-        <div
-          role="status"
-          className="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-2.5 bg-[var(--card2)] border border-[var(--line2)] text-[var(--text)] text-xs font-medium rounded-xl shadow-2xl z-50 animate-in fade-in slide-in-from-bottom-2 duration-150 flex items-center gap-2"
-        >
-          <span className="w-2 h-2 rounded-full bg-[var(--acc)] inline-block shadow-[0_0_8px_var(--acc)]" />
-          <span>{toastMessage}</span>
+        <div className="toast" role="status">
+          <span className="toast-mark">
+            <Sparkles size={15} />
+          </span>
+          <span className="toast-copy">{toastMessage}</span>
+          <button
+            onClick={() => setToastMessage(null)}
+            aria-label="Dismiss notification"
+            title="Dismiss"
+          >
+            <X size={14} />
+          </button>
         </div>
       )}
     </div>

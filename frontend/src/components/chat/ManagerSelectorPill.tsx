@@ -41,8 +41,7 @@ export const ManagerSelectorPill: React.FC<ManagerSelectorPillProps> = ({
             {/* Persona Names and Department */}
             <div className="flex flex-col min-w-0">
               <div className="flex items-center gap-1.5">
-                <span className="text-sm font-semibold truncate text-white">{manager.nameArabic}</span>
-                <span className="text-xs text-gray-400 truncate">({manager.nameEnglish})</span>
+                <span className="text-sm font-semibold truncate text-white">{manager.nameEnglish}</span>
                 {isSelected && (
                   <span className="text-[10px] px-1 py-0.2 bg-amber-500/20 text-amber-300 rounded font-bold border border-amber-500/40 ml-0.5">
                     👑 Manager

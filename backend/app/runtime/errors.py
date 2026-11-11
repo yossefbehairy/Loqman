@@ -45,6 +45,16 @@ class RuntimeCancelled(RuntimeErrorBase):
     retryable = False
 
 
+def safe_error_message(error: BaseException) -> str:
+    """Expose a stable error category without persisting provider output."""
+    if isinstance(error, ValueError) and str(error) == "Mission task returned invalid JSON":
+        return "Mission task returned invalid JSON"
+    code = getattr(error, "code", "runtime_error")
+    if code not in {"offline", "auth", "rate_limited", "model_unavailable", "timeout", "cancelled", "unsupported_capability"}:
+        code = "runtime_error"
+    return f"Request failed ({code})."
+
+
 def normalize_cli_error(stderr: str, returncode: int) -> RuntimeErrorBase:
     text = (stderr or "").lower()
     if "unauthorized" in text or "401" in text or "invalid api key" in text or "auth" in text and "oauth" in text:

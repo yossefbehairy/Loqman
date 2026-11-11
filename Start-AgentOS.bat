@@ -5,6 +5,15 @@ REM  Prefers the portable build, falls back to an installed copy.
 REM ============================================================
 setlocal
 
+REM Run the current project when its dependencies are installed.
+if exist "%~dp0frontend\node_modules\electron\dist\electron.exe" if exist "%~dp0backend\.venv\Scripts\python.exe" (
+  pushd "%~dp0frontend"
+  call npm run desktop
+  if errorlevel 1 pause
+  popd
+  exit /b
+)
+
 REM Prefer the latest build made alongside a running/locked copy of the app.
 set "APP=%~dp0frontend\release-next\win-unpacked\AgentOS.exe"
 if exist "%APP%" (

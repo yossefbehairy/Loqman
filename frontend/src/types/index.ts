@@ -40,7 +40,7 @@ export interface RuntimeHealth {
 
 export type ActiveView = 'chat' | 'company' | 'map' | 'stream' | 'settings';
 
-export type DepartmentId = 'planning' | 'research' | 'quality';
+export type DepartmentId = 'planning' | 'execution';
 
 export interface ExecutionContract {
   model_id: string;
@@ -52,12 +52,12 @@ export interface ExecutionContract {
 }
 
 export interface CompanyMember {
-  id: string;
+  id: string;                  // backend AgentProfile id (stable)
   node_id: string;
-  natural_name: string;        // e.g. "د. سارة", "م. طارق", "أ. ياسمين", "أحمد", "خالد", "ليلى"
-  english_name: string;        // e.g. "Dr. Sara", "Eng. Tarek"
+  natural_name: string;        // e.g. "Dr. Sara", "Eng. Tarek", "Loqman"
+  english_name: string;        // e.g. "Dr. Sara", "Eng. Tarek", "Loqman"
   title: string;               // e.g. "مدير التخطيط والإستراتيجية"
-  role_type: string;           // "planner" | "analyst" | "reviewer" | "general_manager"
+  role_type: string;           // "planner" | "analyst" | "reviewer" | "custom"
   department: DepartmentId | 'executive';
   is_manager: boolean;         // true = 👑 Manager, false = 💼 Specialist
   avatar?: string;
@@ -186,5 +186,44 @@ export interface CeoAction {
   created_profiles?: CeoCreatedProfile[];
   /** Proposed team name for an approved new_team action. */
   team_name?: string | null;
+}
+
+// ==========================================
+// CEO chat threads — the local sidebar history
+// ==========================================
+
+/**
+ * One CEO question + its recorded answer. Threads live in localStorage only
+ * (the ask endpoint is stateless); the sidebar lists them newest-first.
+ */
+export interface CeoTurn {
+  question: string;
+  reply: string;
+  /** Set when the ask failed — rendered as an error card in the thread. */
+  error?: string;
+  /** Actions the answer proposed (still awaiting the user's decision). */
+  proposed: CeoProposedAction[];
+  /** Creation time (ms) — drives the per-turn clock. */
+  ts: number;
+}
+
+/**
+ * A CEO conversation (one selectable item in the CEO sidebar). Since the
+ * backend owns the conversation memory, a thread is purely organizational:
+ * follow-up questions asked with the thread open are APPENDED as turns, so
+ * one ongoing chat instead of a new entry per message.
+ */
+export interface CeoThread {
+  id: string;
+  /** First question — the sidebar label and the thread heading. */
+  question: string;
+  /** Latest turn's reply (kept for search + the sidebar meta line). */
+  reply: string;
+  /** Latest turn's error, if any. */
+  error?: string;
+  proposed: CeoProposedAction[];
+  ts: number;
+  /** Chronological Q&A turns (one entry per exchange in this thread). */
+  turns: CeoTurn[];
 }
 

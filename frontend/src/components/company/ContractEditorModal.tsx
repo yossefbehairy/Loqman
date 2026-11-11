@@ -162,7 +162,6 @@ const ContractEditorForm: React.FC<ContractEditorFormProps> = ({
               <h3 id="modal-title" className="text-lg font-bold text-white">
                 {naturalName || member.natural_name}
               </h3>
-              <span className="text-xs text-gray-400">({member.english_name})</span>
               {member.is_manager ? (
                 <span
                   data-badge="manager"
@@ -217,7 +216,7 @@ const ContractEditorForm: React.FC<ContractEditorFormProps> = ({
                 name="natural_name"
                 value={naturalName}
                 onChange={(e) => setNaturalName(e.target.value)}
-                placeholder="e.g. د. سارة, م. طارق, أحمد"
+                placeholder="e.g. Dr. Sara, Eng. Tarek, Ahmed"
                 className="w-full px-3 py-2 bg-gray-950 border border-gray-800 rounded-lg text-sm text-white focus:outline-none focus:border-indigo-500"
                 required
               />

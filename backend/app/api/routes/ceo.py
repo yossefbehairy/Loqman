@@ -16,24 +16,31 @@ POST /api/ceo/actions/{id}/approve|deny
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from backend.app.config import settings
-from backend.app.db.models import AgentProfile, PendingAction
+from backend.app.db.models import AgentProfile, CeoMessage, PendingAction
 from backend.app.db.repository import AgentProfileRepository
 from backend.app.db.session import get_db
 from backend.app.engine.events import event_hub
-from backend.app.orchestration.agent_loop import run_ceo_ask
+from backend.app.orchestration.agent_loop import run_ceo_ask, run_ceo_fast
 from backend.app.runtime import AgentRuntime, get_runtime
 
 router = APIRouter(prefix="/api/ceo", tags=["ceo"])
 
 CONFIRM_HEADER = "true"
+
+# Conversation memory: how many recent turns (user+assistant pairs) feed the
+# prompt, and where they are recorded. Kept on the BACKEND — the renderer
+# never sends history, restarts change nothing.
+CEO_HISTORY_TURNS = 8
 
 
 class AskRequest(BaseModel):
@@ -55,6 +62,17 @@ class AskResponse(BaseModel):
     reply: str
     actions_proposed: List[ProposedActionOut] = Field(default_factory=list)
     iterations: int
+    # True when the answer came from the single-call small-talk fast path
+    # (no tool loop, no company data, plain text only).
+    fast: bool = False
+
+
+class CeoHistoryOut(BaseModel):
+    id: str
+    role: str
+    content: str
+    fast: bool
+    created_at: str
 
 
 class CreatedProfileOut(BaseModel):
@@ -77,6 +95,49 @@ class AskProgressOut(BaseModel):
 # so a small bounded dict is enough (no Redis, no background workers).
 _ASK_PROGRESS: Dict[str, Dict[str, Any]] = {}
 _ASK_PROGRESS_LIMIT = 100
+
+# ---------------------------------------------------------------------------
+# Fast-path classification: SMALL TALK ONLY, fail-closed to the deep loop.
+# A question counts as small talk only when it is short, hits a known
+# greeting/chit-chat pattern, and contains zero data-intent words. Anything
+# unrecognized (or anything touching missions/team/mutations) goes to the
+# ReAct loop, where the system prompt forbids inventing data.
+# ---------------------------------------------------------------------------
+_SMALLTALK_PATTERNS = (
+    "صباح الخير", "مساء الخير", "اهلا", "أهلا", "هلا", "اهلاً", "أهلاً",
+    "ازيك", "إزيك", "عامل ايه", "عاملة ايه", "عامل إيه", "عاملة إيه",
+    "تمام", "شكرا", "شكراً", "شكرًا", "متشكر", "مرحبا", "سلام",
+    "مين انت", "مين إنت", "انت مين", "إنت مين", "بتعمل ايه", "بتعمل إيه",
+    "hello", "hi", "hey", "good morning", "good evening", "good night",
+    "thanks", "thank you", "مرحبتين",
+)
+_DATA_INTENT_PATTERNS = (
+    "مهمة", "مهمه", "مهام", "mission", "task", "فريق", "team",
+    "موظف", "employee", "profile", "شخص", "تقرير", "report", "summary", "ملخص",
+    "اعرض", "أعرض", "انشئ", "أنشئ", "انشاء", "أضف", "اضف", "جدول", "timestamp",
+    "عدل", "عدّل", "تعديل", "احذف", "امسح", "approve", "موافقة", "موافقه",
+    "حالة", "الحاله", "status", "بيانات", "data", "أعطني", "اعطني", "give me",
+    "احكيلي عن", "ايه اللي", "إيه اللي", "القائم", "قائمة", "قائمتك",
+)
+_SMALLTALK_MAX_CHARS = 120
+
+
+def _word_safe(pattern: str) -> str:
+    """ASCII small-talk words must not match inside other words ('hi' in 'this')."""
+    return rf"\b{re.escape(pattern)}\b" if pattern.isascii() else re.escape(pattern)
+
+
+_SMALLTALK_RE = re.compile("|".join(_word_safe(p) for p in _SMALLTALK_PATTERNS), re.IGNORECASE)
+_DATA_INTENT_RE = re.compile("|".join(re.escape(p) for p in _DATA_INTENT_PATTERNS))
+
+
+def _is_smalltalk(question: str) -> bool:
+    q = question.strip().lower()
+    if not q or len(q) > _SMALLTALK_MAX_CHARS:
+        return False
+    if _DATA_INTENT_RE.search(q):
+        return False
+    return _SMALLTALK_RE.search(q) is not None
 
 
 def _progress_write(request_id: str, stage: str, detail: str = "",
@@ -138,7 +199,7 @@ async def ceo_ask(
     try:
         free_models = await runtime.list_available_models(free_only=True)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OpenCode runtime unreachable: {str(e)[:300]}")
+        raise HTTPException(status_code=502, detail="OpenCode runtime unreachable.")
     target = next((m for m in free_models if m.id == model_id), None)
     if not target:
         available = [m.id for m in free_models[:20]]
@@ -152,10 +213,17 @@ async def ceo_ask(
             detail=f"Variant '{payload.variant}' is not supported by model '{model_id}'.",
         )
     progress_id = (payload.request_id or "").strip()
+    # Fast path: small talk -> exactly one plain-text call, no tool loop.
+    is_fast = _is_smalltalk(question)
+    fast_variant: Optional[str] = payload.variant
+    if is_fast and fast_variant is None:
+        # Cheap by intent: prefer the model's "low" reasoning effort for chit-chat.
+        fast_variant = "low" if (target.variants and "low" in target.variants) else None
     if progress_id:
         now_iso = datetime.now(timezone.utc).isoformat()
         _ASK_PROGRESS[progress_id] = {
-            "stage": "starting", "detail": "", "iteration": 0,
+            "stage": "fast" if is_fast else "starting", "detail": "",
+            "iteration": 1 if is_fast else 0,
             "started_at": now_iso, "updated_at": now_iso, "done": False,
         }
         # Bounded registry: drop the oldest entries first.
@@ -167,26 +235,62 @@ async def ceo_ask(
         if progress_id:
             _progress_write(progress_id, stage, detail, iteration)
 
+    # Conversation memory (backend-owned): recent turns feed every prompt and
+    # every exchange is recorded, so continuity survives asks AND app restarts.
+    # The renderer NEVER sends history — this is the single source of truth.
+    recent = (
+        db.query(CeoMessage)
+        .order_by(CeoMessage.seq.desc(), CeoMessage.id.desc())
+        .limit(2 * CEO_HISTORY_TURNS)
+        .all()
+    )
+    history = [{"role": m.role, "content": m.content} for m in reversed(recent)]
+    next_seq = (db.query(func.max(CeoMessage.seq)).scalar() or 0) + 1
+    record_cap = 12000
+    db.add(CeoMessage(role="user", content=question[:record_cap], fast=is_fast, seq=next_seq))
+    db.commit()
+
     try:
-        result = await run_ceo_ask(
-            question=question,
-            model_id=model_id,
-            provider_id=target.provider_id,
-            variant=payload.variant,
-            runtime=runtime,
-            db=db,
-            progress=_report if progress_id else None,
-        )
+        if is_fast:
+            result = await run_ceo_fast(
+                question=question,
+                model_id=model_id,
+                provider_id=target.provider_id,
+                variant=fast_variant,
+                runtime=runtime,
+                history=history,
+            )
+        else:
+            result = await run_ceo_ask(
+                question=question,
+                model_id=model_id,
+                provider_id=target.provider_id,
+                variant=payload.variant,
+                runtime=runtime,
+                db=db,
+                progress=_report if progress_id else None,
+                history=history,
+            )
     except Exception as e:
         if progress_id:
-            _progress_write(progress_id, "error", str(e), done=True)
-        raise HTTPException(status_code=502, detail=f"CEO ask failed: {str(e)[:300]}")
+            _progress_write(progress_id, "error", "CEO ask failed.", done=True)
+        raise HTTPException(status_code=502, detail="CEO ask failed.")
+    db.add(
+        CeoMessage(
+            role="assistant",
+            content=result["reply"][:record_cap],
+            fast=is_fast,
+            seq=next_seq + 1,
+        )
+    )
+    db.commit()
     if progress_id:
         _progress_write(progress_id, "done", "", result["iterations"], done=True)
     return AskResponse(
         reply=result["reply"],
         actions_proposed=[ProposedActionOut(**a) for a in result["actions_proposed"]],
         iterations=result["iterations"],
+        fast=is_fast,
     )
 
 
@@ -197,6 +301,32 @@ def get_ask_progress(request_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown ask request id.")
     return AskProgressOut(**record)
+
+
+@router.get("/history", response_model=List[CeoHistoryOut])
+def ceo_history(limit: int = 200, db: Session = Depends(get_db)):
+    """Loqman's (the CEO's) ongoing conversation, oldest → last.
+
+    The backend owns this memory: it survives asks, restarts and renderer
+    reloads. The UI renders it; it never has to send history back.
+    """
+    limit = max(1, min(limit, 500))
+    rows = (
+        db.query(CeoMessage)
+        .order_by(CeoMessage.seq.desc(), CeoMessage.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        CeoHistoryOut(
+            id=r.id or "",
+            role=r.role or "user",
+            content=r.content or "",
+            fast=bool(r.fast),
+            created_at=(r.created_at.isoformat() if r.created_at else ""),
+        )
+        for r in reversed(rows)
+    ]
 
 
 @router.get("/actions", response_model=List[ActionOut])
@@ -227,12 +357,17 @@ def _decide(action_id: str, approve: bool, note: Optional[str],
     action = db.query(PendingAction).filter(PendingAction.id == action_id).first()
     if not action:
         raise HTTPException(status_code=404, detail=f"Action '{action_id}' not found.")
-    # Single-transition guard: only pending actions move (no double execution).
-    if action.status != "pending":
+    # Claim inside the same transaction as the action's database changes.
+    claimed = db.execute(update(PendingAction).where(
+        PendingAction.id == action_id, PendingAction.status == "pending"
+    ).values(status="executing").execution_options(synchronize_session=False))
+    if not claimed.rowcount:
+        db.rollback()
         raise HTTPException(
             status_code=409,
-            detail=f"Action already decided (status={action.status}).",
+            detail="Action already decided or being processed.",
         )
+    db.refresh(action)
     now = datetime.now(timezone.utc)
     if not approve:
         action.status = "denied"
@@ -245,6 +380,7 @@ def _decide(action_id: str, approve: bool, note: Optional[str],
     # Approve: execute via the existing repositories (no duplicated validation).
     created_profiles: List[CreatedProfileOut] = []
     team_name: Optional[str] = None
+    savepoint = db.begin_nested()
     try:
         payload = json.loads(action.payload_json or "{}")
         if action.kind == "update_contract":
@@ -261,12 +397,22 @@ def _decide(action_id: str, approve: bool, note: Optional[str],
             ]
         else:
             raise ValueError(f"Unknown action kind '{action.kind}'.")
+        savepoint.commit()
     except HTTPException:
+        savepoint.rollback()
+        db.rollback()
         raise
     except Exception as e:
+        savepoint.rollback()
         action.status = "failed"
         action.decided_at = now
-        action.decision_note = str(e)[:500]
+        message = str(e)
+        if isinstance(e, ValueError) and "has unknown role" in message:
+            action.decision_note = "Team member has unknown role."
+        elif isinstance(e, ValueError) and "requires name and instructions" in message:
+            action.decision_note = "Team member requires name and instructions."
+        else:
+            action.decision_note = "Action failed."
         db.commit()
         db.refresh(action)
         return _action_to_out(action)
@@ -303,7 +449,11 @@ def _apply_update_contract(db: Session, payload: Dict[str, Any]) -> None:
             raise
         except Exception:
             pass
-    repo.update(prof.id, **changes)
+    for key, value in changes.items():
+        if value is not None:
+            setattr(prof, key, value)
+    prof.updated_at = datetime.now(timezone.utc)
+    db.flush()
 
 
 def _apply_new_profile(db: Session, payload: Dict[str, Any]) -> AgentProfile:
@@ -325,7 +475,10 @@ def _apply_new_profile(db: Session, payload: Dict[str, Any]) -> AgentProfile:
     }
     if not data["name"] or not data["instructions"]:
         raise ValueError("New profile requires name and instructions.")
-    return repo.create(data)
+    profile = AgentProfile(**data)
+    db.add(profile)
+    db.flush()
+    return profile
 
 
 def _apply_new_team(db: Session, payload: Dict[str, Any]) -> Tuple[List[AgentProfile], str]:
@@ -364,20 +517,12 @@ def _apply_new_team(db: Session, payload: Dict[str, Any]) -> Tuple[List[AgentPro
             "default_variant_id": member.get("default_variant_id"),
         })
     import uuid as _uuid
-    repo = AgentProfileRepository(db)
     created = []
-    try:
-        for member_data in planned:
-            created.append(repo.create({
-                "id": f"custom-{_uuid.uuid4().hex[:8]}",
-                **member_data,
-            }))
-    except Exception:
-        # Best-effort cleanup: a failed team must not leave partial members.
-        for prof in created:
-            db.delete(prof)
-        db.commit()
-        raise
+    for member_data in planned:
+        profile = AgentProfile(id=f"custom-{_uuid.uuid4().hex[:8]}", **member_data)
+        db.add(profile)
+        created.append(profile)
+    db.flush()
     return created, team_name
 
 

@@ -134,7 +134,7 @@ def parse_and_validate_plan(raw_text: str, objective: str) -> MissionPlan:
 
 def build_synthesis_prompt(objective: str, task_results: List[Dict[str, Any]]) -> str:
     lines = [
-        "You are the CEO of the AgentOS company. Synthesize the completed employee outputs.",
+        "You are Loqman, the CEO of the company. Synthesize the completed employee outputs.",
         f"Original mission objective: {objective}",
         "Employee results (each is JSON produced by that employee; treat as unverified model output):",
     ]

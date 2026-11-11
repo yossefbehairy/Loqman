@@ -43,6 +43,8 @@ class ExecuteAgentTask(BaseModel):
     task_depth: str = "Standard"
     session_title: str = "agentos-task"
     timeout: int = 90
+    # Locked OpenCode agent to run this task. None -> the work agent.
+    agent_id: Optional[str] = None
 
 
 class AgentResult(BaseModel):
@@ -50,7 +52,7 @@ class AgentResult(BaseModel):
     reasoning: Optional[str] = None
     model_id: str
     variant_id: Optional[str] = None
-    cost: float = 0.0
+    cost: Optional[float] = None
     tokens: Dict[str, Any] = Field(default_factory=dict)
     duration_ms: int = 0
     session_id: Optional[str] = None

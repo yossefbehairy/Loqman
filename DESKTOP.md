@@ -16,9 +16,9 @@ AgentOS-Setup-x.x.x.exe (electron-builder · NSIS)
         └── agentos-backend.exe   ← frozen FastAPI backend (PyInstaller onefile)
 
 Runtime:
-  Electron main ──spawns──▶ agentos-backend.exe --port <free port> --data-dir <userData>
-  Electron main ──polls───▶ GET http://127.0.0.1:<port>/api/health  (until ok)
-  Renderer (file://) ─────▶ window.__AGENTOS_API__ = "http://127.0.0.1:<port>/api"
+  Electron main ──spawns──▶ agentos-backend.exe --data-dir <userData>   (Python worker, stdlib only)
+  Electron main ◀──ready──  first stdout line; JSON Lines over stdin/stdout (docs/PYWORKER.md)
+  Renderer (file://) ─────▶ window.agentos.call(method, params) / openStream(...)  (preload → IPC → main → worker)
   SQLite data ────────────▶ %APPDATA%\AgentOS\agentos.db
 ```
 
@@ -28,7 +28,7 @@ Key properties:
 |---|---|
 | Renderer load path | `file://…/app.asar/dist/index.html` (packaged) or `http://127.0.0.1:5173` (dev) |
 | API base in renderer | `window.__AGENTOS_API__` (exposed by `electron/preload.cjs`); falls back to `/api` in a plain browser |
-| Backend port | Dynamic — a free port is picked at each launch (`net` listen on port 0) |
+| Backend transport | stdin/stdout pipes to the worker — no HTTP server, no ports, no token, no CORS |
 | Database location | `app.getPath('userData')` → `%APPDATA%\AgentOS\agentos.db` (WAL mode) |
 | Backend lifecycle | Killed with its process tree (`taskkill /PID <pid> /T /F`) on quit |
 | Single instance | Enforced via `app.requestSingleInstanceLock()` |
@@ -48,14 +48,15 @@ npm run dev
 ```
 
 ```powershell
-# Terminal 2 — Electron shell (spawns the backend automatically via python -m backend.app.cli)
+# Terminal 2 — Electron shell using Vite (spawns the backend automatically)
 cd d:\AgentOS\frontend
+$env:AGENTOS_DEV_SERVER_URL = 'http://127.0.0.1:5173'
 npm run desktop
 ```
 
-In dev mode Electron loads `http://127.0.0.1:5173`, spawns the backend with the venv Python (`backend\.venv\Scripts\python.exe`), and the renderer talks directly to the dynamic backend port (the Vite proxy on `/api` is bypassed because `window.__AGENTOS_API__` takes precedence).
+With `AGENTOS_DEV_SERVER_URL` set, Electron loads the Vite server. Otherwise `npm run desktop` builds and loads the local `dist` files. Electron spawns the backend with the venv Python, creates a random local token, and sends authenticated requests to the dynamic backend port.
 
-Plain-browser development (`npm run dev` alone + a manually started backend on port 8000) keeps working unchanged via the `/api` proxy fallback.
+For plain-browser development, set `AGENTOS_INSECURE_DEV=1` in the backend terminal before starting the backend on port 8000. This explicitly disables local-token authentication for that development process.
 
 ---
 
@@ -141,7 +142,13 @@ Any new frontend network call must go through `frontend/src/api/client.ts` (`API
 
 ## 6. Known Limitations (MVP)
 
-- The AI runtime (OpenCode on `127.0.0.1:49100`) is **not** bundled — the desktop app expects it running on the same machine for mission execution. Browse/UI/data features work fully offline.
+- AI CLIs are **not** bundled — the user installs and signs in to each engine. OpenCode uses `127.0.0.1:49100`; Claude Code, Codex and Antigravity use their installed CLIs. Browse/UI/data features work offline, and `mock` is available for deterministic demos.
 - No code signing, no auto-updater yet (planned: GitHub Releases + `electron-updater`).
 - App icon: custom multi-size `frontend/build/icon.ico` (regenerate via any SVG→ICO tool if the brand changes).
 - uvicorn runs with `h11` only (no `websockets` dependency installed); REST + SSE are unaffected.
+
+
+> **Update:** the sections above that mention ports, `/api/health`, tokens, CORS, uvicorn and `backend/app/cli.py`
+> describe the legacy FastAPI backend. The desktop app now talks to the Python worker (`backend/pyworker`,
+> see `docs/PYWORKER.md`). Plain-browser dev uses the Vite dev bridge (`frontend/vite-agentos-bridge.mjs`, serve-only).
+> Frozen build spec: `pyinstaller/agentos-worker.spec`.

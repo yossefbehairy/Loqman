@@ -54,14 +54,14 @@ def _select_runtime():
 def _create_direct_session(client, runtime, conversation="chat-a"):
     model_id = "muse-spark-1.3-contributor-free"
     create = client.post("/api/opencode-proxy/session", json={
-        "title": "Acceptance chat", "agent": "build",
+        "title": "Acceptance chat", "agent": "agentos-chat",
         "model": {"id": model_id, "providerID": "opencode", "variant": "high"},
     })
     assert create.status_code == 200, create.text
     session_id = create.json()["data"]["id"]
     saved = client.post(f"/api/chat/sessions/{conversation}", json={
         "session_id": session_id, "model_id": model_id,
-        "provider_id": "opencode", "agent_id": "build",
+        "provider_id": "opencode", "agent_id": "agentos-chat",
     })
     assert saved.status_code == 200, saved.text
     return session_id, model_id
@@ -69,7 +69,7 @@ def _create_direct_session(client, runtime, conversation="chat-a"):
 
 def _prompt(client, session_id, text, model_id="muse-spark-1.3-contributor-free"):
     return client.post(f"/api/opencode-proxy/session/{session_id}/message", json={
-        "agent": "build",
+        "agent": "agentos-chat",
         "model": {"providerID": "opencode", "modelID": model_id},
         "variant": "high",
         "parts": [{"type": "text", "text": text}],
@@ -140,7 +140,7 @@ def test_acceptance_e_runtime_failure_is_reported_without_fallback_or_mission(cl
     runtime.fail = True
     response = client.post("/api/opencode-proxy/session", json={
         "model": {"id": "muse-spark-1.3-contributor-free", "providerID": "opencode"},
-        "agent": "build",
+        "agent": "agentos-chat",
     })
     assert response.status_code == 502
     assert "OpenCode request failed" in response.json()["detail"]
@@ -162,7 +162,7 @@ def test_acceptance_f_refresh_reads_same_session_and_real_history(client):
 def test_session_proxy_rejects_models_not_verified_as_free(client):
     _select_runtime()
     response = client.post("/api/opencode-proxy/session", json={
-        "model": {"id": "paid-model", "providerID": "opencode"}, "agent": "build",
+        "model": {"id": "paid-model", "providerID": "opencode"}, "agent": "agentos-chat",
     })
     assert response.status_code == 400
     assert "not verified as free" in response.json()["detail"]

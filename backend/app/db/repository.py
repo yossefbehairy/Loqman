@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session
+from backend.app.config import settings
 from backend.app.db.models import (
     Workflow,
     AgentProfile,
@@ -17,254 +18,18 @@ from backend.app.db.models import (
     MissionTask,
     OpenCodeConversation,
 )
-
-
-# Default 10 Predefined Employee Profiles with Natural Names and Execution Contracts
-DEFAULT_EMPLOYEE_PROFILES = [
-    {
-        "id": "planner",
-        "name": "Dr. Sara (د. سارة)",
-        "role_type": "planner",
-        "description": "Planning & Strategy Manager (👑 Manager). Transforms organizational goals into structured roadmaps and milestone pipelines.",
-        "instructions": (
-            "You are Dr. Sara (د. سارة), Planning & Strategy Manager. Break down complex organizational goals "
-            "into logical, sequential, and measurable milestones. Clearly state objectives, required dependencies, "
-            "and intermediate deliverables with strategic clarity."
-        ),
-        "task_depth": "Standard",
-        "default_model_id": "deepseek-v4.1-flash-free",
-        "default_variant_id": "high",
-        "settings_json": json.dumps({
-            "department": "planning",
-            "is_manager": True,
-            "badge": "👑 Manager",
-            "arabic_name": "د. سارة",
-            "title": "مدير التخطيط والإستراتيجية",
-            "timeout": 120,
-            "max_retries": 3,
-            "strict_json": True
-        })
-    },
-    {
-        "id": "researcher",
-        "name": "Khaled (خالد)",
-        "role_type": "researcher",
-        "description": "Research & Intelligence Specialist (💼 Specialist). Gathers evidence, analyzes context, and extracts verifiable findings.",
-        "instructions": (
-            "You are Khaled (خالد), Research & Intelligence Specialist. Thoroughly analyze given context and inputs. "
-            "Extract verifiable facts, organize citations, and categorize information without hallucinating external web knowledge."
-        ),
-        "task_depth": "Standard",
-        "default_model_id": "deepseek-v4.1-flash-free",
-        "default_variant_id": "low",
-        "settings_json": json.dumps({
-            "department": "analysis",
-            "is_manager": False,
-            "badge": "💼 Specialist",
-            "arabic_name": "خالد",
-            "title": "أخصائي الأبحاث والاستكشاف",
-            "timeout": 120,
-            "max_retries": 3,
-            "strict_json": True
-        })
-    },
-    {
-        "id": "analyst",
-        "name": "Eng. Tarek (م. طارق)",
-        "role_type": "analyst",
-        "description": "Analysis & Risk Manager (👑 Manager). Evaluates feasibility, architecture trade-offs, and security risks.",
-        "instructions": (
-            "You are Eng. Tarek (م. طارق), Analysis & Risk Manager. Perform objective comparison and risk assessment of system architectures. "
-            "Highlight operational constraints, evaluate technical trade-offs, and calculate failure risks with actionable mitigations."
-        ),
-        "task_depth": "Deep",
-        "default_model_id": "deepseek-v4.1-flash-free",
-        "default_variant_id": "max",
-        "settings_json": json.dumps({
-            "department": "analysis",
-            "is_manager": True,
-            "badge": "👑 Manager",
-            "arabic_name": "م. طارق",
-            "title": "مدير التحليل والمخاطر",
-            "timeout": 120,
-            "max_retries": 3,
-            "strict_json": True
-        })
-    },
-    {
-        "id": "reviewer",
-        "name": "Prof. Yasmin (أ. ياسمين)",
-        "role_type": "reviewer",
-        "description": "Quality & Review Manager (👑 Manager). Audits deliverables, verifies test contracts, and issues approvals.",
-        "instructions": (
-            "You are Prof. Yasmin (أ. ياسمين), Quality & Review Manager. Rigorously critique findings for logical contradictions, "
-            "unsupported claims, and missing edge cases. Give constructive correction recommendations and formal quality sign-off."
-        ),
-        "task_depth": "Deep",
-        "default_model_id": "deepseek-v4.1-flash-free",
-        "default_variant_id": "high",
-        "settings_json": json.dumps({
-            "department": "quality",
-            "is_manager": True,
-            "badge": "👑 Manager",
-            "arabic_name": "أ. ياسمين",
-            "title": "مدير الجودة والاعتماد",
-            "timeout": 120,
-            "max_retries": 3,
-            "strict_json": True
-        })
-    },
-    {
-        "id": "data_extractor",
-        "name": "Layla (ليلى)",
-        "role_type": "data_extractor",
-        "description": "Data & Schemas Specialist (💼 Specialist). Converts unstructured inputs into validated JSON schemas.",
-        "instructions": (
-            "You are Layla (ليلى), Data & Schemas Specialist. Convert unstructured input into strict JSON format matching "
-            "the required schema exactly without extra commentary or wrapping."
-        ),
-        "task_depth": "Quick",
-        "default_model_id": "muse-spark-1.3-contributor-free",
-        "default_variant_id": "minimal",
-        "settings_json": json.dumps({
-            "department": "analysis",
-            "is_manager": False,
-            "badge": "💼 Specialist",
-            "arabic_name": "ليلى",
-            "title": "أخصائية استخراج البيانات",
-            "timeout": 90,
-            "max_retries": 2,
-            "strict_json": True
-        })
-    },
-    {
-        "id": "summarizer",
-        "name": "Omar (عمر)",
-        "role_type": "summarizer",
-        "description": "Executive Summarizer Specialist (💼 Specialist). Distills complex findings into clear executive briefs.",
-        "instructions": (
-            "You are Omar (عمر), Executive Summarizer Specialist. Distill complex findings into clear, concise, and structured summaries."
-        ),
-        "task_depth": "Quick",
-        "default_model_id": "muse-spark-1.3-contributor-free",
-        "default_variant_id": "low",
-        "settings_json": json.dumps({
-            "department": "quality",
-            "is_manager": False,
-            "badge": "💼 Specialist",
-            "arabic_name": "عمر",
-            "title": "أخصائي التلخيص والتقارير",
-            "timeout": 60,
-            "max_retries": 2,
-            "strict_json": False
-        })
-    },
-    {
-        "id": "report_writer",
-        "name": "Nour (نور)",
-        "role_type": "report_writer",
-        "description": "Documentation & Technical Writer (💼 Specialist). Assembles executive reports and operational runbooks.",
-        "instructions": (
-            "You are Nour (نور), Technical & Report Writer. Synthesize multi-stage findings into an executive-ready report "
-            "with an introduction, findings, risk matrix, and conclusions."
-        ),
-        "task_depth": "Standard",
-        "default_model_id": "muse-spark-1.3-contributor-free",
-        "default_variant_id": "medium",
-        "settings_json": json.dumps({
-            "department": "quality",
-            "is_manager": False,
-            "badge": "💼 Specialist",
-            "arabic_name": "نور",
-            "title": "أخصائي توثيق الأنظمة",
-            "timeout": 120,
-            "max_retries": 3,
-            "strict_json": False
-        })
-    },
-    {
-        "id": "coder",
-        "name": "Ahmed (أحمد)",
-        "role_type": "coder",
-        "description": "Code Implementation Specialist (💼 Specialist). Proposes and implements robust, clean code architectures.",
-        "instructions": (
-            "You are Ahmed (أحمد), Code Implementation Specialist. Review or draft clean, robust, and well-typed code solutions. "
-            "Explain rationale, adhere to strict patterns, and highlight security implications."
-        ),
-        "task_depth": "Standard",
-        "default_model_id": "deepseek-v4.1-flash-free",
-        "default_variant_id": "high",
-        "settings_json": json.dumps({
-            "department": "planning",
-            "is_manager": False,
-            "badge": "💼 Specialist",
-            "arabic_name": "أحمد",
-            "title": "أخصائي البرمجة والتنفيذ",
-            "timeout": 150,
-            "max_retries": 3,
-            "strict_json": True
-        })
-    },
-    {
-        "id": "translator",
-        "name": "Mona (منى)",
-        "role_type": "translator",
-        "description": "Localization & Terminology Specialist (💼 Specialist). Translates technical content while preserving terminology.",
-        "instructions": (
-            "You are Mona (منى), Localization Specialist. Translate technical content accurately while preserving formatting, "
-            "domain glossary terms, and executive tone."
-        ),
-        "task_depth": "Quick",
-        "default_model_id": "muse-spark-1.3-contributor-free",
-        "default_variant_id": "low",
-        "settings_json": json.dumps({
-            "department": "quality",
-            "is_manager": False,
-            "badge": "💼 Specialist",
-            "arabic_name": "منى",
-            "title": "أخصائية الترجمة والمصطلحات",
-            "timeout": 60,
-            "max_retries": 2,
-            "strict_json": False
-        })
-    },
-    {
-        "id": "custom",
-        "name": "General Manager (المدير العام)",
-        "role_type": "custom",
-        "description": "General Manager & Executive Orchestrator (👑 Manager). Coordinates strategic operations and team alignment.",
-        "instructions": (
-            "You are the General Manager (المدير العام) — a warm, natural conversationalist, "
-            "not a bureaucrat. Talk to the user like a thoughtful human executive: directly, "
-            "concisely, and with personality. Always reply in the user's own language and dialect "
-            "(Egyptian Arabic when they write Egyptian Arabic). Never output JSON, reports, or "
-            "internal mechanics; never mention missions, tasks, sessions, or employees unless the "
-            "user explicitly asks for work to be delegated. Greetings get a natural greeting back — "
-            "nothing more."
-        ),
-        "task_depth": "Standard",
-        "default_model_id": "deepseek-v4.1-flash-free",
-        "default_variant_id": "max",
-        "settings_json": json.dumps({
-            "department": "executive",
-            "is_manager": True,
-            "badge": "👑 Manager",
-            "arabic_name": "المدير العام",
-            "title": "المدير العام للمنظومة",
-            "timeout": 120,
-            "max_retries": 3,
-            "strict_json": True
-        })
-    }
-]
-
-
-# Previous General Manager default instructions (replaced by the conversational
-# contract above). Used only to upgrade existing databases that never customized it.
-_LEGACY_GM_INSTRUCTIONS = (
-    "You are the General Manager (المدير العام) of the organization. Coordinate cross-departmental operations, "
-    "align strategic vision across planning, risk analysis, and quality assurance, and guide company initiatives."
+from backend.app.db.org_defaults import (
+    DEFAULT_EMPLOYEE_PROFILES,
+    CEO_ENGLISH_NAME_RULE,
+    LEGACY_GM_INSTRUCTIONS,
+    LEGACY_GM_NAMES,
+    LEGACY_ORG_NAMES,
+    LEGACY_ORG_TEAM_NAMES,
+    englishify_legacy_text,
 )
+
+# Backwards-compatible alias (older modules/tests import the private name).
+_LEGACY_GM_INSTRUCTIONS = LEGACY_GM_INSTRUCTIONS
 
 
 class WorkflowRepository:
@@ -324,6 +89,8 @@ PROFILE_ALIASES = {
     "eng_tarek": "analyst",
     "prof_yasmin": "reviewer",
     "general_manager": "custom",
+    "loqman": "custom",
+    "ceo": "custom",
     "ahmed": "coder",
     "khaled": "researcher",
     "layla": "data_extractor",
@@ -358,7 +125,7 @@ class AgentProfileRepository:
         if not profile:
             return None
         for key, value in kwargs.items():
-            if hasattr(profile, key) and value is not None:
+            if hasattr(profile, key) and (value is not None or key == "engine"):
                 setattr(profile, key, value)
         profile.updated_at = datetime.now(timezone.utc)
         self.db.commit()
@@ -373,30 +140,144 @@ class AgentProfileRepository:
 
     def seed_defaults(self) -> int:
         """
-        Seeds standard employee roles exactly once: only when the table is
-        completely empty (fresh install / fresh test DB). Never resurrects
-        profiles the user deleted — an intentionally emptied catalog stays empty.
+        Seeds the Loqman company organization (CEO + two teams) exactly once:
+        only when the table is completely empty (fresh install / fresh test DB).
+        Never resurrects profiles the user deleted.
+
+        Existing catalogs are upgraded in place, additively:
+        - an untouched default CEO is renamed to Loqman and gets the new persona;
+        - team membership + the written contract are merged into settings_json
+          only when those keys are missing (any user customization wins).
         """
-        seeded_count = 0
-        if self.db.query(AgentProfile).count() > 0:
-            # Non-empty catalog: never resurrect deleted profiles. Only the
-            # General Manager conversational upgrade may still apply.
-            custom = self.db.query(AgentProfile).filter(AgentProfile.id == "custom").first()
-            if custom is not None and custom.instructions == _LEGACY_GM_INSTRUCTIONS:
-                for profile_data in DEFAULT_EMPLOYEE_PROFILES:
-                    if profile_data["id"] == "custom":
-                        custom.instructions = profile_data.get("instructions")
-                        custom.updated_at = datetime.now(timezone.utc)
-                        self.db.commit()
-                        break
+        existing = self.db.query(AgentProfile).all()
+        if existing:
+            self._upgrade_existing_org(existing)
             return 0
         for profile_data in DEFAULT_EMPLOYEE_PROFILES:
-            prof = AgentProfile(**profile_data)
-            self.db.add(prof)
-            seeded_count += 1
-        if seeded_count > 0:
+            self.db.add(AgentProfile(**profile_data))
+        self.db.commit()
+        return len(DEFAULT_EMPLOYEE_PROFILES)
+
+    @staticmethod
+    def _read_settings(profile: AgentProfile) -> Dict[str, Any]:
+        try:
+            data = json.loads(profile.settings_json or "{}")
+        except Exception:
+            data = {}
+        return data if isinstance(data, dict) else {}
+
+    @classmethod
+    def _merge_settings(
+        cls,
+        profile: AgentProfile,
+        default_settings: Dict[str, Any],
+        force: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Additive settings merge: missing keys are filled, user values win."""
+        current = cls._read_settings(profile)
+        before = json.dumps(current, sort_keys=True, ensure_ascii=False)
+        for key, value in default_settings.items():
+            current.setdefault(key, value)
+        if force:
+            current.update(force)
+        if json.dumps(current, sort_keys=True, ensure_ascii=False) == before:
+            return False
+        profile.settings_json = json.dumps(current, ensure_ascii=False)
+        return True
+
+    @classmethod
+    def _englishify_settings(cls, value: Any) -> Any:
+        """Recursively translate shipped Arabic names, preserving arabic_name."""
+        if isinstance(value, str):
+            return englishify_legacy_text(value)
+        if isinstance(value, list):
+            return [cls._englishify_settings(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: (item if key == "arabic_name" else cls._englishify_settings(item))
+                for key, item in value.items()
+            }
+        return value
+
+    @classmethod
+    def _englishify_profile(cls, profile: AgentProfile) -> bool:
+        """
+        One-way upgrade for profiles seeded with the first Loqman release:
+        translate only the shipped Arabic/bilingual names to English. Any
+        custom name or contract text that does not contain a shipped name is
+        left exactly as the user wrote it.
+        """
+        changed = False
+        instructions = profile.instructions or ""
+        if (
+            profile.id == "custom"
+            and instructions.startswith("You are Loqman")
+            and "Display names in English" not in instructions
+        ):
+            profile.instructions = instructions.rstrip() + "\n\n" + CEO_ENGLISH_NAME_RULE
+            changed = True
+        current = cls._read_settings(profile)
+        shipped_name = (profile.name or "").strip() in LEGACY_ORG_NAMES
+        shipped_team = current.get("team_name") in LEGACY_ORG_TEAM_NAMES
+        if not (shipped_name or shipped_team):
+            return changed
+        name = englishify_legacy_text(profile.name or "")
+        if name != (profile.name or ""):
+            profile.name = name
+            changed = True
+        upgraded_instructions = englishify_legacy_text(profile.instructions or "")
+        if upgraded_instructions != (profile.instructions or ""):
+            profile.instructions = upgraded_instructions
+            changed = True
+        upgraded = cls._englishify_settings(current)
+        if upgraded != current:
+            profile.settings_json = json.dumps(upgraded, ensure_ascii=False)
+            changed = True
+        return changed
+
+    def _upgrade_existing_org(self, profiles: List[AgentProfile]) -> None:
+        """Additive migration for catalogs seeded before the Loqman org."""
+        by_id = {p.id: p for p in profiles}
+        changed = False
+
+        for profile_data in DEFAULT_EMPLOYEE_PROFILES:
+            profile = by_id.get(profile_data["id"])
+            if profile is None:
+                continue
+            default_settings = json.loads(profile_data["settings_json"])
+            force: Dict[str, Any] = {}
+
+            if profile_data["id"] == "custom":
+                current = self._read_settings(profile)
+                instructions = (profile.instructions or "").strip()
+                untouched_ceo = (
+                    (profile.name or "").strip() in LEGACY_GM_NAMES
+                    or current.get("arabic_name") in (None, "", "المدير العام")
+                    or instructions == LEGACY_GM_INSTRUCTIONS.strip()
+                    or instructions.startswith("You are the General Manager")
+                )
+                if untouched_ceo:
+                    profile.name = profile_data["name"]
+                    profile.description = profile_data["description"]
+                    profile.instructions = profile_data["instructions"]
+                    force = {
+                        "department": default_settings["department"],
+                        "badge": default_settings["badge"],
+                        "arabic_name": default_settings["arabic_name"],
+                        "title": default_settings["title"],
+                    }
+                    changed = True
+
+            if self._merge_settings(profile, default_settings, force):
+                profile.updated_at = datetime.now(timezone.utc)
+                changed = True
+
+            if self._englishify_profile(profile):
+                profile.updated_at = datetime.now(timezone.utc)
+                changed = True
+
+        if changed:
             self.db.commit()
-        return seeded_count
 
 
 
@@ -549,11 +430,22 @@ class OpenCodeConversationRepository:
         ).first()
 
     def save(self, conversation_id: str, session_id: str, model_id: str,
-             provider_id: str, agent_id: str = "build") -> OpenCodeConversation:
+             provider_id: str, agent_id: str = settings.CHAT_AGENT_ID) -> OpenCodeConversation:
+        allowed_agents = {settings.CHAT_AGENT_ID, settings.WORK_AGENT_ID}
+        if agent_id not in allowed_agents:
+            raise ValueError(
+                f"OpenCode agent '{agent_id}' is not allowed. Allowed: {sorted(allowed_agents)}."
+            )
         row = self.get(conversation_id)
         if row:
-            if row.session_id != session_id:
+            agent_changed = row.agent_id != agent_id
+            if row.session_id != session_id and not agent_changed:
                 raise ValueError("This conversation already belongs to another OpenCode session.")
+            if agent_changed:
+                # Security migration: a stored conversation pinned to an
+                # unrestricted agent (legacy "build") is re-pointed at the
+                # locked agent instead of silently reusing the unsafe session.
+                row.session_id = session_id
             row.model_id = model_id
             row.provider_id = provider_id
             row.agent_id = agent_id

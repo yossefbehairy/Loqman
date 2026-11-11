@@ -24,16 +24,16 @@ AgentOS adheres to the **Agentic SDLC Quality Standards**, rejecting brittle sup
 ### Tier 1: Core Unit Logic, Sanitization & State Machines
 - **Scope**: Core algorithms, prompt formatting, output sanitizers, and workflow state machine transitions.
 - **Execution Target**: Pytest (`backend/tests/test_context_and_sanitizer.py`, `backend/tests/test_state_machine.py`, `backend/tests/test_validator.py`).
-- **Characteristics**: Instantaneous (< 50ms), zero network overhead, deterministic in-memory fixtures.
+- **Characteristics**: Pure logic tests stay in-memory; API/lifecycle tests use an isolated temporary SQLite file with WAL, foreign keys, busy timeout, and separate connections. Model adapters are faked unless a live smoke test is explicitly selected.
 
 ### Tier 2: Backend API Contracts & Database Integrity
 - **Scope**: REST endpoints, SQLite foreign key cascades, transaction atomicity, agent profile persistence, and direct manager consultation APIs (`POST /api/chat`, `PUT /api/agent-profiles/{id}`).
-- **Execution Target**: Pytest (`backend/tests/test_api.py`, `backend/tests/test_db.py`, `backend/tests/test_team_chat.py`, `backend/tests/test_sse_and_api.py`). The current suite runs 143 tests.
+- **Execution Target**: Pytest across `backend/tests/`; the current backend suite reports 560 passed, 6 skipped at its latest complete run. Fixtures use temporary file-backed SQLite with WAL and separate connections so worker-thread usage writes resemble production.
 - **Guarantees**: Verifies strict JSON serialization, SQLite WAL mode, foreign key enforcement (`PRAGMA foreign_keys=ON`), and persona seeded records.
 
 ### Tier 3: Playwright End-to-End User Journeys (R1 through R5)
 - **Scope**: Real browser automation simulating executive and operator journeys across the Chromium engine.
-- **Execution Target**: Playwright Test (`frontend/e2e/r1_executive_chat.spec.ts` through `r5_team_chat_stream.spec.ts`, plus `frontend/e2e/obsidian_physics_graph.spec.ts`, `frontend/e2e/agentos_ui_craft.spec.ts` and `frontend/e2e/ceo_control_plane.spec.ts`). The suite runs 40 tests across 8 spec files.
+- **Execution Target**: Playwright Test (`frontend/e2e/r1_executive_chat.spec.ts` through `r5_team_chat_stream.spec.ts`, plus `frontend/e2e/obsidian_physics_graph.spec.ts`, `frontend/e2e/agentos_ui_craft.spec.ts` and `frontend/e2e/ceo_control_plane.spec.ts`). The suite runs 43 tests across 8 spec files.
 - **Guarantees**: Real DOM inspection, reactive state transitions, role tag styling and hierarchy prominence, conversation delegation flows, modal forms, and sidebar navigation without page reloads.
 
 ### Tier 4: Live Mission Telemetry, Durations & Handovers
@@ -150,7 +150,7 @@ A composer message that names a role in the delegation grammar ("Delegate this m
 | Metric | Target Threshold | Enforcement Mechanism |
 |--------|------------------|----------------------|
 | **Playwright E2E Suite Pass Rate** | **100%** (0 failures, 0 skipped) | `npm test` with `RUNTIME_MODE=mock` / CI Pipeline |
-| **Pytest Backend Suite Pass Rate** | **100%** (0 failures, 0 errors) | `pytest backend/tests` (143 tests) |
+| **Pytest Backend Suite Pass Rate** | **560 passed, 6 skipped** at last complete run | `backend\.venv\Scripts\python.exe -m pytest backend\tests -q` |
 | **Requirements Traceability (R1-R5)** | **100%** | Audit against `TEST_INFRA.md` |
 | **TypeScript Typecheck** | **0 errors** | `tsc -b` |
 | **Linter Compliance** | **0 errors** | `npm run lint` (`oxlint`) |

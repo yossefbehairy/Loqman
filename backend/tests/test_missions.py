@@ -144,11 +144,14 @@ def test_mission_full_e2e_mock(client):
 
 def test_mission_duplicate_protection(client):
     obj = "Duplicate protection probe objective xyz"
-    r1 = client.post("/api/missions", json={"objective": obj})
+    r1 = client.post("/api/missions", json={"objective": obj, "request_key": "retry-1"})
     assert r1.status_code == 201
-    r2 = client.post("/api/missions", json={"objective": obj})
+    r2 = client.post("/api/missions", json={"objective": obj, "request_key": "retry-1"})
     assert r2.status_code == 201
     assert r1.json()["id"] == r2.json()["id"]
+    assert client.post("/api/missions", json={"objective": obj + " changed", "request_key": "retry-1"}).status_code == 409
+    fresh = client.post("/api/missions", json={"objective": obj})
+    assert fresh.status_code == 201 and fresh.json()["id"] != r1.json()["id"]
 
 
 def test_mission_rejects_unknown_model(client):

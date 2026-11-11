@@ -58,7 +58,7 @@ test.describe('R2: Hierarchical Organization Structure & Natural Naming', () => 
     expect(await managerBadges.count()).toBeGreaterThanOrEqual(1);
 
     // 2. The CEO carries the Executive tag in the detail inspector
-    await page.getByRole('button', { name: 'Select Adel Mansour' }).click();
+    await page.getByRole('button', { name: 'Select Loqman' }).click();
     await expect(
       page.locator('main aside span.os-tag.os-tag-mono:text-is("Executive")')
     ).toBeVisible();

@@ -1,22 +1,51 @@
 import { createOpencodeClient } from '@opencode-ai/sdk/v2/client';
-import { API_BASE } from './client';
+import { ApiError, call } from './transport';
 
 // The generated SDK invokes its custom fetch with a single `Request` object
-// (never `(url, init)`), so the request method, headers and body must be copied
-// explicitly when the URL is rewritten onto the local AgentOS proxy.
+// (never `(url, init)`). There is no HTTP proxy any more: the request is handed
+// to the worker's `chat.opencode_proxy`, which only allows session reads/prompts
+// and re-validates the model/variant against the verified-free catalog.
 const sdkFetch: typeof fetch = async (input, init) => {
   const request =
     typeof input === 'string' || input instanceof URL ? new Request(input.toString(), init) : input;
   const url = new URL(request.url);
-  const target = `${API_BASE}/opencode-proxy${url.pathname}${url.search}`;
-  const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
-  let body: BodyInit | undefined;
-  if (hasBody) {
+  const method = request.method.toUpperCase();
+  let body: unknown;
+  if (method === 'POST') {
     const text = await request.text();
-    body = text.length ? text : undefined;
+    if (text.length) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        body = undefined;
+      }
+    }
   }
-  return fetch(target, { method: request.method, headers: request.headers, body, signal: request.signal });
+  const path = url.pathname.replace(/^\/+/, '');
+  const query = url.search.replace(/^\?/, '');
+  try {
+    const result = await call<{ data: unknown }>('chat.opencode_proxy', {
+      method,
+      path,
+      ...(query ? { query } : {}),
+      ...(body && typeof body === 'object' ? { body } : {}),
+    });
+    return new Response(JSON.stringify(result.data ?? null), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (e) {
+    const err = e as ApiError;
+    return new Response(JSON.stringify({ detail: err.message }), {
+      status: err.status ?? 502,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 };
+
+// Locked OpenCode agent for conversational surfaces. It must stay in sync with
+// settings.CHAT_AGENT_ID on the backend; "build" is never used by the app.
+const AGENT_ID = 'agentos-chat';
 
 const client = createOpencodeClient({
   baseUrl: 'http://agentos-opencode.local',
@@ -34,18 +63,20 @@ export interface SavedConversationSession {
 }
 
 async function getSavedSession(conversationId: string): Promise<SavedConversationSession | null> {
-  const response = await fetch(`${API_BASE}/chat/sessions/${encodeURIComponent(conversationId)}`);
-  if (!response.ok) throw new Error((await response.json()).detail || `Session lookup failed (${response.status})`);
-  return response.json();
+  const { session } = await call<{ session: SavedConversationSession | null }>('chat.session.get', {
+    conversation_id: conversationId,
+  });
+  return session;
 }
 
 async function saveSession(conversationId: string, session: SavedConversationSession) {
-  const response = await fetch(`${API_BASE}/chat/sessions/${encodeURIComponent(conversationId)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(session),
+  await call('chat.session.save', {
+    conversation_id: conversationId,
+    session_id: session.session_id,
+    model_id: session.model_id,
+    provider_id: session.provider_id,
+    agent_id: session.agent_id,
   });
-  if (!response.ok) throw new Error((await response.json()).detail || `Session save failed (${response.status})`);
 }
 
 function extractText(message: any): string {
@@ -77,10 +108,16 @@ export async function sendOpenCodeMessage(args: {
   variant?: string;
 }): Promise<string> {
   let mapping = await getSavedSession(args.conversationId);
+  // Security migration: a conversation pinned to an unrestricted agent
+  // (legacy "build") is re-opened with the locked AgentOS chat agent instead
+  // of silently continuing on the unsafe session.
+  if (mapping && mapping.agent_id !== AGENT_ID) {
+    mapping = null;
+  }
   if (!mapping) {
     const created: any = await client.session.create({
-      title: `AgentOS chat ${args.conversationId}`,
-      agent: 'build',
+      title: `Loqman chat ${args.conversationId}`,
+      agent: AGENT_ID,
       model: { id: args.modelId, providerID: args.providerId, ...(args.variant ? { variant: args.variant } : {}) },
     });
     const session = created?.data ?? created;
@@ -91,7 +128,7 @@ export async function sendOpenCodeMessage(args: {
       session_id: sessionId,
       model_id: args.modelId,
       provider_id: args.providerId,
-      agent_id: 'build',
+      agent_id: AGENT_ID,
     };
     await saveSession(args.conversationId, mapping);
   } else if (mapping.model_id !== args.modelId || mapping.provider_id !== args.providerId) {

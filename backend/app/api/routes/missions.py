@@ -11,6 +11,7 @@ GET  /api/missions/{id}/events (SSE: replay from DB + live)
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -19,19 +20,33 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.config import settings
-from backend.app.db.models import Mission, MissionTask
+from backend.app.db.models import Mission, MissionTask, ConversationRun
+from backend.app.api.routes.conversation_runs import RunOut
+from backend.app.core.conversation_runs import ConversationRunManager, manager_for_factory
 from backend.app.db.repository import AgentProfileRepository, MissionRepository
 from backend.app.db.session import SessionLocal, get_db
 from backend.app.engine.events import event_hub
 from backend.app.orchestration.ceo import (
+    MISSION_NON_TERMINAL,
+    EngineSelectionError,
+    _ENGINE_PROVIDERS,
+    _default_engine_runtime_factory,
+    _default_runtime_identity,
+    _mission_managers,
+    _select_task_runtime,
     cancel_mission,
-    idempotency_key,
+    cancel_mission_rows,
+    mission_was_cancelled,
+    transition_mission,
+    transition_task,
     run_mission_background,
 )
 from backend.app.runtime import get_runtime, AgentRuntime
 from backend.app.runtime.base import ExecuteAgentTask
+from backend.app.runtime.ledger import run_agent_task, KIND_MISSION_DELEGATE, KIND_GREETING
 
 router = APIRouter(prefix="/api/missions", tags=["missions"])
 
@@ -70,6 +85,7 @@ class MissionCreate(BaseModel):
     employee_roles: Optional[List[str]] = Field(default=None, max_length=8)
     model_id: Optional[str] = None
     variant: Optional[str] = None
+    request_key: Optional[str] = Field(default=None, min_length=1, max_length=100)
 
 
 class DelegatedTaskCreate(BaseModel):
@@ -180,12 +196,21 @@ async def _run_mission_task(mission_id: str, session_factory=None, runtime=None)
         db.close()
 
 
+def _force_delegation_cancelled(db: Session, mission_id: str, task_id: str) -> None:
+    """Pin mission/task to cancelled, discarding any late output."""
+    cancel_mission_rows(db, mission_id)
+
+
 async def _run_explicit_delegation(mission_id: str, task_id: str, profile_id: str,
-                                   session_factory=None, runtime=None):
+                                   session_factory=None, runtime=None,
+                                   engine_runtime_factory=None, run_manager=None, resolved=None):
     from backend.app.runtime import get_runtime as _gr
 
     factory = session_factory or SessionLocal
     rt = runtime or _gr()
+    manager = run_manager or manager_for_factory(session_factory)
+    # Lets cancel_mission() persist-cancel the run and abort its adapter.
+    _mission_managers[mission_id] = (manager, asyncio.get_running_loop())
     db = factory()
     try:
         mission = db.query(Mission).filter_by(id=mission_id).first()
@@ -194,11 +219,19 @@ async def _run_explicit_delegation(mission_id: str, task_id: str, profile_id: st
         if not mission or not task or not profile:
             return
         now = datetime.now(timezone.utc)
-        mission.status = "running"
-        mission.started_at = mission.started_at or now
-        task.status = "running"
-        task.started_at = now
-        task.attempt_count = 1
+        # Atomic start in ONE transaction: a queued delegation cancelled before
+        # this point must never start (the task CAS also refuses cancelled missions).
+        mission_started = transition_mission(
+            db, mission_id, MISSION_NON_TERMINAL, commit=False,
+            status="running", started_at=mission.started_at or now,
+        )
+        task_started = mission_started and transition_task(
+            db, task_id, ("queued",), commit=False,
+            status="running", started_at=now, attempt_count=1,
+        )
+        if not (mission_started and task_started):
+            db.rollback()
+            return
         db.commit()
         prompt = (
             f"You are the {profile.role_type} employee ({profile.name}).\n"
@@ -208,46 +241,73 @@ async def _run_explicit_delegation(mission_id: str, task_id: str, profile_id: st
             f"Expected deliverable: {task.expected_output or '(use a clear, useful format)'}\n"
             "Complete the assignment and return the actual deliverable directly."
         )
-        result = await rt.execute_task(ExecuteAgentTask(
-            prompt=prompt,
-            model_id=task.model_id or settings.DEFAULT_MODEL_ID,
-            provider_id="opencode",
-            variant=task.variant,
+        model_id = task.model_id or settings.DEFAULT_MODEL_ID
+        # Same engine/catalog resolution as standard mission workers; an explicit
+        # engine that cannot be honoured fails the delegation (never falls back).
+        # `resolved` = adapter already chosen + catalog-checked by the HTTP preflight (no repeat probe).
+        task_runtime, provider_id, engine = resolved or await _select_task_runtime(
+            profile, rt, engine_runtime_factory or _default_engine_runtime_factory, {}, model_id, task.variant)
+        result, _ = await manager.run_mission_task(
+            runtime=task_runtime, mission_id=mission_id, task_id=task_id, attempt=1,
+            engine=engine or _default_runtime_identity()[0], provider_id=provider_id,
+            model_id=model_id, variant=task.variant, prompt=prompt,
             session_title=f"agentos-delegated-{mission.id[:8]}",
             timeout=settings.MISSION_TASK_TIMEOUT,
-        ))
-        task.output_json = json.dumps({
+            max_output_chars=settings.MISSION_MAX_OUTPUT_CHARS, kind="mission_task",
+        )  # plain-text deliverable: no strict-JSON validator
+        # A cancel may have landed while the provider was working. The late
+        # response must not flip a cancelled mission/task to success.
+        if mission_was_cancelled(db, mission_id):
+            _force_delegation_cancelled(db, mission_id, task_id)
+            return
+        output_json = json.dumps({
             "result": result.text,
             "model": result.model_id,
             "variant": result.variant_id,
             "session_id": result.session_id,
             "duration_ms": result.duration_ms,
         }, ensure_ascii=False)
-        task.session_id = result.session_id
-        task.duration_ms = result.duration_ms
-        task.model_id = result.model_id
-        task.status = "succeeded"
-        task.finished_at = datetime.now(timezone.utc)
-        mission.status = "succeeded"
-        mission.final_summary = json.dumps({"result": result.text}, ensure_ascii=False)
-        mission.finished_at = task.finished_at
+        finished = datetime.now(timezone.utc)
+        # Task + mission complete together or not at all; both writes are
+        # conditional so a committed cancel can never be overwritten.
+        done = transition_task(
+            db, task_id, ("running",), commit=False,
+            output_json=output_json, session_id=result.session_id,
+            duration_ms=result.duration_ms, model_id=result.model_id,
+            status="succeeded", finished_at=finished,
+        ) and transition_mission(
+            db, mission_id, MISSION_NON_TERMINAL, commit=False,
+            status="succeeded", final_summary=json.dumps({"result": result.text}, ensure_ascii=False),
+            finished_at=finished,
+        )
+        if not done:
+            db.rollback()
+            _force_delegation_cancelled(db, mission_id, task_id)
+            return
         db.commit()
     except Exception as exc:
         db.rollback()
-        mission = db.query(Mission).filter_by(id=mission_id).first()
-        task = db.query(MissionTask).filter_by(id=task_id, mission_id=mission_id).first()
-        error = str(exc)[:800]
+        if mission_was_cancelled(db, mission_id):
+            _force_delegation_cancelled(db, mission_id, task_id)
+            return
+        from backend.app.runtime.errors import safe_error_message
+        error = str(exc)[:500] if isinstance(exc, EngineSelectionError) else safe_error_message(exc)
         now = datetime.now(timezone.utc)
-        if task:
-            task.status = "failed"
-            task.error_message = error
-            task.finished_at = now
-        if mission:
-            mission.status = "failed"
-            mission.error_summary = error
-            mission.finished_at = now
-        db.commit()
+        failed = transition_task(
+            db, task_id, ("queued", "running"), commit=False,
+            status="failed", error_message=error, finished_at=now,
+        ) and transition_mission(
+            db, mission_id, MISSION_NON_TERMINAL, commit=False,
+            status="failed", error_summary=error, finished_at=now,
+        )
+        if failed:
+            db.commit()
+        else:
+            db.rollback()
+            if mission_was_cancelled(db, mission_id):
+                _force_delegation_cancelled(db, mission_id, task_id)
     finally:
+        _mission_managers.pop(mission_id, None)
         db.close()
 
 
@@ -270,7 +330,7 @@ async def _create_greeting_mission(
     from backend.app.runtime.errors import RuntimeErrorBase
 
     prompt = (
-        "You are the General Manager (المدير العام) — a warm, natural conversationalist.\n"
+        "You are Loqman, CEO of the company — a warm, natural conversationalist.\n"
         f"The user just said: {objective.strip()}\n"
         "Reply once, naturally and briefly, in the user's own language and dialect "
         "(Egyptian Arabic if they write Egyptian Arabic). "
@@ -278,14 +338,14 @@ async def _create_greeting_mission(
     )
     t0 = _time.time()
     try:
-        result = await runtime.execute_task(ExecuteAgentTask(
+        result = await run_agent_task(runtime, ExecuteAgentTask(
             prompt=prompt,
             model_id=model_id,
             provider_id=provider_id,
             variant=variant,
             session_title="greeting-reply",
             timeout=90,
-        ))
+        ), kind=KIND_GREETING)
         reply = (result.text or "").strip()
         if not reply:
             raise RuntimeErrorBase("Empty greeting reply from runtime.")
@@ -300,7 +360,7 @@ async def _create_greeting_mission(
         except Exception:
             pass
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Greeting reply failed: {str(e)[:300]}")
+        raise HTTPException(status_code=502, detail="Greeting reply failed.")
     duration_ms = int((_time.time() - t0) * 1000)
     now = datetime.now(timezone.utc)
 
@@ -336,6 +396,76 @@ async def _create_greeting_mission(
     return _mission_to_out(mission, [task])
 
 
+def get_engine_runtime_factory():
+    """Adapter factory for explicit profile engines (overridable in tests)."""
+    return _default_engine_runtime_factory
+
+
+def _variant_ok(entry, variant: Optional[str], strict: bool) -> bool:
+    if not variant or (strict and variant == "default"):
+        return True
+    if entry.variants:
+        return variant in entry.variants
+    return not strict  # strict (account engines): no exposed variants -> none supported
+
+
+async def _catalog(rt: Any, free_only: bool, label: str):
+    try:
+        return await rt.list_available_models(free_only=free_only)
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"{label} runtime unreachable.")
+
+
+async def _preflight_model(runtime: AgentRuntime, model_id: str, variant: Optional[str], *,
+                           profile: Any = None, factory: Any = None):
+    """Provider-aware model/variant validation BEFORE any DB write (catalog listing only,
+    never a model call). Returns (runtime, provider_id, engine_label_or_None, catalog_entry).
+
+    Explicit profile.engine -> that engine's own adapter/catalog, never the default
+    runtime (OpenCode: free-only; Claude/Codex/Antigravity: account catalog, billing
+    unknown). No engine -> the configured default runtime: free-only for OpenCode
+    (RUNTIME_MODE=real) and mock; account catalog for claude/codex/agy modes."""
+    engine = ((getattr(profile, "engine", None) if profile else None) or "").strip() or None
+    if engine is not None:
+        if engine not in _ENGINE_PROVIDERS:
+            raise HTTPException(status_code=400, detail=f"Unsupported engine '{engine}'.")
+        if engine == "mock":
+            if settings.RUNTIME_MODE != "mock":
+                raise HTTPException(status_code=400, detail="Engine 'mock' is only available in explicit mock mode.")
+            rt, free_only = runtime, True
+        else:
+            try:
+                rt = (factory or _default_engine_runtime_factory)(engine)
+            except EngineSelectionError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)[:300])
+            except Exception:
+                raise HTTPException(status_code=503, detail=f"Engine '{engine}' is unavailable.")
+            free_only = engine == "opencode"
+        strict = engine not in ("opencode", "mock")
+        label, provider = engine, _ENGINE_PROVIDERS[engine]
+    else:
+        mode = settings.RUNTIME_MODE
+        rt, free_only, strict = runtime, mode in ("real", "mock"), mode not in ("real", "mock")
+        label, provider = None, _default_runtime_identity()[1]
+    models = await _catalog(rt, free_only, "OpenCode" if free_only else (engine or settings.RUNTIME_MODE))
+    entry = next((m for m in models if m.id == model_id), None)
+    if entry is None:
+        if free_only:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_id}' is not verified as free and active. "
+                       f"Available free models include: {[m.id for m in models[:20]]}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model_id}' is not offered by {'engine ' + repr(engine) if engine else 'the configured runtime'}; "
+                   f"available models include: {[m.id for m in models[:20]]}")
+    if not _variant_ok(entry, variant, strict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Variant '{variant}' is not supported by model '{model_id}'. Supported: {entry.variants}")
+    return rt, provider, label, entry
+
+
 @router.post("", response_model=MissionOut, status_code=status.HTTP_201_CREATED)
 async def create_mission(
     payload: MissionCreate,
@@ -353,63 +483,49 @@ async def create_mission(
     if not roles:
         roles = ["planner", "reviewer"]
 
-    # Revalidate model BEFORE persisting (free-only, no paid fallback).
     model_id = payload.model_id or settings.DEFAULT_MODEL_ID
-    try:
-        free_models = await runtime.list_available_models(free_only=True)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OpenCode runtime unreachable: {str(e)[:300]}")
-    target = next((m for m in free_models if m.id == model_id), None)
-    if not target:
-        available = [m.id for m in free_models[:20]]
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model '{model_id}' is not confirmed free/active. Available free models include: {available}",
-        )
-    # Validate requested variant against the live catalog (truthful reasoning selector).
-    if payload.variant and target.variants and payload.variant not in target.variants:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Variant '{payload.variant}' is not supported by model '{model_id}'. Supported: {target.variants}",
-        )
-    if not target.variants:
-        # Model exposes no configurable reasoning parameter — ignore selector silently is lying;
-        # we keep the request but the worker records variant 'default'.
-        pass
+    # Revalidate model BEFORE persisting. Planner/synthesis use the configured default runtime, so validate against ITS catalog
+    # (free-only for OpenCode/mock; account catalog for claude/codex/agy modes).
+    _, _, _, target = await _preflight_model(runtime, model_id, payload.variant)
 
     # Greetings get a single natural reply — never the employee pipeline.
     if is_greeting_objective(objective):
+        if payload.request_key:
+            raise HTTPException(status_code=422, detail="Request keys are not supported for greeting replies")
         return await _create_greeting_mission(
             objective=objective, model_id=model_id, provider_id=target.provider_id,
             variant=payload.variant, title=payload.title, db=db, runtime=runtime,
         )
 
-    # Duplicate protection: same objective+roles+model within 10 minutes returns existing.
-    key = idempotency_key(objective, roles, model_id)
-    repo = MissionRepository(db)
-    # Only dedupe recent queued/running missions with the same key.
-    existing = None
-    if key:
-        from backend.app.db.models import Mission as _M
-        from datetime import timedelta
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
-        existing = (
-            db.query(_M)
-            .filter(_M.idempotency_key == key, _M.status.in_(("queued", "planning", "running")))
-            .filter(_M.created_at >= cutoff)
-            .first()
-        )
+    key = f"client:{payload.request_key}" if payload.request_key else None
+    canonical = json.dumps({"objective": objective, "roles": sorted(roles), "model": model_id,
+                            "variant": payload.variant, "title": payload.title}, sort_keys=True, ensure_ascii=False)
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def existing_request():
+        row = db.query(Mission).filter(Mission.idempotency_key == key).first() if key else None
+        if row and row.request_fingerprint != fingerprint:
+            raise HTTPException(status_code=409, detail="Request key already used for different input")
+        return row
+
+    existing = existing_request()
     if existing:
         tasks = db.query(MissionTask).filter(MissionTask.mission_id == existing.id).all()
         return _mission_to_out(existing, tasks)
-
-    mission = repo.create_mission(
-        objective=objective,
-        title=payload.title or objective[:80],
-        model_id=model_id,
-        variant=payload.variant,
-        idempotency_key=key,
-    )
+    mission = Mission(objective=objective, title=payload.title or objective[:80], status="queued",
+                      model_id=model_id, variant=payload.variant, idempotency_key=key,
+                      request_fingerprint=fingerprint if key else None)
+    db.add(mission)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = existing_request()
+        if not existing:
+            raise
+        tasks = db.query(MissionTask).filter(MissionTask.mission_id == existing.id).all()
+        return _mission_to_out(existing, tasks)
+    db.refresh(mission)
     # Start the real background worker (no fake success: status stays queued/planning/running).
     background_tasks.add_task(_run_mission_task, mission.id, session_factory, runtime)
     return _mission_to_out(mission, [])
@@ -422,6 +538,7 @@ async def create_delegated_task(
     db: Session = Depends(get_db),
     runtime: AgentRuntime = Depends(get_runtime),
     session_factory=Depends(get_mission_session_factory),
+    engine_factory=Depends(get_engine_runtime_factory),
 ):
     """Create and execute exactly one user-selected employee assignment; skip CEO planning."""
     profiles = AgentProfileRepository(db).list_all()
@@ -435,12 +552,9 @@ async def create_delegated_task(
                         or p.role_type.lower() == payload.employee_role.lower()), None)
     if not profile:
         raise HTTPException(status_code=404, detail="Selected employee role was not found.")
-    models = await runtime.list_available_models(free_only=True)
-    model = next((m for m in models if m.id == payload.model_id), None)
-    if not model:
-        raise HTTPException(status_code=400, detail="Selected model is not verified as free and active.")
-    if payload.variant and model.variants and payload.variant not in model.variants:
-        raise HTTPException(status_code=400, detail="Selected reasoning variant is not supported by this model.")
+    # Resolve the profile's engine + validate model/variant on ITS catalog before any DB write.
+    resolved_rt, resolved_provider, resolved_engine, _ = await _preflight_model(
+        runtime, payload.model_id, payload.variant, profile=profile, factory=engine_factory)
 
     objective = payload.instructions.strip()
     mission = MissionRepository(db).create_mission(
@@ -465,7 +579,9 @@ async def create_delegated_task(
     )
     task.expected_output = payload.expected_output
     db.commit()
-    background_tasks.add_task(_run_explicit_delegation, mission.id, task.id, profile.id, session_factory, runtime)
+    background_tasks.add_task(
+        _run_explicit_delegation, mission.id, task.id, profile.id, session_factory, runtime,
+        resolved=(resolved_rt, resolved_provider, resolved_engine))
     return _mission_to_out(mission, [task])
 
 
@@ -499,16 +615,24 @@ def cancel_mission_endpoint(mission_id: str, db: Session = Depends(get_db)):
     if m.status in ("succeeded", "partially_succeeded", "failed", "cancelled"):
         tasks = db.query(MissionTask).filter(MissionTask.mission_id == mission_id).all()
         return _mission_to_out(m, tasks)
-    cancel_mission(mission_id)
-    m.status = "cancelled"
-    m.finished_at = datetime.now(timezone.utc)
-    for t in db.query(MissionTask).filter(MissionTask.mission_id == mission_id).all():
-        if t.status in ("queued", "running"):
-            t.status = "cancelled"
-            t.finished_at = t.finished_at or datetime.now(timezone.utc)
-    db.commit()
+    # Atomic compare-and-set: mission + unfinished tasks flip in one transaction,
+    # and only if the mission is still non-terminal (a concurrent completion wins
+    # over a late cancel; a committed cancel wins over everything afterwards).
+    if cancel_mission_rows(db, mission_id):
+        # Also schedules persisted-run cancel + engine abort on the mission's loop.
+        cancel_mission(mission_id)
+    m = repo.get(mission_id)
     tasks = db.query(MissionTask).filter(MissionTask.mission_id == mission_id).all()
     return _mission_to_out(m, tasks)
+
+
+@router.get("/{mission_id}/runs", response_model=List[RunOut])
+def mission_runs(mission_id: str, db: Session = Depends(get_db)):
+    if db.get(Mission, mission_id) is None:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    runs = (db.query(ConversationRun).filter(ConversationRun.mission_id == mission_id)
+            .order_by(ConversationRun.created_at, ConversationRun.id).limit(100).all())
+    return [ConversationRunManager._snapshot(db, run) for run in runs]
 
 
 @router.get("/{mission_id}/events")
@@ -517,29 +641,24 @@ async def mission_events(mission_id: str, db: Session = Depends(get_db)):
     m = repo.get(mission_id)
     if not m:
         raise HTTPException(status_code=404, detail="Mission not found")
-    tasks = db.query(MissionTask).filter(MissionTask.mission_id == mission_id).all()
-
-    past: List[Dict[str, Any]] = [
-        {"event": "mission.status.changed", "data": json.dumps({"missionId": m.id, "status": m.status})}
-    ]
-    for t in tasks:
-        past.append({"event": "task.status.changed",
-                     "data": json.dumps({"missionId": m.id, "taskKey": t.task_key, "status": t.status})})
-
     async def gen():
-        for ev in past:
-            yield f"event: {ev['event']}\ndata: {ev['data']}\n\n"
         q = event_hub.subscribe(mission_id)
         try:
+            # Subscribe before reading the snapshot, so events arriving while
+            # the snapshot is sent are buffered for the live stream.
+            db.expire_all()
+            current = repo.get(mission_id)
+            if not current:
+                return
+            tasks = db.query(MissionTask).filter(MissionTask.mission_id == mission_id).all()
+            for ev in _mission_replay_events(current, tasks):
+                yield f"event: {ev['event']}\ndata: {json.dumps(ev['data'])}\n\n"
             while True:
                 try:
                     ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                    if ev["event"] == "stream.overflow":
+                        break
                     yield f"event: {ev['event']}\ndata: {json.dumps(ev['data'])}\n\n"
-                    if ev["event"] in ("mission.status.changed",) and ev["data"].get("status") in (
-                        "succeeded", "partially_succeeded", "failed", "cancelled"):
-                        # Give the client a beat, then close only on terminal broadcast.
-                        # (Task-level events keep streaming until mission terminal.)
-                        pass
                     # Terminal close handled by client; keep alive otherwise.
                 except asyncio.TimeoutError:
                     yield "event: ping\ndata: {}\n\n"
@@ -547,3 +666,14 @@ async def mission_events(mission_id: str, db: Session = Depends(get_db)):
             event_hub.unsubscribe(mission_id, q)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+def _mission_replay_events(m: Mission, tasks: List[MissionTask]) -> List[Dict[str, Any]]:
+    """Snapshot events a fresh SSE client must receive BEFORE live broadcasts."""
+    past: List[Dict[str, Any]] = [
+        {"event": "mission.status.changed", "data": {"missionId": m.id, "status": m.status}}
+    ]
+    for t in tasks:
+        past.append({"event": "task.status.changed",
+                     "data": {"missionId": m.id, "taskKey": t.task_key, "status": t.status}})
+    return past

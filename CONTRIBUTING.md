@@ -19,6 +19,7 @@ npm install
 
 ```powershell
 # Terminal 1 — backend (from repo root)
+$env:AGENTOS_INSECURE_DEV = '1' # local browser development only
 backend\.venv\Scripts\python.exe -m backend.app.cli
 # or: uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 

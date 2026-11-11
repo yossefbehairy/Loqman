@@ -40,7 +40,7 @@ test.describe('R1: Minimalist Executive Chat & Manager Direct Consultation', () 
     await expect(page.getByRole('button', { name: 'Send message' })).toBeVisible();
   });
 
-  test('Persona list allows choosing General Manager, Dr. Sara, Eng. Tarek, Prof. Yasmin', async ({
+  test('Persona list allows choosing Loqman, Dr. Sara, Eng. Tarek, Prof. Yasmin', async ({
     page,
   }) => {
     await seedDepartments(page, ['planning', 'research', 'quality']);
@@ -48,7 +48,7 @@ test.describe('R1: Minimalist Executive Chat & Manager Direct Consultation', () 
     await expect(page.getByRole('heading', { name: 'OpenCode Chat' })).toBeVisible();
 
     // 1. All four personas exist in the conversation agent list
-    const gmPill = page.getByRole('button', { name: /Adel Mansour/ }).first();
+    const gmPill = page.getByRole('main').getByRole('button', { name: /Loqman/ }).first();
     const saraPill = page.getByRole('button', { name: /د\. سارة/ }).first();
     const tarekPill = page.getByRole('button', { name: /م\. طارق/ }).first();
     const yasminPill = page.getByRole('button', { name: /أ\. ياسمين/ }).first();
@@ -66,9 +66,9 @@ test.describe('R1: Minimalist Executive Chat & Manager Direct Consultation', () 
     await yasminPill.click();
     await expect(page.getByText('OpenCode · أ. ياسمين', { exact: true })).toBeVisible();
 
-    // 3. Return to the General Manager
+    // 3. Return to Loqman (the CEO)
     await gmPill.click();
-    await expect(page.getByText('OpenCode · Adel Mansour', { exact: true })).toBeVisible();
+    await expect(page.getByText('OpenCode · Loqman', { exact: true })).toBeVisible();
   });
 
   test('Sending a chat message to a manager receives a delegated task response', async ({ page }) => {
@@ -114,7 +114,7 @@ test.describe('R1: Minimalist Executive Chat & Manager Direct Consultation', () 
 
     // 2. Navigate through every view
     await page.getByRole('button', { name: 'CEO', exact: true }).click();
-    await expect(page.getByRole('heading', { name: /CEO Control Plane/ })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'هنعمل إيه النهارده؟' })).toBeVisible();
 
     await page.getByRole('button', { name: 'Conversations', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'OpenCode Chat' })).toBeVisible();

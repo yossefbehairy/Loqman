@@ -22,14 +22,14 @@ def test_get_agent_profile_by_id_and_alias(client):
     assert res1.status_code == 200
     p1 = res1.json()
     assert p1["id"] == "planner"
-    assert "د. سارة" in p1["name"]
+    assert "Sara" in p1["name"]
 
     # By alias
     res2 = client.get("/api/agent-profiles/dr_sara")
     assert res2.status_code == 200
     p2 = res2.json()
     assert p2["id"] == "planner"
-    assert "د. سارة" in p2["name"]
+    assert "Sara" in p2["name"]
 
     # 404 for non-existent profile
     res_404 = client.get("/api/agent-profiles/non_existent_profile_999")
@@ -123,11 +123,11 @@ def test_direct_consultation_dr_sara(client):
     assert res.status_code == 200
     data = res.json()
     assert data["manager_id"] == "dr_sara"
-    assert "سارة" in data["manager_name"]
+    assert "Sara" in data["manager_name"]
     assert "التخطيط" in data["title"]
     assert len(data["reply"]) > 20
     # Ordinary consultation must not create a mission suggestion.
-    assert "سارة" in data["reply"] or "التخطيط" in data["reply"]
+    assert "Sara" in data["reply"] or "التخطيط" in data["reply"]
     assert data["suggested_mission"] is None
 
 
@@ -143,10 +143,10 @@ def test_direct_consultation_eng_tarek(client):
     assert res.status_code == 200
     data = res.json()
     assert data["manager_id"] == "eng_tarek"
-    assert "طارق" in data["manager_name"]
-    assert "التحليل" in data["title"] or "المخاطر" in data["title"]
+    assert "Tarek" in data["manager_name"]
+    assert "التنفيذ" in data["title"] or "الهندسة" in data["title"]
     assert len(data["reply"]) > 20
-    assert "طارق" in data["reply"] or "المخاطر" in data["reply"]
+    assert "Tarek" in data["reply"] or "المخاطر" in data["reply"]
     assert data["suggested_mission"] is None
 
 
@@ -162,10 +162,10 @@ def test_direct_consultation_prof_yasmin(client):
     assert res.status_code == 200
     data = res.json()
     assert data["manager_id"] == "prof_yasmin"
-    assert "ياسمين" in data["manager_name"]
+    assert "Yasmin" in data["manager_name"]
     assert "الجودة" in data["title"] or "الاعتماد" in data["title"]
     assert len(data["reply"]) > 20
-    assert "ياسمين" in data["reply"] or "الجودة" in data["reply"]
+    assert "Yasmin" in data["reply"] or "الجودة" in data["reply"]
     assert data["suggested_mission"] is None
 
 
@@ -181,9 +181,9 @@ def test_direct_consultation_general_manager(client):
     assert res.status_code == 200
     data = res.json()
     assert data["manager_id"] == "general_manager"
-    assert "المدير العام" in data["manager_name"]
+    assert "Loqman" in data["manager_name"]
     assert len(data["reply"]) > 20
-    assert "المدير العام" in data["reply"] or "المنظومة" in data["reply"]
+    assert "Loqman" in data["reply"] or "المنظومة" in data["reply"]
     assert data["suggested_mission"] is None
 
 
@@ -211,7 +211,7 @@ def test_manager_consultation_path_endpoint(client):
     assert res.status_code == 200
     data = res.json()
     assert data["manager_id"] == "dr_sara"
-    assert "سارة" in data["manager_name"]
+    assert "Sara" in data["manager_name"]
     assert data["suggested_mission"] is None
 
     # Invalid manager on path
@@ -222,11 +222,11 @@ def test_manager_consultation_path_endpoint(client):
 def test_default_seeded_organization_hierarchy(db_session):
     """
     Verifies repository seeding includes natural names for managers and specialists:
-    - General Manager (المدير العام)
-    - Dr. Sara (د. سارة) - Planning & Strategy Manager (👑 Manager)
-    - Eng. Tarek (م. طارق) - Analysis & Risk Manager (👑 Manager)
-    - Prof. Yasmin (أ. ياسمين) - Quality & Review Manager (👑 Manager)
-    - Specialists: Ahmed (أحمد), Khaled (خالد), Layla (ليلى).
+    - Loqman, the CEO
+    - Dr. Sara - Planning & Strategy Manager (👑 Manager)
+    - Eng. Tarek - Execution & Engineering Manager (👑 Manager)
+    - Prof. Yasmin - Quality & Review Manager (👑 Manager)
+    - Specialists: Ahmed, Khaled, Layla.
     """
     repo = AgentProfileRepository(db_session)
     repo.seed_defaults()
@@ -236,43 +236,43 @@ def test_default_seeded_organization_hierarchy(db_session):
 
     # Verify Dr. Sara
     planner = profiles_by_id["planner"]
-    assert "د. سارة" in planner.name
+    assert "Sara" in planner.name
     planner_cfg = json.loads(planner.settings_json)
     assert planner_cfg["is_manager"] is True
     assert planner_cfg["department"] == "planning"
 
     # Verify Eng. Tarek
     analyst = profiles_by_id["analyst"]
-    assert "م. طارق" in analyst.name
+    assert "Tarek" in analyst.name
     analyst_cfg = json.loads(analyst.settings_json)
     assert analyst_cfg["is_manager"] is True
     assert analyst_cfg["department"] == "analysis"
 
     # Verify Prof. Yasmin
     reviewer = profiles_by_id["reviewer"]
-    assert "أ. ياسمين" in reviewer.name
+    assert "Yasmin" in reviewer.name
     reviewer_cfg = json.loads(reviewer.settings_json)
     assert reviewer_cfg["is_manager"] is True
     assert reviewer_cfg["department"] == "quality"
 
-    # Verify General Manager
+    # Verify the CEO (Loqman)
     gm = profiles_by_id["custom"]
-    assert "المدير العام" in gm.name
+    assert "Loqman" in gm.name
     gm_cfg = json.loads(gm.settings_json)
     assert gm_cfg["is_manager"] is True
     assert gm_cfg["department"] == "executive"
 
     # Verify Specialists: Ahmed, Khaled, Layla
     coder = profiles_by_id["coder"]
-    assert "أحمد" in coder.name
+    assert "Ahmed" in coder.name
     assert json.loads(coder.settings_json)["is_manager"] is False
 
     researcher = profiles_by_id["researcher"]
-    assert "خالد" in researcher.name
+    assert "Khaled" in researcher.name
     assert json.loads(researcher.settings_json)["is_manager"] is False
 
     extractor = profiles_by_id["data_extractor"]
-    assert "ليلى" in extractor.name
+    assert "Layla" in extractor.name
     assert json.loads(extractor.settings_json)["is_manager"] is False
 
 

@@ -26,7 +26,7 @@ def test_ask_about_team_returns_profiles(client):
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["iterations"] == 2
-    assert "planner" in data["reply"] or "سارة" in data["reply"]
+    assert "planner" in data["reply"] or "Sara" in data["reply"]
 
 
 def test_ask_direct_final_first_iteration(client):
@@ -36,17 +36,55 @@ def test_ask_direct_final_first_iteration(client):
     assert len(r.json()["reply"]) > 0
 
 
+def test_smalltalk_takes_fast_single_call_path(client):
+    """Small talk bypasses the tool loop entirely: 1 call, plain text, no actions."""
+    r = client.post("/api/ceo/ask", json={"question": "أهلاً يا مدير، عامله ايه؟"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fast"] is True
+    assert data["iterations"] == 1
+    assert data["actions_proposed"] == []
+    assert "أهلاً بيك" in data["reply"]  # the deterministic mock fast reply (plain text)
+
+
+def test_fast_reply_is_plain_text_not_json(client):
+    r = client.post("/api/ceo/ask", json={"question": "شكراً ليك"})
+    assert r.status_code == 200, r.text
+    reply = r.json()["reply"]
+    assert not reply.lstrip().startswith("{")
+
+
+def test_data_question_never_takes_fast_path(client):
+    r = client.post("/api/ceo/ask", json={"question": "شكرا، وبالمناسبة ما هي آخر المهام؟"})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["fast"] is False
+
+
+def test_fast_path_records_usage_kind(client, db_session):
+    from backend.app.db.models import UsageEvent
+    from backend.app.runtime.ledger import KIND_CEO_ASK_FAST
+
+    before = db_session.query(UsageEvent).count()
+    r = client.post("/api/ceo/ask", json={"question": "مساء الخير"})
+    assert r.status_code == 200, r.text
+    rows = db_session.query(UsageEvent).all()
+    assert len(rows) == before + 1
+    assert rows[-1].kind == KIND_CEO_ASK_FAST
+
+
 def test_ask_empty_question_400(client):
     r = client.post("/api/ceo/ask", json={"question": "   "})
     assert r.status_code == 400
 
 
-def test_stubborn_loop_caps_at_six_iterations(client):
+def test_stubborn_loop_caps_at_three_iterations(client):
     r = client.post("/api/ceo/ask", json={"question": "stubborn_loop probe please"})
     assert r.status_code == 200, r.text
     data = r.json()
-    assert data["iterations"] == 6
+    assert data["iterations"] == 3
     assert len(data["reply"]) > 0
+    assert data["fast"] is False
 
 
 def test_self_correction_on_unknown_tool(client):

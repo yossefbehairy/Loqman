@@ -137,7 +137,7 @@ test.describe('R5: Inter-Agent Team Chat & Handover Stream', () => {
     // Turn 1 — manager → employee, carrying the real delegation instruction text
     const turn1 = turnCard(1);
     await expect(turn1).toHaveCount(1);
-    await expect(turn1).toContainText('Adel Mansour');
+    await expect(turn1).toContainText('Loqman');
     await expect(turn1).toContainText(assignee!);
     await expect(turn1).toContainText('سجل التسليم الحقيقي في تيار الفريق');
 
@@ -156,7 +156,7 @@ test.describe('R5: Inter-Agent Team Chat & Handover Stream', () => {
     // Turn 3 — manager → employee: the mission's recorded synthesis
     const turn3 = turnCard(3);
     await expect(turn3).toHaveCount(1);
-    await expect(turn3).toContainText('Adel Mansour');
+    await expect(turn3).toContainText('Loqman');
     await expect(turn3).toContainText('key_objective');
   });
 });

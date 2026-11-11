@@ -9,6 +9,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
+from sqlalchemy import insert, select, update
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import WorkflowExecution, NodeExecution, ExecutionEvent
@@ -28,6 +29,7 @@ from backend.app.engine.events import (
     persist_and_broadcast_team_message,
 )
 from backend.app.runtime.base import AgentRuntime, ExecuteAgentTask
+from backend.app.runtime.ledger import run_agent_task, KIND_WORKFLOW_NODE
 
 logger = logging.getLogger("agentos.executor")
 
@@ -56,6 +58,144 @@ def clear_cancellation_flag(execution_id: str):
     _cancellation_registry.pop(execution_id, None)
 
 
+# ---------------------------------------------------------------------------
+# Atomic, conditional state writes.
+#
+# The database is the single source of truth for cancellation. Every status
+# change below is ONE guarded UPDATE (compare-and-set), so a committed cancel
+# can never be overwritten by a later success/failure, and a cancel can never
+# overwrite an execution that already reached a terminal state. The in-memory
+# flag is only a fast-path hint for the running task.
+# ---------------------------------------------------------------------------
+_EXEC_ACTIVE = (WorkflowState.PENDING.value, WorkflowState.RUNNING.value)
+_NODE_ACTIVE = (NodeState.PENDING.value, NodeState.READY.value, NodeState.RUNNING.value)
+
+
+def _transition_execution(db: Session, execution_id: str, from_states, **values) -> bool:
+    """Atomically set `values` iff the execution is currently in `from_states`."""
+    try:
+        res = db.execute(
+            update(WorkflowExecution)
+            .where(WorkflowExecution.id == execution_id, WorkflowExecution.status.in_(tuple(from_states)))
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.expire_all()
+    return res.rowcount == 1
+
+
+def _transition_node(db: Session, node_rec_id: str, from_states, **values) -> bool:
+    """Atomically set `values` on a node iff it is in `from_states` AND its
+    owning execution is still active (pending/running, i.e. not cancelled)."""
+    try:
+        res = db.execute(
+            update(NodeExecution)
+            .where(
+                NodeExecution.id == node_rec_id,
+                NodeExecution.status.in_(tuple(from_states)),
+                NodeExecution.execution_id.in_(
+                    select(WorkflowExecution.id).where(WorkflowExecution.status.in_(_EXEC_ACTIVE))
+                ),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.expire_all()
+    return res.rowcount == 1
+
+
+def _cancel_open_nodes(db: Session, execution_id: str, message: str, *, only_if_cancelled: bool = False) -> None:
+    stmt = update(NodeExecution).where(
+        NodeExecution.execution_id == execution_id,
+        NodeExecution.status.in_(_NODE_ACTIVE),
+    )
+    if only_if_cancelled:
+        stmt = stmt.where(
+            NodeExecution.execution_id.in_(
+                select(WorkflowExecution.id).where(WorkflowExecution.status == WorkflowState.CANCELLED.value)
+            )
+        )
+    db.execute(
+        stmt.values(
+            status=NodeState.CANCELLED.value,
+            finished_at=datetime.now(timezone.utc),
+            error_message=message,
+        ).execution_options(synchronize_session=False)
+    )
+
+
+def cancel_execution_rows(
+    db: Session,
+    execution_id: str,
+    *,
+    summary: str = "Execution cancelled by user request",
+    node_message: str = "Cancelled by user request",
+    event_json: Optional[str] = None,
+) -> bool:
+    """Atomically cancel a non-terminal execution and its unfinished nodes.
+
+    The execution CAS, node cancellation and (optional) audit event commit in
+    ONE transaction. Returns True iff this call moved the execution to
+    cancelled; False when it is unknown or already terminal (nothing written).
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        res = db.execute(
+            update(WorkflowExecution)
+            .where(WorkflowExecution.id == execution_id, WorkflowExecution.status.in_(_EXEC_ACTIVE))
+            .values(status=WorkflowState.CANCELLED.value, finished_at=now, error_summary=summary)
+            .execution_options(synchronize_session=False)
+        )
+        won = res.rowcount == 1
+        if won:
+            _cancel_open_nodes(db, execution_id, node_message)
+            if event_json is not None:
+                db.execute(insert(ExecutionEvent).values(
+                    execution_id=execution_id, event_type="execution.cancelled", event_json=event_json
+                ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.expire_all()
+    return won
+
+
+def _current_status(db: Session, execution_id: str) -> Optional[str]:
+    db.expire_all()
+    return db.execute(
+        select(WorkflowExecution.status).where(WorkflowExecution.id == execution_id)
+    ).scalar_one_or_none()
+
+
+def _cancel_requested(db: Session, execution_id: str) -> bool:
+    return is_execution_cancelled(execution_id) or _current_status(db, execution_id) == WorkflowState.CANCELLED.value
+
+
+def _lost_result(db: Session, execution_id: str) -> Dict[str, Any]:
+    """A guarded write lost the race: report the execution's real status and
+    make sure no node of a cancelled execution is left non-terminal."""
+    status_now = _current_status(db, execution_id)
+    if status_now == WorkflowState.CANCELLED.value:
+        try:
+            _cancel_open_nodes(db, execution_id, "Cancelled by user request", only_if_cancelled=True)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        db.expire_all()
+        return {"status": "cancelled"}
+    return {"status": status_now or "unknown"}
+
+
 async def execute_workflow(
     execution_id: str,
     db: Session,
@@ -75,17 +215,21 @@ async def execute_workflow(
     validation = validate_workflow_graph(workflow_definition)
     if not validation.valid:
         error_msg = f"Graph validation failed: {'; '.join(validation.errors)}"
-        wf_exec.status = WorkflowState.FAILED.value
-        wf_exec.error_summary = error_msg
-        wf_exec.finished_at = datetime.now(timezone.utc)
-        db.commit()
+        if not _transition_execution(
+            db, execution_id, _EXEC_ACTIVE,
+            status=WorkflowState.FAILED.value, error_summary=error_msg, finished_at=datetime.now(timezone.utc),
+        ):
+            return _lost_result(db, execution_id)
         await event_hub.broadcast(execution_id, "execution.failed", {"error": error_msg})
         return {"status": "failed", "error": error_msg}
 
-    # 2. Mark Workflow as RUNNING
-    wf_exec.status = WorkflowState.RUNNING.value
-    wf_exec.started_at = datetime.now(timezone.utc)
-    db.commit()
+    # 2. Mark Workflow as RUNNING (never resurrects a cancelled/terminal execution)
+    if not _transition_execution(
+        db, execution_id, _EXEC_ACTIVE,
+        status=WorkflowState.RUNNING.value, started_at=datetime.now(timezone.utc),
+    ):
+        clear_cancellation_flag(execution_id)
+        return _lost_result(db, execution_id)
     await event_hub.broadcast(execution_id, "execution.status.changed", {"status": "running"})
 
     nodes: List[Dict[str, Any]] = workflow_definition.get("nodes", [])
@@ -177,15 +321,21 @@ async def execute_workflow(
     try:
         for nid in topological_order:
             # Check cancellation before node execution
-            if is_execution_cancelled(execution_id):
+            if _cancel_requested(db, execution_id):
                 logger.info(f"Execution {execution_id} was cancelled before node {nid}")
-                _mark_remaining_nodes_cancelled(topological_order, node_states, node_db_records, db, execution_id)
-                wf_exec.status = WorkflowState.CANCELLED.value
-                wf_exec.finished_at = datetime.now(timezone.utc)
-                wf_exec.error_summary = "Execution cancelled by user"
-                db.commit()
-                await event_hub.broadcast(execution_id, "execution.cancelled", {"reason": "User cancelled"})
-                return {"status": "cancelled"}
+                for k, v in list(node_states.items()):
+                    if v in _NODE_ACTIVE:
+                        node_states[k] = NodeState.CANCELLED.value
+                # No-op CAS when the cancel route already committed; otherwise
+                # (flag-only cancel) this call performs the cancellation.
+                won = cancel_execution_rows(
+                    db, execution_id,
+                    summary="Execution cancelled by user", node_message="Cancelled by user",
+                )
+                res = _lost_result(db, execution_id)
+                if won:
+                    await event_hub.broadcast(execution_id, "execution.cancelled", {"reason": "User cancelled"})
+                return res
 
             n_def = node_map[nid]
             n_type = normalize_node_type(n_def.get("type"))
@@ -196,26 +346,30 @@ async def execute_workflow(
             # Check upstream status
             any_upstream_failed = any(node_states.get(u) in (NodeState.FAILED.value, NodeState.SKIPPED.value, NodeState.CANCELLED.value) for u in upstreams)
             if any_upstream_failed:
+                if not _transition_node(
+                    db, n_rec.id, (NodeState.PENDING.value,),
+                    status=NodeState.SKIPPED.value, finished_at=datetime.now(timezone.utc),
+                ):
+                    return _lost_result(db, execution_id)
                 node_states[nid] = NodeState.SKIPPED.value
-                n_rec.status = NodeState.SKIPPED.value
-                n_rec.finished_at = datetime.now(timezone.utc)
-                db.commit()
                 await event_hub.broadcast(execution_id, "node.status.changed", {
                     "nodeId": nid, "status": "skipped", "reason": "Upstream node failed or skipped"
                 })
                 continue
 
             # Transition to READY
+            if not _transition_node(db, n_rec.id, (NodeState.PENDING.value,), status=NodeState.READY.value):
+                return _lost_result(db, execution_id)
             node_states[nid] = NodeState.READY.value
-            n_rec.status = NodeState.READY.value
-            db.commit()
             await event_hub.broadcast(execution_id, "node.status.changed", {"nodeId": nid, "status": "ready"})
 
             # Transition to RUNNING
+            if not _transition_node(
+                db, n_rec.id, (NodeState.READY.value,),
+                status=NodeState.RUNNING.value, started_at=datetime.now(timezone.utc),
+            ):
+                return _lost_result(db, execution_id)
             node_states[nid] = NodeState.RUNNING.value
-            n_rec.status = NodeState.RUNNING.value
-            n_rec.started_at = datetime.now(timezone.utc)
-            db.commit()
             await event_hub.broadcast(execution_id, "node.status.changed", {"nodeId": nid, "status": "running"})
 
             node_t0 = time.time()
@@ -223,13 +377,16 @@ async def execute_workflow(
             # --- CASE 1: START NODE ---
             if n_type == "start":
                 start_output = initial_input if initial_input is not None else {"input": "Start workflow"}
+                if not _transition_node(
+                    db, n_rec.id, (NodeState.RUNNING.value,),
+                    status=NodeState.SUCCEEDED.value,
+                    output_json=json.dumps(start_output, ensure_ascii=False) if not isinstance(start_output, str) else start_output,
+                    finished_at=datetime.now(timezone.utc),
+                    duration_ms=int((time.time() - node_t0) * 1000),
+                ):
+                    return _lost_result(db, execution_id)
                 node_outputs[nid] = start_output
-                n_rec.output_json = json.dumps(start_output, ensure_ascii=False) if not isinstance(start_output, str) else start_output
-                n_rec.status = NodeState.SUCCEEDED.value
-                n_rec.finished_at = datetime.now(timezone.utc)
-                n_rec.duration_ms = int((time.time() - node_t0) * 1000)
                 node_states[nid] = NodeState.SUCCEEDED.value
-                db.commit()
 
                 await event_hub.broadcast(execution_id, "node.status.changed", {
                     "nodeId": nid, "status": "succeeded", "output": start_output
@@ -248,13 +405,16 @@ async def execute_workflow(
                     workflow_input=initial_input
                 )
                 final_output = output_context["upstream_context"]
+                if not _transition_node(
+                    db, n_rec.id, (NodeState.RUNNING.value,),
+                    status=NodeState.SUCCEEDED.value,
+                    output_json=json.dumps(final_output, ensure_ascii=False),
+                    finished_at=datetime.now(timezone.utc),
+                    duration_ms=int((time.time() - node_t0) * 1000),
+                ):
+                    return _lost_result(db, execution_id)
                 node_outputs[nid] = final_output
-                n_rec.output_json = json.dumps(final_output, ensure_ascii=False)
-                n_rec.status = NodeState.SUCCEEDED.value
-                n_rec.finished_at = datetime.now(timezone.utc)
-                n_rec.duration_ms = int((time.time() - node_t0) * 1000)
                 node_states[nid] = NodeState.SUCCEEDED.value
-                db.commit()
 
                 await event_hub.broadcast(execution_id, "node.status.changed", {
                     "nodeId": nid, "status": "succeeded", "output": final_output
@@ -277,13 +437,16 @@ async def execute_workflow(
                 if not target_free_model:
                     err_msg = f"Zero-cost revalidation failed: Model '{model_id}' is no longer confirmed free (0/0) or active."
                     logger.error(err_msg)
-                    n_rec.status = NodeState.FAILED.value
-                    n_rec.error_message = err_msg
-                    n_rec.finished_at = datetime.now(timezone.utc)
+                    if not _transition_node(
+                        db, n_rec.id, (NodeState.RUNNING.value,),
+                        status=NodeState.FAILED.value, error_message=err_msg,
+                        finished_at=datetime.now(timezone.utc),
+                    ):
+                        return _lost_result(db, execution_id)
                     node_states[nid] = NodeState.FAILED.value
-                    db.commit()
                     await event_hub.broadcast(execution_id, "node.status.changed", {"nodeId": nid, "status": "failed", "error": err_msg})
-                    _fail_workflow(wf_exec, err_msg, db, execution_id)
+                    if not _fail_workflow(db, execution_id, err_msg):
+                        return _lost_result(db, execution_id)
                     return {"status": "failed", "error": err_msg}
 
                 # Multi-source context aggregation + team transcript
@@ -300,23 +463,25 @@ async def execute_workflow(
                     node_display_names=node_display_names,
                 )
 
-                # Self-correcting retry loop (max 3 attempts)
+                # max_retries counts additional attempts after the first call.
+                configured_retries = n_data.get("max_retries")
+                max_retries = int(configured_retries) if configured_retries is not None else MAX_ATTEMPTS_PER_NODE - 1
                 node_succeeded = False
                 last_error = ""
                 retry_feedback = None
 
-                for attempt in range(1, MAX_ATTEMPTS_PER_NODE + 1):
+                for attempt in range(1, max_retries + 2):
                     # Check safety cap on total AI calls
                     if total_ai_calls >= MAX_AI_CALLS_PER_EXECUTION:
                         last_error = f"Safety cap exceeded: maximum allowed AI calls per workflow ({MAX_AI_CALLS_PER_EXECUTION}) reached."
                         break
 
-                    if is_execution_cancelled(execution_id):
+                    if _cancel_requested(db, execution_id):
                         break
 
                     total_ai_calls += 1
-                    n_rec.attempt_count = attempt
-                    db.commit()
+                    if not _transition_node(db, n_rec.id, (NodeState.RUNNING.value,), attempt_count=attempt):
+                        return _lost_result(db, execution_id)
 
                     prompt = format_agent_prompt(
                         base_instructions=instructions,
@@ -330,6 +495,9 @@ async def execute_workflow(
                     await event_hub.broadcast(execution_id, "node.attempt", {
                         "nodeId": nid, "attempt": attempt, "taskDepth": task_depth
                     })
+                    if _cancel_requested(db, execution_id):
+                        cancel_execution_rows(db, execution_id)
+                        return _lost_result(db, execution_id)
 
                     try:
                         task = ExecuteAgentTask(
@@ -337,10 +505,10 @@ async def execute_workflow(
                             model_id=model_id,
                             variant=variant,
                             task_depth=task_depth,
-                            session_title=f"agentos-{execution_id[:8]}-{nid}",
+                            session_title=f"workflow-{execution_id}-{nid}",
                             timeout=timeout
                         )
-                        agent_res = await runtime.execute_task(task)
+                        agent_res = await run_agent_task(runtime, task, kind=KIND_WORKFLOW_NODE)
 
                         # Output Sanitizer: strip Markdown fences
                         clean_text = sanitize_model_output(agent_res.text)
@@ -349,27 +517,38 @@ async def execute_workflow(
                         parsed_json = json.loads(clean_text)
 
                         # Success! Record output
+                        duration_ms = int((time.time() - node_t0) * 1000)
+                        # Guarded write: a late runtime result is ignored if the
+                        # execution was cancelled (or the node is no longer running).
+                        if not _transition_node(
+                            db, n_rec.id, (NodeState.RUNNING.value,),
+                            status=NodeState.SUCCEEDED.value,
+                            output_json=json.dumps(parsed_json, ensure_ascii=False),
+                            finished_at=datetime.now(timezone.utc),
+                            duration_ms=duration_ms,
+                        ):
+                            logger.info(f"Ignoring late result for node {nid}: execution {execution_id} no longer active")
+                            return _lost_result(db, execution_id)
                         node_outputs[nid] = parsed_json
-                        n_rec.output_json = json.dumps(parsed_json, ensure_ascii=False)
-                        n_rec.status = NodeState.SUCCEEDED.value
-                        n_rec.finished_at = datetime.now(timezone.utc)
-                        n_rec.duration_ms = int((time.time() - node_t0) * 1000)
                         node_states[nid] = NodeState.SUCCEEDED.value
                         node_succeeded = True
-                        db.commit()
 
                         await event_hub.broadcast(execution_id, "node.status.changed", {
                             "nodeId": nid,
                             "status": "succeeded",
                             "attempt": attempt,
                             "output": parsed_json,
-                            "duration_ms": n_rec.duration_ms
+                            "duration_ms": duration_ms
                         })
                         await _emit_team_message(nid, parsed_json, n_rec.id)
                         break
 
                     except Exception as e:
-                        last_error = str(e)
+                        from backend.app.runtime.errors import safe_error_message
+                        last_error = safe_error_message(e)
+                        if _cancel_requested(db, execution_id):
+                            # Late failure after cancel: ignore it, record nothing.
+                            break
                         logger.warning(f"Attempt {attempt} failed on node {nid}: {last_error}")
                         # Format feedback for next attempt
                         retry_feedback = (
@@ -384,27 +563,48 @@ async def execute_workflow(
                         )
 
                 if not node_succeeded:
-                    n_rec.status = NodeState.FAILED.value
-                    n_rec.error_message = f"Node failed after {n_rec.attempt_count} attempts. Last error: {last_error}"
-                    n_rec.finished_at = datetime.now(timezone.utc)
-                    n_rec.duration_ms = int((time.time() - node_t0) * 1000)
+                    if _cancel_requested(db, execution_id):
+                        # Cancellation (not a node failure) ended this node.
+                        won = cancel_execution_rows(
+                            db, execution_id,
+                            summary="Execution cancelled by user", node_message="Cancelled by user",
+                        )
+                        res = _lost_result(db, execution_id)
+                        if won:
+                            await event_hub.broadcast(execution_id, "execution.cancelled", {"reason": "User cancelled"})
+                        return res
+
+                    attempts = db.execute(
+                        select(NodeExecution.attempt_count).where(NodeExecution.id == n_rec.id)
+                    ).scalar_one_or_none() or 0
+                    node_error = f"Node failed after {attempts} attempts. Last error: {last_error}"
+                    if not _transition_node(
+                        db, n_rec.id, (NodeState.RUNNING.value,),
+                        status=NodeState.FAILED.value, error_message=node_error,
+                        finished_at=datetime.now(timezone.utc),
+                        duration_ms=int((time.time() - node_t0) * 1000),
+                    ):
+                        return _lost_result(db, execution_id)
                     node_states[nid] = NodeState.FAILED.value
-                    db.commit()
 
                     await event_hub.broadcast(execution_id, "node.status.changed", {
-                        "nodeId": nid, "status": "failed", "error": n_rec.error_message
+                        "nodeId": nid, "status": "failed", "error": node_error
                     })
 
-                    # Fail workflow
-                    _fail_workflow(wf_exec, f"Workflow stopped: Node '{nid}' failed.", db, execution_id)
-                    return {"status": "failed", "failed_node": nid, "error": n_rec.error_message}
+                    # Fail workflow (conditional: a committed cancel wins)
+                    if not _fail_workflow(db, execution_id, f"Workflow stopped: Node '{nid}' failed."):
+                        return _lost_result(db, execution_id)
+                    return {"status": "failed", "failed_node": nid, "error": node_error}
 
-        # 3. All nodes completed: Succeeded
+        # 3. All nodes completed: Succeeded (conditional: cannot overwrite a cancel)
         final_output = node_outputs.get(topological_order[-1], {})
-        wf_exec.status = WorkflowState.SUCCEEDED.value
-        wf_exec.final_output_json = json.dumps(final_output, ensure_ascii=False) if not isinstance(final_output, str) else final_output
-        wf_exec.finished_at = datetime.now(timezone.utc)
-        db.commit()
+        if not _transition_execution(
+            db, execution_id, (WorkflowState.RUNNING.value,),
+            status=WorkflowState.SUCCEEDED.value,
+            final_output_json=json.dumps(final_output, ensure_ascii=False) if not isinstance(final_output, str) else final_output,
+            finished_at=datetime.now(timezone.utc),
+        ):
+            return _lost_result(db, execution_id)
 
         await event_hub.broadcast(execution_id, "execution.finished", {
             "status": "succeeded",
@@ -416,21 +616,9 @@ async def execute_workflow(
         clear_cancellation_flag(execution_id)
 
 
-def _mark_remaining_nodes_cancelled(order: List[str], states: Dict[str, str], records: Dict[str, NodeExecution], db: Session, exec_id: str):
-    now = datetime.now(timezone.utc)
-    for nid in order:
-        if states.get(nid) in (NodeState.PENDING.value, NodeState.READY.value, NodeState.RUNNING.value):
-            states[nid] = NodeState.CANCELLED.value
-            rec = records.get(nid)
-            if rec:
-                rec.status = NodeState.CANCELLED.value
-                rec.finished_at = now
-                rec.error_message = "Cancelled by user"
-    db.commit()
-
-
-def _fail_workflow(wf_exec: WorkflowExecution, error: str, db: Session, exec_id: str):
-    wf_exec.status = WorkflowState.FAILED.value
-    wf_exec.error_summary = error
-    wf_exec.finished_at = datetime.now(timezone.utc)
-    db.commit()
+def _fail_workflow(db: Session, execution_id: str, error: str) -> bool:
+    """Conditionally fail a still-active execution. False if it lost the race."""
+    return _transition_execution(
+        db, execution_id, _EXEC_ACTIVE,
+        status=WorkflowState.FAILED.value, error_summary=error, finished_at=datetime.now(timezone.utc),
+    )

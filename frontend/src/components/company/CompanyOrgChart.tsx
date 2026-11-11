@@ -127,6 +127,16 @@ export const CompanyOrgChart: React.FC<Props> = ({
                   </button>
                 </div>
 
+                {/* Team contract (written charter) */}
+                {t.desc ? (
+                  <p
+                    className="text-[10px] leading-relaxed text-[var(--muted)] mb-3 line-clamp-2"
+                    title={t.desc}
+                  >
+                    {t.desc}
+                  </p>
+                ) : null}
+
                 {/* Manager Card */}
                 {manager ? (
                   <button

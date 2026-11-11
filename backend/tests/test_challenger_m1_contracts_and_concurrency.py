@@ -90,7 +90,7 @@ def disk_sqlite_db():
 
 
 @pytest.fixture(scope="function")
-def disk_client(disk_sqlite_db):
+def disk_client(disk_sqlite_db, isolate_app_lifespan):
     """
     FastAPI TestClient wired to the disk-backed SQLite DB with MockRuntime.
     """
@@ -107,8 +107,11 @@ def disk_client(disk_sqlite_db):
     set_runtime(mock_rt)
 
     from backend.app.api.routes.workflows import get_session_factory
+    from backend.app.api.routes.missions import get_mission_session_factory
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_session_factory] = lambda: session_factory
+    app.dependency_overrides[get_mission_session_factory] = lambda: session_factory
+    isolate_app_lifespan(session_factory)
 
     with TestClient(app) as test_client:
         yield test_client
@@ -267,7 +270,9 @@ def test_rapid_contention_same_profile_updates(disk_sqlite_db):
 # SECTION 2: Persistence Across Database Sessions & Disconnection
 # ==============================================================================
 
-def test_profile_contract_persistence_across_sessions_and_reconnection(disk_sqlite_db, disk_client):
+def test_profile_contract_persistence_across_sessions_and_reconnection(
+    disk_sqlite_db, disk_client, isolate_app_lifespan
+):
     """
     Verifies that PUT /api/agent-profiles/{id} updates persist across complete engine
     disconnection and fresh reconnection (simulating process restart).
@@ -326,6 +331,7 @@ def test_profile_contract_persistence_across_sessions_and_reconnection(disk_sqli
         connect_args={"check_same_thread": False}
     )
     FreshSessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=fresh_engine)
+    isolate_app_lifespan(FreshSessionFactory)
 
     def fresh_get_db():
         session = FreshSessionFactory()
@@ -335,36 +341,41 @@ def test_profile_contract_persistence_across_sessions_and_reconnection(disk_sqli
             session.close()
 
     app.dependency_overrides[get_db] = fresh_get_db
+    from backend.app.api.routes.workflows import get_session_factory
+    from backend.app.api.routes.missions import get_mission_session_factory
+    app.dependency_overrides[get_session_factory] = lambda: FreshSessionFactory
+    app.dependency_overrides[get_mission_session_factory] = lambda: FreshSessionFactory
 
-    with TestClient(app) as fresh_client:
-        # Re-query GET /api/agent-profiles/{id} using alias
-        get_res_alias = fresh_client.get("/api/agent-profiles/dr_sara")
-        assert get_res_alias.status_code == 200
-        persisted_alias = get_res_alias.json()
+    try:
+        with TestClient(app) as fresh_client:
+            # Re-query GET /api/agent-profiles/{id} using alias
+            get_res_alias = fresh_client.get("/api/agent-profiles/dr_sara")
+            assert get_res_alias.status_code == 200
+            persisted_alias = get_res_alias.json()
 
-        # Re-query GET /api/agent-profiles/{id} using primary ID
-        get_res_pk = fresh_client.get("/api/agent-profiles/planner")
-        assert get_res_pk.status_code == 200
-        persisted_pk = get_res_pk.json()
+            # Re-query GET /api/agent-profiles/{id} using primary ID
+            get_res_pk = fresh_client.get("/api/agent-profiles/planner")
+            assert get_res_pk.status_code == 200
+            persisted_pk = get_res_pk.json()
 
-        assert persisted_alias["id"] == persisted_pk["id"] == "planner"
-        assert persisted_alias["name"] == update_payload["name"]
-        assert persisted_alias["instructions"] == update_payload["instructions"]
-        assert persisted_alias["default_model_id"] == "deepseek-v4.1-flash-free"
-        assert persisted_alias["default_variant_id"] == "max"
-        assert persisted_alias["task_depth"] == "Deep"
+            assert persisted_alias["id"] == persisted_pk["id"] == "planner"
+            assert persisted_alias["name"] == update_payload["name"]
+            assert persisted_alias["instructions"] == update_payload["instructions"]
+            assert persisted_alias["default_model_id"] == "deepseek-v4.1-flash-free"
+            assert persisted_alias["default_variant_id"] == "max"
+            assert persisted_alias["task_depth"] == "Deep"
 
-        # Verify parsed settings_json integrity
-        parsed_settings = json.loads(persisted_alias["settings_json"])
-        assert parsed_settings["timeout"] == 240
-        assert parsed_settings["max_retries"] == 3
-        assert parsed_settings["strict_json"] is True
-        assert parsed_settings["arabic_name"] == "د. سارة الاستشارية"
-        assert parsed_settings["title"] == "مدير التخطيط الاستراتيجي والهيكلة"
-        assert len(parsed_settings["custom_rules"]) == 2
-        assert parsed_settings["nested_metadata"]["department_code"] == "PLN-01"
-
-    fresh_engine.dispose()
+            # Verify parsed settings_json integrity
+            parsed_settings = json.loads(persisted_alias["settings_json"])
+            assert parsed_settings["timeout"] == 240
+            assert parsed_settings["max_retries"] == 3
+            assert parsed_settings["strict_json"] is True
+            assert parsed_settings["arabic_name"] == "د. سارة الاستشارية"
+            assert parsed_settings["title"] == "مدير التخطيط الاستراتيجي والهيكلة"
+            assert len(parsed_settings["custom_rules"]) == 2
+            assert parsed_settings["nested_metadata"]["department_code"] == "PLN-01"
+    finally:
+        fresh_engine.dispose()
 
 
 def test_persistence_for_all_department_managers(disk_client):
@@ -678,7 +689,7 @@ def test_manager_consultation_uses_updated_zero_cost_model(disk_client):
     assert chat_res.status_code == 200
     chat_data = chat_res.json()
     assert chat_data["manager_id"] == "general_manager"
-    assert "المدير العام" in chat_data["manager_name"]
+    assert "Loqman" in chat_data["manager_name"]
     assert len(chat_data["reply"]) > 20
     # Contract: consultations never auto-suggest missions (see chat.py + docs/ceo-control-plan.md).
     assert chat_data["suggested_mission"] is None

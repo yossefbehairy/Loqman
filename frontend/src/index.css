@@ -3,52 +3,52 @@
 @tailwind utilities;
 
 :root {
-  /* AgentOS icon theme: charcoal (#121214 → #27272A) + white core + zinc arcs */
-  --bg: #121214;
-  --bg-gradient-from: #27272a;
-  --card: rgba(39, 39, 42, 0.82);
-  --card2: #1d1d20;
-  --card-hover: rgba(63, 63, 70, 0.55);
-  --line: rgba(255, 255, 255, 0.08);
-  --line2: rgba(255, 255, 255, 0.14);
-  --line-strong: rgba(255, 255, 255, 0.24);
-  --text: #fafafa;
-  --muted: #a1a1aa;
-  --dim: #71717a;
-  --acc: #fafafa;
-  --acc-hover: #e4e4e7;
-  --acc2: #a1a1aa;
-  --amber: #f5b841;
-  --green: #34d399;
-  --red: #f87171;
-  --glow: rgba(255, 255, 255, 0.14);
-  --shadow-card: 0 8px 32px 0 rgba(0, 0, 0, 0.55);
+  /* AgentOS workspace theme: warm charcoal (#252525) + terracotta accent (#d17b59) */
+  --bg: #252525;
+  --bg-gradient-from: #31302d;
+  --card: rgba(48, 48, 48, 0.86);
+  --card2: #2f2f2f;
+  --card-hover: rgba(66, 64, 61, 0.62);
+  --line: #3a3a3a;
+  --line2: #484848;
+  --line-strong: #5c5c5c;
+  --text: #ece9e4;
+  --muted: #b0aca4;
+  --dim: #8a867e;
+  --acc: #d17b59;
+  --acc-hover: #b96749;
+  --acc2: #c9a08a;
+  --amber: #e0a05c;
+  --green: #8fae8f;
+  --red: #e0857c;
+  --glow: rgba(209, 123, 89, 0.18);
+  --shadow-card: 0 16px 42px rgba(0, 0, 0, 0.32), 0 2px 7px rgba(0, 0, 0, 0.2);
   box-sizing: border-box;
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 [data-theme="light"] {
-  /* Light counterpart of the icon theme: paper white + charcoal ink */
-  --bg: #f4f4f5;
-  --bg-gradient-from: #e4e4e7;
-  --card: #ffffff;
-  --card2: #ececee;
-  --card-hover: #e4e4e7;
-  --line: rgba(24, 24, 27, 0.1);
-  --line2: rgba(24, 24, 27, 0.18);
-  --line-strong: rgba(24, 24, 27, 0.3);
-  --text: #18181b;
-  --muted: #52525b;
-  --dim: #a1a1aa;
-  --acc: #18181b;
-  --acc-hover: #27272a;
-  --acc2: #71717a;
-  --amber: #d97706;
-  --green: #059669;
-  --red: #e11d48;
-  --glow: rgba(24, 24, 27, 0.12);
-  --shadow-card: 0 4px 20px -2px rgba(24, 24, 27, 0.12);
+  /* Light counterpart: warm paper white + terracotta ink */
+  --bg: #f8f7f4;
+  --bg-gradient-from: #fdf4ec;
+  --card: #fffefa;
+  --card2: #f2f1ed;
+  --card-hover: #e9e6df;
+  --line: #e8e6df;
+  --line2: #dedbd2;
+  --line-strong: #c9c5ba;
+  --text: #292824;
+  --muted: #6f6e66;
+  --dim: #9b9991;
+  --acc: #bd6c4b;
+  --acc-hover: #a95738;
+  --acc2: #8a6f5f;
+  --amber: #b7791f;
+  --green: #5f7d66;
+  --red: #c25a4a;
+  --glow: rgba(189, 108, 75, 0.16);
+  --shadow-card: 0 12px 32px rgba(37, 34, 28, 0.08), 0 2px 8px rgba(37, 34, 28, 0.04);
 }
 
 * {
@@ -79,7 +79,7 @@ body {
 
 /* Custom Selection */
 ::selection {
-  background: rgba(255, 255, 255, 0.22);
+  background: rgba(209, 123, 89, 0.32);
   color: var(--text);
 }
 
@@ -114,7 +114,7 @@ input, select, textarea {
 
 input:focus, select:focus, textarea:focus {
   border-color: var(--acc);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.16);
+  box-shadow: 0 0 0 2px var(--glow);
 }
 
 :focus-visible {
@@ -155,7 +155,7 @@ button {
   padding: 8px 14px;
   border-radius: 10px;
   background: var(--acc);
-  color: #18181b;
+  color: #fff8f3;
   font-weight: 600;
   font-size: 13px;
   border: 1px solid transparent;
@@ -164,7 +164,7 @@ button {
 }
 
 .os-btn:hover {
-  filter: brightness(1.08);
+  background: var(--acc-hover);
 }
 
 .os-btn:active {

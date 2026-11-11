@@ -2,6 +2,7 @@
 Execution Management, Cancellation, and SSE Event Stream Routes
 """
 
+import asyncio
 from typing import List, Dict, Any
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -20,7 +21,7 @@ from backend.app.engine.events import (
     event_hub,
     TEAM_MESSAGE_EVENT_TYPE,
 )
-from backend.app.engine.executor import cancel_running_execution
+from backend.app.engine.executor import cancel_running_execution, cancel_execution_rows
 from backend.app.engine.state_machine import WorkflowState, NodeState
 from backend.app.runtime import get_runtime, AgentRuntime
 
@@ -62,30 +63,31 @@ async def cancel_execution(
     if not exec_obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found")
 
-    if exec_obj.status in (WorkflowState.SUCCEEDED.value, WorkflowState.FAILED.value, WorkflowState.CANCELLED.value):
-        return {"status": exec_obj.status, "message": f"Execution already in terminal state '{exec_obj.status}'"}
+    running_nodes = [node.node_id for node in exec_obj.node_executions if node.status == NodeState.RUNNING.value]
+    # Single atomic compare-and-set: only a pending/running execution can be
+    # cancelled; the node cancellation and audit event commit in the same
+    # transaction. A concurrently-finished execution is never overwritten.
+    won = cancel_execution_rows(
+        db,
+        execution_id,
+        event_json='{"reason": "User requested cancellation"}',
+    )
+    if not won:
+        current = repo.get_execution(execution_id)
+        db.refresh(current)
+        return {"status": current.status, "message": f"Execution already in terminal state '{current.status}'"}
 
-    # Signal in-memory flag
+    # Signal the in-memory flag only after the cancel is committed.
     cancel_running_execution(execution_id)
 
-    # Transition DB states
-    now = datetime.now(timezone.utc)
-    exec_obj.status = WorkflowState.CANCELLED.value
-    exec_obj.finished_at = now
-    exec_obj.error_summary = "Execution cancelled by user request"
-
-    for node_exec in exec_obj.node_executions:
-        if node_exec.status in (NodeState.PENDING.value, NodeState.READY.value, NodeState.RUNNING.value):
-            node_exec.status = NodeState.CANCELLED.value
-            node_exec.finished_at = now
-            node_exec.error_message = "Cancelled by user request"
-
-    repo.record_event(
-        execution_id=execution_id,
-        event_type="execution.cancelled",
-        event_json='{"reason": "User requested cancellation"}'
-    )
-    db.commit()
+    # The database is already cancelled; stopping remote work is best effort.
+    async def abort_running():
+        await asyncio.gather(*(runtime.abort_task(f"workflow-{execution_id}-{node_id}")
+                               for node_id in running_nodes), return_exceptions=True)
+    try:
+        await asyncio.wait_for(abort_running(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
 
     # Broadcast event to SSE subscribers
     await event_hub.broadcast(execution_id, "execution.cancelled", {"reason": "User cancelled"})
@@ -107,11 +109,8 @@ async def get_execution_events_stream(execution_id: str, db: Session = Depends(g
     if not exec_obj:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found")
 
-    # Fetch past events for historical catch-up
-    past_events = exec_obj.events
-
     return EventSourceResponse(
-        stream_execution_events(execution_id=execution_id, past_events=past_events)
+        stream_execution_events(execution_id=execution_id, load_past=lambda: list(exec_obj.events))
     )
 
 

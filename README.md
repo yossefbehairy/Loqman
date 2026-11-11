@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml/badge.svg)](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml)
 ![Version](https://img.shields.io/badge/version-0.2.2-blue)
-![Tests](https://img.shields.io/badge/tests-145%20backend%20%7C%2040%20E2E-brightgreen)
+![Tests](https://img.shields.io/badge/tests-560%20backend%20%7C%2043%20E2E-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![Node](https://img.shields.io/badge/node-22-green)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
@@ -39,11 +39,11 @@ flowchart LR
         DB[("SQLite (WAL)")]
         API --- DB
     end
-    OpenCode["OpenCode server (external process)"]
+    Engines["OpenCode · Claude Code · Codex · Antigravity CLI"]
     Mock["MockRuntime (deterministic tests)"]
     Main -->|spawns| API
     Renderer -->|"HTTP and SSE"| API
-    API -.->|"RUNTIME_MODE=real"| OpenCode
+    API -->|"engine adapters"| Engines
     API -.->|"RUNTIME_MODE=mock"| Mock
 ```
 
@@ -52,9 +52,9 @@ flowchart LR
 | Backend | Python 3.13, FastAPI, SQLAlchemy over SQLite (WAL), Pydantic v2, SSE via `sse-starlette`, pytest |
 | Frontend | React 19, TypeScript, Vite 8, Tailwind CSS, `@xyflow/react`, `react-force-graph` |
 | Desktop | Electron 44, electron-builder (NSIS), PyInstaller one-file backend sidecar |
-| AI runtime | OpenCode CLI transport for real work, deterministic `MockRuntime` for tests |
+| AI runtime | Provider adapters for OpenCode, Claude Code, Codex CLI, and Antigravity ACP; deterministic `MockRuntime` for tests |
 
-Two runtime modes share one interface. `real` mode forwards prompts to an OpenCode server on `http://127.0.0.1:49100`. `mock` mode answers from deterministic branches, which keeps the Playwright suite reproducible and free.
+`RUNTIME_MODE=real` uses OpenCode and its verified free-model policy. `mock` is a deterministic, offline test/demo mode. `claude`, `codex`, and the experimental `agy` mode use the logged-in local CLI account; Antigravity ACP is also available by selecting the `antigravity` engine for a conversation or employee. Account eligibility and billing remain unknown where the CLI cannot verify them, and there is no silent provider fallback.
 
 ## CEO control plane
 
@@ -91,22 +91,22 @@ The full design notes live in `docs/ceo-control-plan.md`.
 
 ## Mission lifecycle
 
-A delegation in a conversation, or an approved CEO proposal, becomes a mission. The planner decomposes the objective, employees execute tasks on free models, and results return as strict JSON.
+A delegation in a conversation, or an approved CEO proposal, becomes a mission. The planner decomposes the objective, employees execute on their selected engine, and structured worker results are validated before they count as successful.
 
 ```mermaid
 flowchart LR
     Goal["Goal"] --> Plan["Planner decomposes the goal into tasks"]
-    Plan --> Exec["Employees execute tasks on free models"]
-    Exec --> Out["Deliverables return as strict JSON"]
+    Plan --> Exec["Employees execute on selected engines"]
+    Exec --> Out["Validated worker results and reviewable deliverables"]
     Out --> Review["Inbox review and approval"]
     Out --> Ledger["Team Stream handover ledger"]
 ```
 
-Every execution revalidates its model against the live catalog. A model that is not confirmed free and active is rejected, and there is no paid fallback.
+Every execution revalidates its model against the selected engine's catalog. OpenCode remains free-only; other CLI engines use their local account catalog and never claim an unknown model is free. Unsupported models fail without switching providers.
 
 ## Getting started
 
-Prerequisites: Python 3.13, Node 22, and Windows 10 or 11 for the desktop build. Real AI work needs an OpenCode server on `http://127.0.0.1:49100`; tests and the mock runtime do not.
+Prerequisites: Python 3.13, Node 22, and Windows 10 or 11 for the desktop build. OpenCode needs its local server on `http://127.0.0.1:49100`; Claude Code, Codex, and Antigravity need their official CLI installed and signed in. Tests and the mock runtime do not need a model account.
 
 Start with the backend:
 
@@ -118,6 +118,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 cd ..
+$env:AGENTOS_INSECURE_DEV = '1' # local browser development only
 backend\.venv\Scripts\python.exe -m backend.app.cli
 ```
 
@@ -132,6 +133,7 @@ npm run dev
 ```
 
 The dev server listens on `http://127.0.0.1:5173` and proxies `/api` to the backend.
+Without `AGENTOS_INSECURE_DEV=1`, standalone API requests require `AGENTOS_LOCAL_TOKEN` in the `X-AgentOS-Token` header. Desktop sets a random token automatically.
 
 Run the desktop shell, which spawns and supervises the backend by itself:
 
@@ -158,18 +160,18 @@ Copy `.env.example` to `.env` in the repository root and adjust what you need:
 | Key | Default | Notes |
 | --- | --- | --- |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Keep it on loopback. `cli.py` accepts `--host`, `--port`, and `--data-dir`. |
-| `RUNTIME_MODE` | `real` | Use `mock` for deterministic tests. |
+| `RUNTIME_MODE` | `real` | `real` uses OpenCode; `claude` and `codex` use their CLIs; `agy` is an experimental legacy adapter; `mock` is deterministic. Antigravity ACP is selected per engine. |
 | `OPENCODE_BASE_URL` | `http://127.0.0.1:49100` | The AI runtime lives outside the desktop bundle. |
-| `DEFAULT_MODEL_ID` | `deepseek-v4.1-flash-free` | Revalidated against the live catalog before every execution. |
+| `DEFAULT_MODEL_ID` | `muse-spark-1.3-contributor-free` | Revalidated against the selected runtime catalog before a mission starts. |
 | `AGENTOS_DATA_DIR` | set by Electron | Points `agentos.db` at the app data folder. |
 
 ## Testing
 
-The suite covers 145 backend tests (21 pytest suites) and 40 end-to-end tests (8 Playwright spec files) on Chromium.
+The backend suite currently reports 560 passed and 6 skipped tests. The repository also contains 43 Playwright end-to-end tests across 8 specs; run them separately when verifying frontend changes.
 
 ```powershell
-# Backend: 145 tests
-backend\.venv\Scripts\pytest.exe backend\tests -v
+# Backend: last run 560 passed, 6 skipped
+backend\.venv\Scripts\python.exe -m pytest backend\tests -q
 
 # Frontend gates: types, lint, production build
 cd frontend
@@ -177,7 +179,7 @@ npx tsc -b
 npm run lint
 npm run build
 
-# End to end: 40 tests on a deterministic mock runtime
+# End to end: 43 tests on a deterministic mock runtime
 npx playwright test
 ```
 
@@ -187,9 +189,9 @@ Continuous integration runs four jobs on every push:
 
 ```mermaid
 flowchart LR
-    Push["Push or pull request"] --> Backend["backend: pytest (145 tests)"]
+    Push["Push or pull request"] --> Backend["backend: pytest (560 passed, 6 skipped at last run)"]
     Push --> Frontend["frontend: tsc, oxlint, vite build"]
-    Push --> E2E["e2e: Playwright (40 tests, mock runtime)"]
+    Push --> E2E["e2e: Playwright (43 tests, mock runtime)"]
     Push --> Scan["secrets scan"]
 ```
 
@@ -205,15 +207,15 @@ backend/
     db/              # session, models, repository, seed profiles
     engine/          # executor, state machine, validator, context, events
     orchestration/   # CEO ReAct loop, tool registry, planner
-    runtime/         # OpenCode transport, deterministic mock runtime
-  tests/             # 21 pytest suites, 145 tests
+    runtime/         # OpenCode, Claude Code, Codex, Antigravity ACP, and mock adapters
+  tests/             # Backend unit, contract, lifecycle, migration, and security tests
 frontend/
   src/
     api/             # typed API client
     components/      # ceo, company, conversations, stream, inbox, settings
     data/ types/ utils/
   electron/          # main, preload, splash
-  e2e/               # 8 Playwright specs, 40 tests
+  e2e/               # 8 Playwright specs, 43 tests
 pyinstaller/         # backend freeze and smoke test scripts
 docs/                # architecture notes, CEO control plan
 ```
@@ -228,7 +230,8 @@ docs/                # architecture notes, CEO control plan
 
 ## Known limits
 
-- The AI runtime is not bundled. `real` mode needs an OpenCode server on the same machine.
+- AI CLIs are not bundled; the user installs and authenticates each engine. The React UI is not yet wired to all new conversation-run and engine setup APIs.
+- CLI adapters do not offer confirmed workspace isolation, tool approvals, streaming text, or session resume as a cross-engine feature. See `docs/BACKEND-IMPLEMENTATION-STATUS-AR.md` for the current boundaries.
 - No code signing and no auto-updater yet. The plan is GitHub Releases plus `electron-updater`.
 - The bundled `uvicorn` runs h11 only. REST and SSE are unaffected.
 

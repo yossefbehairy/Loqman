@@ -1,18 +1,20 @@
 """
 Executive Chat & Manager Direct Consultation Route
 Handles interactive manager consultation (R1) with authentic Arabic personas
-for Dr. Sara, Eng. Tarek, Prof. Yasmin, and General Manager.
+for Dr. Sara (Compass), Eng. Tarek (Forge), Prof. Yasmin, and Loqman (CEO).
 """
 
 import json
-import uuid
+
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from backend.app.config import settings
 from backend.app.db.session import get_db
 from backend.app.db.repository import AgentProfileRepository, OpenCodeConversationRepository
 from backend.app.runtime import get_runtime, AgentRuntime
+from backend.app.runtime.ledger import run_agent_task, KIND_CHAT_CONSULT
 from backend.app.runtime.base import ExecuteAgentTask
 from backend.app.engine.context import sanitize_model_output
 
@@ -52,7 +54,7 @@ class ConversationSessionSave(BaseModel):
     session_id: str = Field(min_length=1, max_length=128)
     model_id: str = Field(min_length=1, max_length=128)
     provider_id: str = Field(min_length=1, max_length=128)
-    agent_id: str = Field(default="build", min_length=1, max_length=128)
+    agent_id: str = Field(default=settings.CHAT_AGENT_ID, min_length=1, max_length=128)
 
 
 class ConversationSessionOut(ConversationSessionSave):
@@ -73,22 +75,23 @@ async def _handle_consultation(
             detail=f"Manager profile '{manager_id}' not found"
         )
 
-    # Extract persona details
-    settings: Dict[str, Any] = {}
+    # Extract persona details (named `profile_settings` so it never shadows the
+    # module-level `settings` object).
+    profile_settings: Dict[str, Any] = {}
     if profile and profile.settings_json:
         try:
             parsed = json.loads(profile.settings_json)
             if isinstance(parsed, dict):
-                settings = parsed
+                profile_settings = parsed
         except Exception:
-            settings = {}
+            profile_settings = {}
 
-    if not isinstance(settings, dict):
-        settings = {}
+    if not isinstance(profile_settings, dict):
+        profile_settings = {}
 
-    manager_name = payload.agent_name or settings.get("arabic_name") or profile.name
-    title = payload.agent_role or settings.get("title") or (profile.description if profile else None) or "مدير الإدارة"
-    department = settings.get("department") or (profile.role_type if profile else payload.agent_role)
+    manager_name = payload.agent_name or profile.name or profile_settings.get("arabic_name")
+    title = payload.agent_role or profile_settings.get("title") or (profile.description if profile else None) or "مدير الإدارة"
+    department = profile_settings.get("department") or (profile.role_type if profile else payload.agent_role)
     instructions = payload.agent_instructions or (profile.instructions if profile else "You are a helpful AI agent. Answer the user's request directly and clearly.")
     model_id = payload.model_id or (profile.default_model_id if profile else None) or "deepseek-v4.1-flash-free"
     variant = payload.variant if payload.model_id else ((profile.default_variant_id if profile else None) or "high")
@@ -111,7 +114,8 @@ async def _handle_consultation(
     prompt_lines.append(
         "Reply now as the persona, naturally and warmly, in the user's own "
         "language and dialect (Egyptian Arabic if they write Egyptian Arabic). "
-        "Be concise, be yourself, answer what was asked and nothing more. "
+        "Be yourself: a short question takes a short answer, and a real question "
+        "deserves a real one with your own point of view. "
         "Plain text only — no JSON, no markdown fences, no headers, "
         "no mention of missions, tasks, sessions, or employees."
     )
@@ -121,10 +125,14 @@ async def _handle_consultation(
         prompt=full_prompt,
         model_id=model_id,
         variant=variant,
-        session_title=f"consult-{uuid.uuid4().hex[:8]}"
+        # PR6: one thread per manager — conversation continuity lives inside the
+        # OpenCode session itself, across messages AND app restarts (the runtime
+        # re-finds the thread by its stable title).
+        session_title=f"consult-{manager_id or manager_name}",
+        agent_id=settings.CHAT_AGENT_ID,
     )
 
-    result = await runtime.execute_task(task)
+    result = await run_agent_task(runtime, task, kind=KIND_CHAT_CONSULT)
     clean_text = sanitize_model_output(result.text)
 
     reply: Optional[str] = None
@@ -158,7 +166,7 @@ async def chat_consultation(
 ):
     """
     Direct executive consultation endpoint (R1).
-    Chats with Dr. Sara, Eng. Tarek, Prof. Yasmin, or General Manager.
+    Chats with Dr. Sara, Eng. Tarek, Prof. Yasmin, or Loqman (the CEO).
     """
     manager_id = payload.manager_id or "general_manager"
     return await _handle_consultation(manager_id, payload, db, runtime)
@@ -202,8 +210,14 @@ async def save_conversation_session(
     model = next((m for m in models if m.id == payload.model_id and m.provider_id == payload.provider_id), None)
     if not model:
         raise HTTPException(status_code=400, detail="Selected model/provider is not verified as free and active.")
-    if payload.agent_id != "build":
-        raise HTTPException(status_code=400, detail="Only the configured OpenCode primary agent 'build' is supported.")
+    if payload.agent_id not in {settings.CHAT_AGENT_ID, settings.WORK_AGENT_ID}:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only AgentOS' locked OpenCode agents are supported: "
+                f"{sorted({settings.CHAT_AGENT_ID, settings.WORK_AGENT_ID})}."
+            ),
+        )
     try:
         row = OpenCodeConversationRepository(db).save(
             conversation_id, payload.session_id, payload.model_id, payload.provider_id, payload.agent_id
@@ -260,4 +274,4 @@ async def opencode_sdk_proxy(path: str, request: Request, runtime: AgentRuntime 
     try:
         return await request_api(request.method, api_path, data)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"OpenCode request failed: {str(exc)[:300]}")
+        raise HTTPException(status_code=502, detail="OpenCode request failed.")

@@ -13,9 +13,10 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Set, AsyncGenerator, Any, Optional
+from typing import Dict, Set, AsyncGenerator, Any, Optional, Callable
 
 logger = logging.getLogger("agentos.events")
+MAX_SUBSCRIBER_EVENTS = 256
 
 
 class ExecutionEventHub:
@@ -29,7 +30,7 @@ class ExecutionEventHub:
 
     def subscribe(self, execution_id: str) -> asyncio.Queue:
         """Subscribes a client to live events for an execution."""
-        q: asyncio.Queue = asyncio.Queue()
+        q: asyncio.Queue = asyncio.Queue(maxsize=MAX_SUBSCRIBER_EVENTS)
         if execution_id not in self._subscribers:
             self._subscribers[execution_id] = set()
         self._subscribers[execution_id].add(q)
@@ -60,8 +61,12 @@ class ExecutionEventHub:
         for q in queues:
             try:
                 q.put_nowait(event_payload)
-            except Exception as e:
-                logger.warning(f"Failed to queue event for subscriber on execution {execution_id}: {e}")
+            except asyncio.QueueFull:
+                # Close slow clients so they can reconnect and fetch current state.
+                self.unsubscribe(execution_id, q)
+                while not q.empty():
+                    q.get_nowait()
+                q.put_nowait({"event": "stream.overflow", "data": {}})
 
 
 # Global event hub instance
@@ -129,34 +134,34 @@ async def persist_and_broadcast_team_message(
 
 async def stream_execution_events(
     execution_id: str,
-    past_events: Optional[list] = None
+    past_events: Optional[list] = None,
+    load_past: Optional[Callable[[], list]] = None,
 ) -> AsyncGenerator[Dict[str, str], None]:
     """
     Async generator yielding formatted SSE events.
     First yields past events (reconnection catch-up from SQLite),
     then waits on live event bus until completion or disconnect.
     """
-    # 1. Replay historical events from SQLite if provided
-    if past_events:
-        for ev in past_events:
-            ev_data = ev.event_json
-            if isinstance(ev_data, str):
-                try:
-                    ev_data = json.loads(ev_data)
-                except Exception:
-                    ev_data = {"raw": ev_data}
-            yield {
-                "event": ev.event_type,
-                "data": json.dumps(ev_data)
-            }
-
-    # 2. Subscribe to live event queue
+    # Subscribe before the DB read; updates emitted while replay is being sent
+    # are buffered for the live portion of the stream.
     q = event_hub.subscribe(execution_id)
     try:
+        history = load_past() if load_past else past_events
+        if history:
+            for ev in history:
+                ev_data = ev.event_json
+                if isinstance(ev_data, str):
+                    try:
+                        ev_data = json.loads(ev_data)
+                    except Exception:
+                        ev_data = {"raw": ev_data}
+                yield {"event": ev.event_type, "data": json.dumps(ev_data)}
         while True:
             # Wait for next event with a periodic heartbeat to prevent connection timeout
             try:
                 ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                if ev["event"] == "stream.overflow":
+                    break
                 yield {
                     "event": ev["event"],
                     "data": json.dumps(ev["data"])

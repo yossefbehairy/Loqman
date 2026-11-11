@@ -5,14 +5,17 @@ and mounts all REST endpoints.
 """
 
 import logging
+import hmac
+import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from backend.app.config import settings
 from backend.app.db.session import init_db, SessionLocal
 from backend.app.db.repository import AgentProfileRepository
 from backend.app.core.lifecycle import run_startup_crash_recovery
-from backend.app.api.routes import health, models, agent_profiles, workflows, executions, chat, missions, ceo
+from backend.app.api.routes import health, models, agent_profiles, workflows, executions, chat, missions, ceo, usage, engines, conversations, conversation_runs, workspaces, backup, approvals, skills, deliverables
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,9 +50,13 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
-    yield
-
-    logger.info("AgentOS backend shutting down cleanly.")
+    manager = conversation_runs.get_run_manager()
+    manager.recover_interrupted()
+    try:
+        yield
+    finally:
+        await manager.shutdown()
+        logger.info("AgentOS backend shutting down cleanly.")
 
 
 app = FastAPI(
@@ -68,6 +75,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def authenticate_desktop_requests(request: Request, call_next):
+    """Authenticate the Electron sidecar when launched with a local token."""
+    token = os.environ.get("AGENTOS_LOCAL_TOKEN")
+    insecure_dev = os.environ.get("AGENTOS_INSECURE_DEV") == "1"
+    allowed_hosts = {"localhost", "127.0.0.1"}
+    if insecure_dev:
+        allowed_hosts.add("testserver")
+    if (request.url.hostname or "").lower() not in allowed_hosts:
+        return JSONResponse(status_code=400, content={"detail": "Invalid host"})
+    if request.url.path.startswith("/api/") and not token and not insecure_dev:
+        return JSONResponse(status_code=503, content={"detail": "Local authentication is not configured"})
+    if token and request.url.path.startswith("/api/") and request.method != "OPTIONS":
+        supplied = request.headers.get("x-agentos-token", "")
+        if not hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8")):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+
 # Register API Routers
 app.include_router(health.router)
 app.include_router(models.router)
@@ -77,6 +103,16 @@ app.include_router(executions.router)
 app.include_router(chat.router)
 app.include_router(missions.router)
 app.include_router(ceo.router)
+app.include_router(usage.router)
+app.include_router(engines.router)
+app.include_router(conversations.router)
+app.include_router(conversation_runs.router)
+app.include_router(workspaces.router)
+app.include_router(workspaces.artifacts_router)
+app.include_router(backup.router)
+app.include_router(approvals.router)
+app.include_router(skills.router)
+app.include_router(deliverables.router)
 
 
 @app.get("/", tags=["root"])

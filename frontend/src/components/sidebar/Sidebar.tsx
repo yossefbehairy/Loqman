@@ -61,9 +61,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
     >
       <div className="flex h-[60px] items-center justify-between px-3">
         {!collapsed && (
-          <button type="button" onClick={() => onViewChange('chat')} data-nav="chat" className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-gray-100 hover:bg-gray-800" aria-label="AgentOS - الرئيسية">
-            <span className="grid h-7 w-7 place-items-center rounded-full border border-gray-600 text-sm font-semibold text-gray-100">A</span>
-            <span className="text-[15px] font-semibold tracking-tight">AgentOS</span>
+          <button type="button" onClick={() => onViewChange('chat')} data-nav="chat" className="flex items-center gap-2.5 rounded-lg px-2 py-1.5 text-gray-100 hover:bg-gray-800" aria-label="Loqman - الرئيسية">
+            <span className="grid h-7 w-7 place-items-center rounded-full border border-gray-600 text-sm font-semibold text-gray-100">L</span>
+            <span className="text-[15px] font-semibold tracking-tight">Loqman</span>
           </button>
         )}
         <button type="button" onClick={() => setCollapsed((value) => !value)} className="rounded-lg p-2 text-gray-400 transition hover:bg-gray-800 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400" aria-label={collapsed ? 'توسيع القائمة' : 'طي القائمة'} title={collapsed ? 'توسيع القائمة' : 'طي القائمة'}>

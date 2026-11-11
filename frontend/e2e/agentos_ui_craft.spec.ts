@@ -27,7 +27,7 @@ test.describe('AgentOS Impeccable UI Verification', () => {
     page,
   }) => {
     await page.goto('/#company');
-    await expect(page).toHaveTitle('AgentOS');
+    await expect(page).toHaveTitle('Loqman');
 
     // Verify the shell branding/sidebar footer
     await expect(page.getByText('Local workspace')).toBeVisible();
@@ -61,7 +61,7 @@ test.describe('AgentOS Impeccable UI Verification', () => {
 
     // Switch to Org Chart
     await switchCompanyView(page, 'org');
-    await expect(page.getByText('Adel Mansour').first()).toBeVisible();
+    await expect(page.getByText('Loqman').first()).toBeVisible();
     await expect(page.getByText('Planning & Strategy', { exact: true }).first()).toBeVisible();
     await expect(page.getByText('د. سارة').first()).toBeVisible();
     await expect(page.getByText('م. طارق').first()).toBeVisible();
@@ -116,8 +116,8 @@ test.describe('AgentOS Impeccable UI Verification', () => {
     await page.goto('/#conversations');
     await expect(page.getByRole('heading', { name: 'OpenCode Chat' })).toBeVisible();
 
-    // Verify Adel Mansour CEO is selected by default
-    await expect(page.getByText('OpenCode · Adel Mansour', { exact: true })).toBeVisible();
+    // Verify Loqman CEO is selected by default
+    await expect(page.getByText('OpenCode · Loqman', { exact: true })).toBeVisible();
 
     // Type a message (explicit delegation to the planner employee). The last
     // role keyword on the line must be the target, so the command closes it.

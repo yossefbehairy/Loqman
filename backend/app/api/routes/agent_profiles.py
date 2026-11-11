@@ -12,7 +12,11 @@ from sqlalchemy.orm import Session
 from backend.app.db.session import get_db
 from backend.app.db.models import AgentProfile
 from backend.app.db.repository import AgentProfileRepository
-from backend.app.schemas.agent_profile import AgentProfileCreate, AgentProfileResponse
+from backend.app.schemas.agent_profile import (
+    AgentProfileCreate,
+    AgentProfileResponse,
+    validate_profile_engine,
+)
 
 router = APIRouter(prefix="/api/agent-profiles", tags=["agent-profiles"])
 
@@ -28,6 +32,13 @@ class AgentProfileUpdate(BaseModel):
     default_variant_id: Optional[str] = None
     task_depth: Optional[str] = None
     settings_json: Optional[str] = None
+    # Explicit null (or "") clears the preference back to the server default.
+    engine: Optional[str] = None
+
+    @field_validator("engine")
+    @classmethod
+    def validate_engine(cls, v: Optional[str]) -> Optional[str]:
+        return validate_profile_engine(v)
 
     @field_validator("settings_json")
     @classmethod

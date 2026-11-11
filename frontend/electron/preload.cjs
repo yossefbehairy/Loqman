@@ -1,33 +1,77 @@
-// AgentOS — Electron preload.
+// Loqman — Electron preload.
 //
 // CommonJS on purpose (frontend/package.json is "type": "module").
-// Exposes only the API base URL passed by main.cjs via additionalArguments:
-//   "--agentos-api=http://127.0.0.1:<port>/api"
-// so the renderer can fall back to a relative "/api" when running in a plain
-// browser (where this preload never runs and the key stays undefined).
+// Exposes a NARROW bridge to the Python worker owned by the main process:
+//   window.agentos.call(method, params)                   -> Promise<result>
+//   window.agentos.openStream(topic, id, lastId, onMsg)   -> Promise<{ close() }>
+// No raw ipcRenderer, no arbitrary channel, no HTTP/port/token: the main process
+// validates the sender and the method name, and never exposes `shutdown`.
 'use strict';
 
-const { contextBridge } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
 
-const API_ARG_PREFIX = '--agentos-api=';
+/** @type {Map<string, (msg: object) => void>} */
+const handlers = new Map();
+/** Messages that arrive before the renderer registered its handler (IPC ordering is not guaranteed). */
+const early = new Map();
+
+ipcRenderer.on('agentos:stream', (_event, msg) => {
+  const handler = handlers.get(msg.stream_id);
+  if (handler) {
+    handler(msg);
+    if (msg.type === 'stream_end') handlers.delete(msg.stream_id);
+    return;
+  }
+  const queue = early.get(msg.stream_id) || [];
+  if (queue.length < 256) queue.push(msg);
+  early.set(msg.stream_id, queue);
+});
 
 /**
- * @param {string[]} argv
- * @returns {string | null}
+ * Main throws Error(JSON.stringify({status, detail})). contextBridge only carries an Error's
+ * message across the isolated world, so the payload stays JSON in `message`; the renderer
+ * (src/api/transport.ts) parses it back into ApiError(status, detail).
  */
-function readApiBase(argList) {
-  for (const arg of argList) {
-    if (typeof arg !== 'string' || !arg.startsWith(API_ARG_PREFIX)) continue;
-    const value = arg.slice(API_ARG_PREFIX.length).trim();
-    if (value) return value;
+function unwrap(error) {
+  const raw = error && error.message ? String(error.message) : String(error);
+  const marker = raw.indexOf('{"status"');
+  if (marker >= 0) {
+    try {
+      JSON.parse(raw.slice(marker));
+      return new Error(raw.slice(marker));
+    } catch {
+      /* fall through */
+    }
   }
-  return null;
+  return new Error(JSON.stringify({ status: null, detail: raw.replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
 }
 
-const apiUrl = readApiBase(process.argv);
-
-if (typeof apiUrl === 'string' && apiUrl.length > 0) {
-  contextBridge.exposeInMainWorld('__AGENTOS_API__', apiUrl);
-}
+contextBridge.exposeInMainWorld('agentos', {
+  call: async (method, params) => {
+    try {
+      return await ipcRenderer.invoke('agentos:call', method, params || {});
+    } catch (error) {
+      throw unwrap(error);
+    }
+  },
+  openStream: async (topic, id, lastEventId, onMessage) => {
+    let streamId;
+    try {
+      streamId = await ipcRenderer.invoke('agentos:stream-open', topic, id, lastEventId || 0);
+    } catch (error) {
+      throw unwrap(error);
+    }
+    handlers.set(streamId, onMessage);
+    for (const msg of early.get(streamId) || []) onMessage(msg);
+    early.delete(streamId);
+    return {
+      close: () => {
+        handlers.delete(streamId);
+        early.delete(streamId);
+        return ipcRenderer.invoke('agentos:stream-close', streamId).catch(() => false);
+      },
+    };
+  },
+});
 
 contextBridge.exposeInMainWorld('__AGENTOS_DESKTOP__', true);

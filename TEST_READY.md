@@ -4,8 +4,8 @@
 The comprehensive End-to-End (E2E) Playwright testing track for AgentOS is **fully authored, validated, and green** against the current UI (M1 through M6 verification).
 
 - **Total E2E Test Files**: 8 files
-- **Total E2E Test Cases**: 40 tests
-- **Last Full Suite Result**: `40 passed` (0 failed, 0 skipped) with `RUNTIME_MODE=mock`
+- **Total E2E Test Cases**: 43 tests
+- **Last Full Suite Result**: `43 passed` (0 failed, 0 skipped) with `RUNTIME_MODE=mock`
 - **Linter Status**: 0 errors, 0 warnings (`oxlint`)
 - **TypeScript Status**: Clean compilation (`tsc -b`)
 - **Vite Build**: Success (`vite build`)
@@ -40,13 +40,13 @@ Run targeted specs matching individual feature tracks (set `$env:RUNTIME_MODE='m
 | **R5 (Team Chat Stream & Handovers)** | `frontend/e2e/r5_team_chat_stream.spec.ts` | 5 | `npx playwright test e2e/r5_team_chat_stream.spec.ts` |
 | **Obsidian Physics Graph** | `frontend/e2e/obsidian_physics_graph.spec.ts` | 4 | `npx playwright test e2e/obsidian_physics_graph.spec.ts` |
 | **Workspace UI Craft Sweep** | `frontend/e2e/agentos_ui_craft.spec.ts` | 10 | `npx playwright test e2e/agentos_ui_craft.spec.ts` |
-| **CEO Control Plane** | `frontend/e2e/ceo_control_plane.spec.ts` | 6 | `npx playwright test e2e/ceo_control_plane.spec.ts` |
+| **CEO Control Plane** | `frontend/e2e/ceo_control_plane.spec.ts` | 9 | `npx playwright test e2e/ceo_control_plane.spec.ts` |
 
 ### 2.3 Backend Pytest Execution
-Run all 142 backend integration and unit tests:
+Run the backend unit, contract, migration and security tests:
 ```powershell
 cd d:\AgentOS
-d:\AgentOS\backend\.venv\Scripts\pytest.exe backend\tests -v
+d:\AgentOS\backend\.venv\Scripts\python.exe -m pytest backend\tests -q
 ```
 
 ---
@@ -101,11 +101,14 @@ d:\AgentOS\backend\.venv\Scripts\pytest.exe backend\tests -v
 9. **Agent Active Task Inspector**: Verifies the org chart inspector's "View active task & dialogue" action opens the agent's active work, dialogue summary and empty deliverable payload state.
 10. **Team Stream Shell**: Verifies the stream header, live status, metrics and recorded-turns empty state render.
 
-### Suite 8: `frontend/e2e/ceo_control_plane.spec.ts` (CEO Control Plane, 6 tests)
-1. **Executive-First Navigation & Surfaces**: Verifies the CEO entry leads the sidebar, and opening it shows the `CEO Control Plane` heading, the ask surface (`اسأل المدير العام`, textarea `سؤال للمدير العام`) and the approvals inbox (`صندوق الاعتماد`).
-2. **Ask Over Live Data → Pending Proposal**: Asks `اعمل فريق مراجعة أمنية` and verifies the deterministic mock reply (`Based on live company data`) renders in the CEO reply region, a `بانتظار اعتمادك` chip appears, and the proposal is recorded in the approvals inbox as `معلّق` (count `before + 1`; never auto-executed).
-3. **Gated Approval**: Verifies `اعتماد` opens the in-app confirmation strip (`تأكيد اعتماد هذا الإجراء؟ سيُنفَّذ فوراً.`); cancel decides nothing; confirming executes the action, shows `تم اعتماد الإجراء وتنفيذه.`, removes the card from the pending list, and files it under the `معتمدة` tab as `معتمد`.
-4. **Approved Team Materializes in the Company**: After approving the team proposal, opens the sidebar `Company` view and switches to `Org chart`, then verifies the new team (`Security Review Team (فريق المراجعة الأمنية)`) and all three created members (`Hassan (حسن)`, `Farida (فريدة)`, `Kareem (كريم)`) are present — the approve response's `created_profiles`/`team_name` are materialized into the local company state.
-5. **Gated Denial**: Verifies `رفض` shows `تأكيد رفض هذا الإجراء؟ لن يُنفَّذ شيء.`; confirming reports `تم رفض الإجراء — لم يُنفَّذ شيء.`, removes the card from pending, and files it under the `مرفوضة` tab as `مرفوض`.
-6. **Empty Question Guard**: Verifies send stays disabled for empty and whitespace-only questions (no reply region ever appears) and enables only for a real question.
+### Suite 8: `frontend/e2e/ceo_control_plane.spec.ts` (CEO Control Plane, 9 tests)
+1. **Executive-First Navigation & Surfaces**: Verifies the CEO entry leads the sidebar, and opening it shows the chat console heading (`هنعمل إيه النهارده؟`) and the ask composer (textarea `سؤال للمدير العام`); the topbar bell opens the full approvals inbox dialog (`صندوق الاعتماد`).
+2. **Ask Over Live Data → Pending Proposal**: Asks `اعمل فريق مراجعة أمنية` and verifies the deterministic mock reply (`Based on live company data`) renders in the CEO reply region, an actionable proposal card appears right under the reply (`بانتظار اعتمادك` + `اعتماد`/`رفض` buttons), and the proposal is recorded in the approvals inbox as `معلّق` (count `before + 1`; never auto-executed).
+3. **Suggestion Card → Sidebar History**: Clicking the `فريق مراجعة أمنية` suggestion pre-fills the composer, the send action lands the ask in the sidebar `RECENT QUESTIONS` history, `New question` returns to the welcome state, and reopening the thread from the sidebar restores the recorded exchange.
+4. **Live Free Catalog Pickers**: Verifies the model picker is fed by `GET /api/models/free` (label shows `DeepSeek V4.1 Flash Free (Mock)`), the menu lists the whole free catalog, selecting `Cat Jam Free (Mock)` persists (`CEO model updated`), and the effort picker lists the model's reasoning variants (selects `xhigh`).
+5. **Sidebar Collapse**: Verifies collapsing the sidebar to icons keeps navigation functional (accessible names come from titles) and expanding restores the full shell.
+6. **Gated In-Chat Approval**: Verifies `اعتماد` on the inline card opens the confirmation strip (`تأكيد اعتماد هذا الإجراء؟ سيُنفَّذ فوراً.`); cancel decides nothing; confirming executes the action, shows the inline decision line `تم اعتماد الإجراء وتنفيذه.`, flips the card to `معتمد`, removes it from the pending list, and files it under the `معتمدة` tab in the inbox dialog.
+7. **Approved Team Materializes in the Company**: After approving the team proposal inline in the chat, opens the sidebar `Company` view and switches to `Org chart`, then verifies the new team (`Security Review Team (فريق المراجعة الأمنية)`) and all three created members (`Hassan (حسن)`, `Farida (فريدة)`, `Kareem (كريم)`) are present — the approve response's `created_profiles`/`team_name` are materialized into the local company state.
+8. **Gated In-Chat Denial**: Verifies `رفض` shows `تأكيد رفض هذا الإجراء؟ لن يُنفَّذ شيء.`; confirming reports the inline `تم رفض الإجراء — لم يُنفَّذ شيء.`, flips the card to `مرفوض`, removes it from pending, and files it under the `مرفوضة` tab in the inbox dialog.
+9. **Empty Question Guard**: Verifies send stays disabled for empty and whitespace-only questions (no reply region ever appears) and enables only for a real question.
 

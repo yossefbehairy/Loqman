@@ -15,6 +15,8 @@ from backend.app.runtime.base import (
     ExecuteAgentTask,
     AgentResult,
 )
+from backend.app.config import settings
+from backend.app.runtime.errors import RuntimeModelUnavailable
 
 # Team-creation phrasing (additive routing for the CEO tools mock branch).
 # Listing questions ("who is on the team?") must NOT match.
@@ -128,6 +130,37 @@ class MockRuntime:
 
         import re as _re
 
+        # Agent lockdown parity with RealOpenCodeRuntime (PR1): the mock refuses
+        # the unrestricted "build" agent too, so tests exercise the same contract.
+        agent_id = task.agent_id or settings.WORK_AGENT_ID
+        if agent_id not in {settings.CHAT_AGENT_ID, settings.WORK_AGENT_ID}:
+            raise RuntimeModelUnavailable(
+                f"OpenCode agent '{agent_id}' is not allowed by AgentOS. "
+                f"Allowed agents: {sorted({settings.CHAT_AGENT_ID, settings.WORK_AGENT_ID})}."
+            )
+
+        # Thread parity with RealOpenCodeRuntime: conversation titles reuse the
+        # same (deterministic) session; worker one-shots stay stateless.
+        session_title = task.session_title or ""
+        if session_title.startswith(("consult-", "ceo-ask-", "ceo-fast-")):
+            mock_session_id = f"mock-thread-{session_title[:40]}"
+        else:
+            mock_session_id = "mock-session-id"
+
+        # -1. CEO fast path ("ceo fast reply" marker) — PLAIN text, no envelope:
+        # documents the small-talk single-call contract (no tool catalog at all).
+        if "ceo fast reply" in prompt_lower:
+            return AgentResult(
+                text="أهلاً بيك! الوضع تمام والحمد لله — تحت أمرك، قول لي محتاج إيه؟",
+                reasoning="[Mock Runtime Reasoning: small-talk single-call fast path]",
+                model_id=task.model_id,
+                variant_id=task.variant or "default",
+                cost=0.0,
+                tokens={"input": 12, "output": 8, "reasoning": 0},
+                duration_ms=3,
+                session_id=mock_session_id,
+            )
+
         # 0. CEO self-reasoning loop ("ceo tools" marker) — deterministic tool protocol.
         # Checked FIRST so loop prompts never fall into older branches.
         if "ceo tools" in prompt_lower:
@@ -201,7 +234,7 @@ class MockRuntime:
                 cost=0.0,
                 tokens={"input": 45, "output": 30, "reasoning": 10},
                 duration_ms=duration_ms,
-                session_id="mock-session-id"
+                session_id=mock_session_id
             )
         # 0b. CEO planning / synthesis (orchestrator prompts) — deterministic valid JSON.
         if "ceo planner" in prompt_lower or "structured execution plan" in prompt_lower:
@@ -238,15 +271,47 @@ class MockRuntime:
             goal_match = _re.search(r"user (?:message|question/briefing):\s*(.+?)(?:\n|$)", task.prompt, _re.IGNORECASE)
             goal_text = goal_match.group(1).strip() if goal_match else "المشروع المطلوب"
 
-            if "sara" in prompt_lower or "د. سارة" in task.prompt or "planner" in prompt_lower:
+            # Resolve the persona from the declared identity line first: the CEO's
+            # instructions mention both team leads, so substring-matching the whole
+            # prompt would misroute a Loqman consultation to Dr. Sara.
+            identity_line = next(
+                (ln for ln in task.prompt.splitlines() if ln.startswith("You are ")),
+                "",
+            )
+            identity = identity_line.lower()
+            if identity:
+                is_ceo = "Loqman" in identity_line or "loqman" in identity
+                is_sara = (not is_ceo) and ("سارة" in identity_line or "sara" in identity)
+                is_tarek = (
+                    (not is_ceo)
+                    and (not is_sara)
+                    and ("طارق" in identity_line or "tarek" in identity)
+                )
+                is_yasmin = (
+                    (not is_ceo)
+                    and (not is_sara)
+                    and (not is_tarek)
+                    and ("Prof. Yasmin" in identity_line or "yasmin" in identity)
+                )
+            else:
+                is_ceo = "general manager" in prompt_lower or "المدير العام" in task.prompt
+                is_sara = "sara" in prompt_lower or "Dr. Sara" in task.prompt or "planner" in prompt_lower
+                is_tarek = (not is_sara) and (
+                    "tarek" in prompt_lower or "Eng. Tarek" in task.prompt or "analyst" in prompt_lower
+                )
+                is_yasmin = (not is_sara) and (not is_tarek) and (
+                    "yasmin" in prompt_lower or "Prof. Yasmin" in task.prompt or "reviewer" in prompt_lower
+                )
+
+            if is_sara:
                 mock_json = {
                     "reply": (
-                        "أهلاً بك! بصفتي د. سارة مديرة التخطيط والإستراتيجية، قمت بتحليل الهدف وتفكيكه "
+                        "أهلاً بك! بصفتي Dr. Sara مديرة Compass للتخطيط والإستراتيجية، قمت بتحليل الهدف وتفكيكه "
                         "إلى مسارات ومحطات تنفيذية واضحة. سنبدأ أولاً بتحديد المتطلبات المعمارية بدقة، "
-                        "ثم وضع خارطة طريق متسلسلة تضمن توجيه المهام بفعالية لفرق التحليل والتطوير."
+                        "ثم وضع خارطة طريق متسلسلة تضمن توجيه المهام بفعالية لـ Forge."
                     ),
                     "manager_id": "dr_sara",
-                    "manager_name": "د. سارة",
+                    "manager_name": "Dr. Sara",
                     "title": "مدير التخطيط والإستراتيجية",
                     "suggested_mission": {
                         "title": "خطة تفكيك الأهداف والمراحل التنفيذية",
@@ -261,21 +326,21 @@ class MockRuntime:
                         }
                     }
                 }
-            elif "tarek" in prompt_lower or "م. طارق" in task.prompt or "analyst" in prompt_lower:
+            elif is_tarek:
                 mock_json = {
                     "reply": (
-                        "مرحباً بك! بصفتي م. طارق مدير التحليل والمخاطر، قمت بدراسة الجدوى الفنية وتقييم "
+                        "مرحباً بك! بصفتي Eng. Tarek مدير Forge والهندسة، قمت بدراسة الجدوى الفنية وتقييم "
                         "المخاطر المحتملة. نوصي بالتركيز على معالجة اختناقات الأداء ومزامنة العمليات وضمان "
                         "صمود النظام تحت الضغط العالي مع توفير آليات عزل واستعادة سريعة."
                     ),
                     "manager_id": "eng_tarek",
-                    "manager_name": "م. طارق",
-                    "title": "مدير التحليل والمخاطر",
+                    "manager_name": "Eng. Tarek",
+                    "title": "مدير التنفيذ والهندسة",
                     "suggested_mission": {
                         "title": "دراسة الجدوى الفنية وتحليل المخاطر المعمارية",
                         "input_json": {
                             "goal": goal_text,
-                            "department": "analysis",
+                            "department": "execution",
                             "risk_focus": [
                                 "أمان البيانات وتكامل واجهات API",
                                 "اختناقات الأداء والعمليات المتزامنة",
@@ -284,15 +349,15 @@ class MockRuntime:
                         }
                     }
                 }
-            elif "yasmin" in prompt_lower or "أ. ياسمين" in task.prompt or "reviewer" in prompt_lower:
+            elif is_yasmin:
                 mock_json = {
                     "reply": (
-                        "أهلاً بك! بصفتي أ. ياسمين مديرة الجودة والاعتماد، وضعت مصفوفة فحص الجودة وتأكيد المخرجات. "
+                        "أهلاً بك! بصفتي Prof. Yasmin مديرة الجودة والاعتماد، وضعت مصفوفة فحص الجودة وتأكيد المخرجات. "
                         "سنخضع كافة التسليمات لتدقيق منهجي يضمن مطابقة العقود البرمجية وسلامة مخططات JSON والتغطية "
                         "الشاملة لكافة الحالات الطرفية قبل إصدار الاعتماد النهائي."
                     ),
                     "manager_id": "prof_yasmin",
-                    "manager_name": "أ. ياسمين",
+                    "manager_name": "Prof. Yasmin",
                     "title": "مدير الجودة والاعتماد",
                     "suggested_mission": {
                         "title": "مصفوفة ضبط الجودة واعتماد مخرجات العمل",
@@ -310,21 +375,21 @@ class MockRuntime:
             else:
                 mock_json = {
                     "reply": (
-                        "مرحباً بك! بصفتي المدير العام للمنظومة، سأقود التنسيق الشامل لتنفيذ هذا الهدف "
-                        "عبر توجيه إدارات التخطيط، والتحليل والمخاطر، والجودة لضمان تسليم متكامل وعالي الكفاءة."
+                        "مرحباً بك! بصفتي Loqman، الرئيس التنفيذي للمنظومة، سأقود التنسيق الشامل لتنفيذ هذا الهدف "
+                        "عبر Compass للتخطيط وForge للتنفيذ، مع بوابة جودة قبل أي تسليم."
                     ),
                     "manager_id": "general_manager",
-                    "manager_name": "المدير العام",
-                    "title": "المدير العام للمنظومة",
+                    "manager_name": "Loqman",
+                    "title": "الرئيس التنفيذي · CEO",
                     "suggested_mission": {
                         "title": "مهمة تنفيذية شاملة عبر الإدارات",
                         "input_json": {
                             "goal": goal_text,
                             "department": "executive",
                             "pipeline": [
-                                "د. سارة (التخطيط والإستراتيجية)",
-                                "م. طارق (التحليل والمخاطر)",
-                                "أ. ياسمين (الجودة والاعتماد)"
+                                "Dr. Sara (التخطيط والإستراتيجية)",
+                                "Eng. Tarek (التحليل والمخاطر)",
+                                "Prof. Yasmin (الجودة والاعتماد)"
                             ]
                         }
                     }
@@ -381,7 +446,7 @@ class MockRuntime:
             cost=0.0,
             tokens={"input": 45, "output": 30, "reasoning": 10},
             duration_ms=duration_ms,
-            session_id="mock-session-id"
+            session_id=mock_session_id
         )
 
     async def abort_task(self, session_id: str) -> None:

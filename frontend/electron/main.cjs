@@ -1,25 +1,22 @@
-// AgentOS — Electron main process.
+// Loqman — Electron main process.
 //
 // CommonJS on purpose: frontend/package.json declares "type": "module", so
 // every file under electron/ must use the .cjs extension.
 'use strict';
 
-const { app, BrowserWindow, Menu, dialog, shell } = require('electron');
-const { spawn } = require('node:child_process');
-const fs = require('node:fs');
-const net = require('node:net');
+const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
 const path = require('node:path');
+const { WorkerClient, workerCommand, METHOD_RE } = require('./worker-client.cjs');
 
 const isDev = !app.isPackaged;
 
-app.setAppUserModelId('com.agentos.desktop');
-// Keep userData deterministic across dev and packaged builds: %APPDATA%\AgentOS
+app.setAppUserModelId('app.loqman.desktop');
+// Keep userData deterministic across dev and packaged builds: %APPDATA%\Loqman
 // (must run before the first getPath('userData') call).
-app.setName('AgentOS');
+app.setName('Loqman');
 
-const DEV_SERVER_URL = 'http://127.0.0.1:5173';
-const HEALTH_TIMEOUT_MS = 45000;
-const HEALTH_POLL_MS = 300;
+const DEV_SERVER_URL = process.env.AGENTOS_DEV_SERVER_URL;
+const READY_TIMEOUT_MS = 45000;
 const MAX_BACKEND_RESTARTS = 3;
 const BACKEND_LOG_LIMIT = 40; // Rolling buffer size (lines).
 const DIALOG_LOG_LINES = 10; // Backend lines shown in error dialogs.
@@ -32,8 +29,10 @@ const DIALOG_LOG_LINES = 10; // Backend lines shown in error dialogs.
 let mainWindow = null;
 /** @type {BrowserWindow | null} */
 let splashWindow = null;
-/** @type {import('node:child_process').ChildProcess | null} */
-let backendProcess = null;
+/** The Python worker (JSON Lines over stdin/stdout; no HTTP, no ports, no token). @type {WorkerClient | null} */
+let worker = null;
+/** stream_id -> webContents that opened it. @type {Map<string, Electron.WebContents>} */
+const streamOwners = new Map();
 let backendRestartCount = 0;
 let restartingBackend = false;
 let quitting = false;
@@ -47,10 +46,6 @@ const backendLog = [];
 // Small helpers
 // ---------------------------------------------------------------------------
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /** Appends one backend output line to the console + rolling buffer. */
 function logBackend(rawLine) {
   const line = String(rawLine).replace(/\s+$/, '');
@@ -63,147 +58,121 @@ function logBackend(rawLine) {
   }
 }
 
-/** Splits a child-process stream into lines and feeds logBackend. */
-function pipeBackendOutput(stream) {
-  if (!stream) return;
-  stream.setEncoding('utf8');
-  let pending = '';
-  stream.on('data', (chunk) => {
-    pending += chunk;
-    let newlineIndex;
-    while ((newlineIndex = pending.indexOf('\n')) !== -1) {
-      logBackend(pending.slice(0, newlineIndex));
-      pending = pending.slice(newlineIndex + 1);
-    }
-  });
-  stream.on('end', () => {
-    if (pending) logBackend(pending);
-  });
-}
-
 function tailOfBackendLog(lines) {
   if (backendLog.length === 0) return '(no backend output captured)';
   return backendLog.slice(-lines).join('\n');
 }
 
-/** Asks the OS for a free TCP port on 127.0.0.1. @returns {Promise<number>} */
-function getFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      const port = address && typeof address === 'object' ? address.port : null;
-      server.close(() => {
-        if (port) resolve(port);
-        else reject(new Error('Could not determine a free TCP port'));
-      });
-    });
+// ---------------------------------------------------------------------------
+// Backend (Python worker) lifecycle
+// ---------------------------------------------------------------------------
+
+function spawnBackend() {
+  const { command, args, options } = workerCommand({
+    isDev,
+    repoRoot: path.resolve(__dirname, '..', '..'),
+    resourcesPath: process.resourcesPath,
+    dataDir: app.getPath('userData'),
+    runtimeMode: process.env.RUNTIME_MODE || undefined,
   });
-}
-
-// ---------------------------------------------------------------------------
-// Backend process lifecycle
-// ---------------------------------------------------------------------------
-
-function resolveBackendCommand(port) {
-  if (isDev) {
-    const repoRoot = path.resolve(__dirname, '..', '..');
-    const venvPython = path.resolve(repoRoot, 'backend', '.venv', 'Scripts', 'python.exe');
-    const pythonExe = fs.existsSync(venvPython) ? venvPython : 'python';
-    return {
-      command: pythonExe,
-      args: ['-m', 'backend.app.cli', '--port', String(port)],
-      options: {
-        cwd: repoRoot,
-        env: { ...process.env },
-        windowsHide: true,
-      },
-    };
-  }
-  const backendExe = path.join(process.resourcesPath, 'agentos-backend.exe');
-  return {
-    command: backendExe,
-    args: ['--port', String(port), '--data-dir', app.getPath('userData')],
-    options: { windowsHide: true },
-  };
-}
-
-function spawnBackend(port) {
-  const { command, args, options } = resolveBackendCommand(port);
   logBackend(`spawning: ${command} ${args.join(' ')}`);
-
-  const child = spawn(command, args, options);
-  backendProcess = child;
-
-  pipeBackendOutput(child.stdout);
-  pipeBackendOutput(child.stderr);
-
-  child.once('error', (error) => {
-    logBackend(`failed to spawn backend: ${error.message}`);
-    if (child === backendProcess) backendProcess = null;
-    // Startup/restart flows notice via waitForBackend(); there is nothing to
-    // kill and no crash dialog to show here.
+  const child = new WorkerClient();
+  worker = child;
+  child.on('log', logBackend);
+  child.on('stream', (msg) => {
+    const owner = streamOwners.get(msg.stream_id);
+    if (owner && !owner.isDestroyed()) owner.send('agentos:stream', msg);
   });
-
-  child.once('exit', (code, signal) => {
-    if (child !== backendProcess) return; // Already cleaned up (shutdown/kill).
-    backendProcess = null;
+  child.on('stream_end', (msg) => {
+    const owner = streamOwners.get(msg.stream_id);
+    streamOwners.delete(msg.stream_id);
+    if (owner && !owner.isDestroyed()) owner.send('agentos:stream', msg);
+  });
+  child.on('exit', ({ code, signal }) => {
+    if (child !== worker) return; // Already cleaned up (shutdown/kill/restart).
+    worker = null;
+    streamOwners.clear();
     if (quitting) return; // Expected exit during shutdown.
     if (!mainWindow || mainWindow.isDestroyed()) return; // Startup/restart reports it.
     void promptBackendCrash(code, signal);
   });
-
+  child.start({ command, args, options }).catch(() => {
+    // Startup/restart flows notice via waitForBackend(); nothing else to do here.
+  });
   return child;
 }
 
-/** Polls GET /api/health until the backend answers or the timeout elapses. */
-async function waitForBackend(port) {
-  const url = `http://127.0.0.1:${port}/api/health`;
-  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
-
-  while (Date.now() < deadline) {
-    if (quitting) throw new Error('App is quitting');
-
-    const child = backendProcess;
-    if (!child) throw new Error('Backend process failed to start');
-    if (child.exitCode !== null) {
-      throw new Error(`Backend exited before becoming healthy (exit code ${child.exitCode})`);
-    }
-
-    try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
-      if (response.ok) return;
-    } catch {
-      // Not listening yet — retry until the deadline.
-    }
-    await delay(HEALTH_POLL_MS);
+/** Resolves when the worker printed its ready line; rejects on fatal/exit/timeout. */
+async function waitForBackend() {
+  const child = worker;
+  if (!child) throw new Error('Backend process failed to start');
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Backend did not become ready within ${Math.round(READY_TIMEOUT_MS / 1000)}s`)),
+      READY_TIMEOUT_MS,
+    );
+  });
+  try {
+    await Promise.race([child.ready, timeout]);
+  } finally {
+    clearTimeout(timer);
   }
-
-  throw new Error(
-    `Backend did not become healthy within ${Math.round(HEALTH_TIMEOUT_MS / 1000)}s (${url})`,
-  );
 }
 
-/** Kills the backend process tree; safe to call multiple times. */
+/** Kills the worker process tree; safe to call multiple times. */
 function killBackendTree() {
-  const child = backendProcess;
-  backendProcess = null; // Prevent the exit handler from treating this as a crash.
-  if (!child || child.exitCode !== null) return;
+  const child = worker;
+  worker = null; // Prevent the exit handler from treating this as a crash.
+  streamOwners.clear();
+  if (child) child.kill();
+}
 
-  if (process.platform === 'win32' && child.pid) {
-    try {
-      spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
-    } catch (error) {
-      console.error('[backend] taskkill failed:', error);
+/** Renderer -> worker bridge. Only the main window may call; `shutdown` is never exposed. */
+function registerIpc() {
+  const fromMainWindow = (event) =>
+    !!mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents;
+
+  ipcMain.handle('agentos:call', async (event, method, params) => {
+    if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
+    if (typeof method !== 'string' || !METHOD_RE.test(method) || method === 'shutdown') {
+      throw new Error('Invalid method');
     }
-  }
-  try {
-    child.kill(); // Fallback (and the primary path on non-Windows).
-  } catch {
-    // Process already gone.
-  }
+    if (!worker) throw new Error('Backend is not running');
+    try {
+      return await worker.request(method, params && typeof params === 'object' ? params : {});
+    } catch (error) {
+      // Errors cross IPC as plain data (status + detail), never as Error objects.
+      const status = error && error.status;
+      const detail = error && error.detail !== undefined ? error.detail : error && error.message;
+      throw new Error(JSON.stringify({ status: status || null, detail: detail ?? 'Request failed' }));
+    }
+  });
+
+  ipcMain.handle('agentos:stream-open', async (event, topic, id, lastEventId) => {
+    if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
+    if (!worker) throw new Error('Backend is not running');
+    const params = { topic, id };
+    if (Number.isInteger(lastEventId) && lastEventId > 0) params.last_event_id = lastEventId;
+    try {
+      const { stream_id: streamId } = await worker.request('stream.open', params, 15000);
+      streamOwners.set(streamId, event.sender);
+      return streamId;
+    } catch (error) {
+      throw new Error(JSON.stringify({ status: (error && error.status) || null, detail: (error && error.detail) || (error && error.message) || 'Stream failed' }));
+    }
+  });
+
+  ipcMain.handle('agentos:stream-close', async (event, streamId) => {
+    if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
+    if (typeof streamId !== 'string' || !worker) return false;
+    streamOwners.delete(streamId);
+    try {
+      return (await worker.request('stream.close', { stream_id: streamId }, 5000)).closed;
+    } catch {
+      return false;
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +236,7 @@ function applySplashStatus() {
 // Main window
 // ---------------------------------------------------------------------------
 
-function createMainWindow(port) {
+function createMainWindow() {
   const win = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -283,7 +252,6 @@ function createMainWindow(port) {
       contextIsolation: true,
       nodeIntegration: false,
       preload: path.join(__dirname, 'preload.cjs'),
-      additionalArguments: ['--agentos-api=http://127.0.0.1:' + port + '/api'],
     },
   });
 
@@ -308,7 +276,7 @@ function createMainWindow(port) {
     if (mainWindow === win) mainWindow = null;
   });
 
-  if (isDev) {
+  if (isDev && DEV_SERVER_URL) {
     // The vite dev server may still be starting up; retry a few times.
     let loadAttempts = 0;
     const loadDevServer = () => {
@@ -320,7 +288,10 @@ function createMainWindow(port) {
     };
     loadDevServer();
   } else {
-    win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+    win.loadFile(path.join(__dirname, '..', 'dist', 'index.html')).catch((error) => {
+      dialog.showErrorBox('Loqman could not load the interface',
+        `Could not load the application files. Run npm run build in the frontend folder.\n\n${error.message}`);
+    });
   }
 
   return win;
@@ -371,7 +342,7 @@ function handleStartupFailure(error) {
   void (async () => {
     const result = await dialog.showMessageBox({
       type: 'error',
-      title: 'AgentOS failed to start',
+      title: 'Loqman failed to start',
       message,
       detail: `Last backend output:\n${tailOfBackendLog(DIALOG_LOG_LINES)}`,
       buttons: ['Retry', 'Quit'],
@@ -395,14 +366,17 @@ async function boot() {
   setSplashStatus('Starting backend…');
 
   try {
-    const port = await getFreePort();
-    spawnBackend(port);
-    setSplashStatus(`Waiting for backend on 127.0.0.1:${port}…`);
-    await waitForBackend(port);
+    // A recovery re-boot (second-instance with no windows) keeps the healthy
+    // backend that is already running instead of spawning a duplicate.
+    if (!worker || worker.exited) {
+      spawnBackend();
+      setSplashStatus('Waiting for the backend…');
+    }
+    await waitForBackend();
 
     if (quitting) return;
     setSplashStatus('Backend ready — loading workspace…');
-    createMainWindow(port);
+    createMainWindow();
   } catch (error) {
     handleStartupFailure(error);
   }
@@ -413,8 +387,8 @@ async function promptBackendCrash(code, signal) {
 
   const options = {
     type: 'error',
-    title: 'AgentOS backend stopped',
-    message: `The AgentOS backend exited unexpectedly (code ${code === null ? 'n/a' : code}, signal ${signal || 'none'}).`,
+    title: 'Loqman backend stopped',
+    message: `The Loqman backend exited unexpectedly (code ${code === null ? 'n/a' : code}, signal ${signal || 'none'}).`,
     detail: `Last backend output:\n${tailOfBackendLog(DIALOG_LOG_LINES)}`,
     buttons: ['Restart backend', 'Quit'],
     defaultId: 0,
@@ -441,8 +415,8 @@ async function restartBackend() {
   if (backendRestartCount >= MAX_BACKEND_RESTARTS) {
     quitting = true;
     dialog.showErrorBox(
-      'AgentOS backend keeps stopping',
-      `The backend has already been restarted ${backendRestartCount} times. AgentOS will now quit.\n\nLast backend output:\n${tailOfBackendLog(DIALOG_LOG_LINES)}`,
+      'Loqman backend keeps stopping',
+      `The backend has already been restarted ${backendRestartCount} times. Loqman will now quit.\n\nLast backend output:\n${tailOfBackendLog(DIALOG_LOG_LINES)}`,
     );
     app.quit();
     return;
@@ -466,13 +440,12 @@ async function restartBackend() {
   killBackendTree();
 
   try {
-    const port = await getFreePort();
-    spawnBackend(port);
-    await waitForBackend(port);
+    spawnBackend();
+    await waitForBackend();
 
     if (quitting) return;
     setSplashStatus('Backend ready — reloading workspace…');
-    createMainWindow(port);
+    createMainWindow();
   } catch (error) {
     handleStartupFailure(error);
   } finally {
@@ -486,8 +459,24 @@ async function restartBackend() {
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 
+// Exit-trace diagnostics: a silent quit must never be undiscoverable again.
+// Every exit path prints WHY it fired (all output lands in the app log).
+for (const [signal, handler] of [
+  ['uncaughtException', (error) => console.error('[exit-trace] uncaughtException:', error)],
+  ['unhandledRejection', (reason) => console.error('[exit-trace] unhandledRejection:', reason)],
+]) {
+  process.on(signal, handler);
+}
+app.on('render-process-gone', (_event, details) => {
+  console.error('[exit-trace] renderer gone:', JSON.stringify(details));
+});
+app.on('child-process-gone', (_event, details) => {
+  console.error('[exit-trace] child process gone:', JSON.stringify(details));
+});
+
 if (!hasSingleInstanceLock) {
-  // Another AgentOS instance owns the app — hand over and exit.
+  // Another Loqman instance owns the app — hand over and exit.
+  console.error('[exit-trace] single-instance lock NOT acquired — quitting immediately');
   app.quit();
 } else {
   app.on('second-instance', () => {
@@ -496,22 +485,47 @@ if (!hasSingleInstanceLock) {
       if (target.isMinimized()) target.restore();
       target.show();
       target.focus();
+      return;
     }
+    // Windowless instance still holding the lock (a stalled quit): recover by
+    // booting the workspace again instead of ignoring every future launch.
+    console.error('[exit-trace] second-instance with no windows — rebooting UI');
+    void boot();
   });
 
+  registerIpc();
   app.whenReady().then(boot);
 
   app.on('window-all-closed', () => {
+    console.error('[exit-trace] window-all-closed firing (all windows are gone)');
     if (restartingBackend) return; // Restart flow briefly recreates windows.
     if (process.platform !== 'darwin') {
       quitting = true;
-      killBackendTree();
-      app.quit();
+      app.quit(); // before-quit stops the worker gracefully
     }
   });
 
-  app.on('before-quit', () => {
+  let stoppingWorker = false;
+  app.on('before-quit', (event) => {
     quitting = true;
-    killBackendTree();
+    // Graceful: the worker persists in-flight runs as interrupted before exiting.
+    if (worker && !stoppingWorker) {
+      stoppingWorker = true;
+      event.preventDefault();
+      const closing = worker;
+      worker = null;
+      streamOwners.clear();
+      closing.stop(5000).catch(() => {}).finally(() => {
+        closing.kill();
+        app.quit();
+      });
+    }
+    // Hard-exit watchdog: a stalled graceful quit used to leave the main
+    // process alive while holding the single-instance lock — every later
+    // launch then exited silently ("the app won't open"). Never again.
+    setTimeout(() => {
+      console.error('[exit-trace] graceful quit stalled — forcing process exit');
+      process.exit(0);
+    }, 9000).unref();
   });
 }

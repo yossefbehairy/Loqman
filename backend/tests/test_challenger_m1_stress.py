@@ -203,10 +203,10 @@ def test_stress_profile_not_found(client: TestClient):
 def test_stress_chat_all_4_managers_personas_and_no_auto_mission(client: TestClient):
     """
     Empirically verifies POST /api/chat for all 4 required manager personas:
-    1. dr_sara -> Planning & Strategy Manager (د. سارة)
-    2. eng_tarek -> Analysis & Risk Manager (م. طارق)
-    3. prof_yasmin -> Quality & Review Manager (أ. ياسمين)
-    4. general_manager -> General Manager (المدير العام)
+    1. dr_sara -> Planning & Strategy Manager (Dr. Sara)
+    2. eng_tarek -> Execution & Engineering Manager (Eng. Tarek)
+    3. prof_yasmin -> Quality & Review Manager (Prof. Yasmin)
+    4. general_manager -> Loqman, the CEO
 
     Verifies persona-specific reply, manager metadata, and that consultation
     chats never auto-suggest a mission.
@@ -214,29 +214,29 @@ def test_stress_chat_all_4_managers_personas_and_no_auto_mission(client: TestCli
     test_cases = [
         {
             "manager_id": "dr_sara",
-            "name_keyword": "سارة",
+            "name_keyword": "Sara",
             "title_keyword": "التخطيط",
             "expected_department": "planning",
             "mission_key": "phases",
         },
         {
             "manager_id": "eng_tarek",
-            "name_keyword": "طارق",
-            "title_keyword": "التحليل",
+            "name_keyword": "Tarek",
+            "title_keyword": "التنفيذ",
             "expected_department": "analysis",
             "mission_key": "risk_focus",
         },
         {
             "manager_id": "prof_yasmin",
-            "name_keyword": "ياسمين",
+            "name_keyword": "Yasmin",
             "title_keyword": "الجودة",
             "expected_department": "quality",
             "mission_key": "quality_gates",
         },
         {
             "manager_id": "general_manager",
-            "name_keyword": "المدير العام",
-            "title_keyword": "المدير العام",
+            "name_keyword": "Loqman",
+            "title_keyword": "الرئيس التنفيذي",
             "expected_department": "executive",
             "mission_key": "pipeline",
         },
@@ -276,10 +276,10 @@ def test_stress_chat_with_primary_keys(client: TestClient):
     (planner, analyst, reviewer, custom) also yields the corresponding personas.
     """
     primary_map = [
-        ("planner", "سارة", "planning"),
-        ("analyst", "طارق", "analysis"),
-        ("reviewer", "ياسمين", "quality"),
-        ("custom", "المدير العام", "executive"),
+        ("planner", "Sara", "planning"),
+        ("analyst", "Tarek", "analysis"),
+        ("reviewer", "Yasmin", "quality"),
+        ("custom", "Loqman", "executive"),
     ]
     for pk, expected_name, expected_dept in primary_map:
         payload = {"manager_id": pk, "message": "استشارة تجريبية"}
@@ -344,12 +344,12 @@ def test_stress_chat_payload_edge_cases(client: TestClient):
     # 3. Missing manager_id defaults cleanly to general_manager -> 200 OK
     res_default_gm = client.post("/api/chat", json={"message": "هدف عام للمنظومة"})
     assert res_default_gm.status_code == 200
-    assert "المدير العام" in res_default_gm.json()["manager_name"]
+    assert "Loqman" in res_default_gm.json()["manager_name"]
 
     # 4. Null manager_id defaults cleanly to general_manager -> 200 OK
     res_null_gm = client.post("/api/chat", json={"manager_id": None, "message": "هدف عام للمنظومة"})
     assert res_null_gm.status_code == 200
-    assert "المدير العام" in res_null_gm.json()["manager_name"]
+    assert "Loqman" in res_null_gm.json()["manager_name"]
 
     # 5. Very long user message (15,000 characters)
     long_msg = "وصف تفصيلي جداً للمشروع: " + ("نطاق العمل والتحديات التقنية " * 500)
@@ -368,7 +368,7 @@ def test_stress_chat_payload_edge_cases(client: TestClient):
         "history": history
     })
     assert res_hist.status_code == 200
-    assert "طارق" in res_hist.json()["manager_name"]
+    assert "Tarek" in res_hist.json()["manager_name"]
 
 
 # ============================================================================
@@ -391,7 +391,7 @@ def test_vulnerability_settings_json_non_dict_causes_chat_crash(client: TestClie
     assert chat_res.status_code == 200
     data = chat_res.json()
     assert data["manager_id"] == "dr_sara"
-    assert "سارة" in data["manager_name"]
+    assert "Sara" in data["manager_name"]
     assert data["suggested_mission"] is None
 
 
@@ -408,7 +408,7 @@ def test_vulnerability_settings_json_null_and_scalars_cause_chat_crash(client: T
 
         chat_res = client.post("/api/chat", json={"manager_id": "eng_tarek", "message": "استشارة"})
         assert chat_res.status_code == 200, f"Failed for {raw_json}: got status {chat_res.status_code}"
-        assert "طارق" in chat_res.json()["manager_name"]
+        assert "Tarek" in chat_res.json()["manager_name"]
 
 
 def test_vulnerability_path_consult_endpoint_crashes_on_non_dict_settings_json(client: TestClient):
@@ -421,7 +421,7 @@ def test_vulnerability_path_consult_endpoint_crashes_on_non_dict_settings_json(c
 
     res = client.post("/api/managers/prof_yasmin/consult", json={"message": "مصفوفة الجودة"})
     assert res.status_code == 200
-    assert "ياسمين" in res.json()["manager_name"]
+    assert "Yasmin" in res.json()["manager_name"]
 
 
 def test_agent_profile_settings_json_malformed_rejected(client: TestClient):

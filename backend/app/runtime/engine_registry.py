@@ -1,0 +1,21 @@
+"""Canonical engine lookup shared by setup/catalog APIs."""
+from backend.app.runtime.base import AgentRuntime
+
+
+ENGINE_IDS = ("opencode", "claude-code", "codex", "antigravity")
+
+
+def create_engine_runtime(engine_id: str) -> AgentRuntime:
+    if engine_id == "opencode":
+        from backend.app.runtime.opencode_runtime import RealOpenCodeRuntime
+        return RealOpenCodeRuntime()
+    if engine_id == "claude-code":
+        from backend.app.runtime.claude_runtime import ClaudeCodeRuntime
+        return ClaudeCodeRuntime()
+    if engine_id == "codex":
+        from backend.app.runtime.codex_runtime import CodexCliRuntime
+        return CodexCliRuntime()
+    if engine_id == "antigravity":
+        from backend.app.runtime.agy_acp_runtime import AgyAcpRuntime
+        return AgyAcpRuntime()
+    raise ValueError("Unknown engine")

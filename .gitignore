@@ -47,6 +47,8 @@ backend/build/
 *.db-wal
 *.sqlite
 *.sqlite3
+*.db.pre-v*.bak
+*.db.pre-restore-*.bak
 
 # Env / secrets (never commit)
 .env

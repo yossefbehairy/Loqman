@@ -277,11 +277,11 @@ def run_tool(db: Session, name: str, args: Dict[str, Any]) -> str:
     try:
         parsed = spec.args_model(**(args or {}))
     except Exception as e:
-        return f"ERROR: invalid args for '{name}': {str(e)[:300]}"
+        return f"ERROR: invalid args for '{name}'"
     try:
         return spec.handler(db, parsed)
     except Exception as e:
-        return f"ERROR: tool '{name}' failed: {str(e)[:300]}"
+        return f"ERROR: tool '{name}' failed"
 
 
 def pending_action_ids(db: Session) -> List[str]:
