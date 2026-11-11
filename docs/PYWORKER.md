@@ -67,13 +67,8 @@ re-run); dangling missions/workflows become `failed`.
 - **Browser dev / Playwright**: `frontend/vite-agentos-bridge.mjs` (serve-only Vite plugin) spawns the same worker.
 - **Frozen build**: `pyinstaller/agentos-worker.spec` -> `agentos-backend.exe` (verified: ready in ~1 s, runs/missions/CEO work).
 
-## Deleting the legacy backend - checklist
-Done: worker backend, Electron/React migration, Playwright e2e (43/43 via the dev bridge, mock engine), frozen exe smoke
-test, and a real Electron launch (isolated `--user-data-dir`, mock engine): bridge present, `shutdown` blocked, errors keep
-their status, mission + stream + CEO ask work, clean close.
-Still to do:
-1. Click through the real app once with your real engine (OpenCode/Claude/Codex): real engines were never run here.
-2. `npm run desktop:dist` with the new exe (copy `agentos-backend.exe` built from `agentos-worker.spec` into `frontend/build-resources/`).
-3. Then delete: `backend/app/`, `pyinstaller/agentos-backend.spec`, legacy tests (they import `backend.app`),
-   `test_schema_compat::test_new_ddl_matches_legacy_*` / `..._written_by_legacy_backend_...`; drop fastapi/uvicorn/
-   sqlalchemy/pydantic/httpx/sse-starlette from `backend/requirements.txt`; fix README/CONTRIBUTING mentions.
+## Status
+The legacy FastAPI backend (`backend/app`), its tests, its PyInstaller spec and the framework dependencies are removed.
+`backend/requirements.txt` only lists pytest and pytest-asyncio. Verified: backend suite 270 passed / 1 skipped, Playwright
+e2e 43/43 (via the dev bridge, mock engine), a real Electron launch (isolated user-data dir), and the frozen exe smoke test.
+Not verified here: live model calls with the real engines (OpenCode / Claude Code / Codex / Antigravity).

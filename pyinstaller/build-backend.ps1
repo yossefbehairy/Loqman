@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds the AgentOS FastAPI backend into a single-file Windows executable.
+    Builds the AgentOS Python worker (stdlib-only backend) into a single-file Windows executable.
 
 .DESCRIPTION
     Idempotent build: clears previous outputs, runs PyInstaller (ONEFILE spec)
@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 # --- Paths -------------------------------------------------------------------
 $RepoRoot  = Split-Path -Parent $PSScriptRoot            # D:\AgentOS
 $VenvPy    = Join-Path $RepoRoot "backend\.venv\Scripts\python.exe"
-$SpecFile  = Join-Path $RepoRoot "pyinstaller\agentos-backend.spec"
+$SpecFile  = Join-Path $RepoRoot "pyinstaller\agentos-worker.spec"
 $DistDir   = Join-Path $RepoRoot "backend\dist"
 $BuildDir  = Join-Path $RepoRoot "backend\build"
 $ExePath   = Join-Path $DistDir "agentos-backend.exe"

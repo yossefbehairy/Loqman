@@ -1,6 +1,6 @@
 # AgentOS — Desktop Application Guide (`DESKTOP.md`)
 
-Desktop packaging for AgentOS uses **Electron** (shell + UI) and **PyInstaller** (frozen FastAPI backend as a sidecar process). No Python or Node.js installation is required on the target machine — the installer ships everything.
+Desktop packaging for AgentOS uses **Electron** (shell + UI) and **PyInstaller** (frozen stdlib-only Python worker as a sidecar process). No Python or Node.js installation is required on the target machine — the installer ships everything.
 
 ---
 
@@ -13,7 +13,7 @@ AgentOS-Setup-x.x.x.exe (electron-builder · NSIS)
     │   ├── electron/         ← main.cjs · preload.cjs · splash.html
     │   └── dist/             ← built React frontend (vite, base "./")
     └── resources/
-        └── agentos-backend.exe   ← frozen FastAPI backend (PyInstaller onefile)
+        └── agentos-backend.exe   ← frozen Python worker (PyInstaller onefile)
 
 Runtime:
   Electron main ──spawns──▶ agentos-backend.exe --data-dir <userData>   (Python worker, stdlib only)
@@ -27,10 +27,10 @@ Key properties:
 | Property | Value |
 |---|---|
 | Renderer load path | `file://…/app.asar/dist/index.html` (packaged) or `http://127.0.0.1:5173` (dev) |
-| API base in renderer | `window.__AGENTOS_API__` (exposed by `electron/preload.cjs`); falls back to `/api` in a plain browser |
+| API in renderer | `window.agentos.call(method, params)` / `openStream(...)` (exposed by `electron/preload.cjs`); a plain browser uses the dev-only Vite bridge |
 | Backend transport | stdin/stdout pipes to the worker — no HTTP server, no ports, no token, no CORS |
 | Database location | `app.getPath('userData')` → `%APPDATA%\AgentOS\agentos.db` (WAL mode) |
-| Backend lifecycle | Killed with its process tree (`taskkill /PID <pid> /T /F`) on quit |
+| Backend lifecycle | Stopped gracefully on quit (`shutdown`, in-flight runs saved as interrupted); killed with its process tree if it lingers |
 | Single instance | Enforced via `app.requestSingleInstanceLock()` |
 
 ---
@@ -54,9 +54,9 @@ $env:AGENTOS_DEV_SERVER_URL = 'http://127.0.0.1:5173'
 npm run desktop
 ```
 
-With `AGENTOS_DEV_SERVER_URL` set, Electron loads the Vite server. Otherwise `npm run desktop` builds and loads the local `dist` files. Electron spawns the backend with the venv Python, creates a random local token, and sends authenticated requests to the dynamic backend port.
+With `AGENTOS_DEV_SERVER_URL` set, Electron loads the Vite server. Otherwise `npm run desktop` builds and loads the local `dist` files. Electron spawns the worker with the venv Python (`python -m backend.pyworker --data-dir <userData>`) and talks to it over stdin/stdout.
 
-For plain-browser development, set `AGENTOS_INSECURE_DEV=1` in the backend terminal before starting the backend on port 8000. This explicitly disables local-token authentication for that development process.
+For plain-browser development just run `npm run dev`: a serve-only Vite plugin (`frontend/vite-agentos-bridge.mjs`) spawns the same worker (`RUNTIME_MODE` from the environment, default mock; data in `.agentos-dev-data`).
 
 ---
 
@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -File pyinstaller\build-backend.ps1
 
 Output (idempotent, cleans previous artifacts):
 
-- `backend\dist\agentos-backend.exe` (onefile, ~19.5 MB)
+- `backend\dist\agentos-backend.exe` (onefile, ~11 MB)
 - copied automatically to `frontend\build-resources\agentos-backend.exe` (consumed by electron-builder `extraResources`)
 
 Verify the frozen backend standalone:
@@ -80,7 +80,7 @@ Verify the frozen backend standalone:
 powershell -ExecutionPolicy Bypass -File pyinstaller\smoke-test.ps1
 ```
 
-The smoke test spawns the exe on a temp port + temp data dir, polls `/api/health`, asserts `agentos.db` was created, then kills the process tree. Expected cold start: ~2–3 s.
+The smoke test spawns the exe with a temp data dir and the mock engine, waits for the `ready` line, sends `health`, asserts `agentos.db` was created, then sends `shutdown` and checks a clean exit. Expected cold start: ~1 s.
 
 ### Step 2 — Build the frontend
 
@@ -106,24 +106,22 @@ Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` 
 
 ## 4. Runtime Contract (do not break)
 
-**Backend CLI** (`backend/app/cli.py`):
+**Backend CLI** (`python -m backend.pyworker` / `agentos-backend.exe`):
 
 | Flag | Description |
 |---|---|
-| `--port <n>` | Bind port (overrides `PORT` env / `.env`) |
-| `--host <h>` | Bind host (default `127.0.0.1`) |
-| `--data-dir <path>` | SQLite lives at `<path>\agentos.db` (sets `AGENTOS_DATA_DIR`, overrides `SQLITE_DB_URL`) |
+| `--data-dir <path>` | SQLite lives at `<path>gentos.db` |
+| `--db <file>` | Explicit database file (alternative to `--data-dir`) |
+| `--runtime-mode real\|mock\|claude\|codex\|agy` | Overrides `RUNTIME_MODE` |
 
-Arguments are applied to `os.environ` **before** `backend.app.config` is imported (the Settings singleton and SQLAlchemy engine are created at import time).
-
-**Health endpoint:** `GET /api/health` → `{"status":"ok","app_name":"AgentOS","version":"..."}` — used by the Electron boot splash and the smoke test.
+**Protocol:** JSON Lines on stdin/stdout (`agentos-worker/1`, see `docs/PYWORKER.md`). The first stdout line is `ready`; startup failures send a `fatal` line and exit with code 2. Logs go to stderr only.
 
 **Preload bridge:** `electron/preload.cjs` exposes exactly two globals via `contextBridge` (context isolation ON, node integration OFF):
 
-- `window.__AGENTOS_API__` — e.g. `http://127.0.0.1:53421/api` (includes the `/api` suffix)
+- `window.agentos` — `call(method, params)` and `openStream(topic, id, lastEventId, onMessage)`
 - `window.__AGENTOS_DESKTOP__` — `true`
 
-Any new frontend network call must go through `frontend/src/api/client.ts` (`API_BASE`), including `EventSource` URLs.
+Any new frontend backend call must go through `frontend/src/api/client.ts` (`call` from `transport.ts`); event streams use `openStream`.
 
 ---
 
@@ -131,10 +129,9 @@ Any new frontend network call must go through `frontend/src/api/client.ts` (`API
 
 | Symptom | Cause / Fix |
 |---|---|
-| Splash shows "backend failed to start" | Read the last `[backend]` log lines shown on the splash. Typical: port race (relaunch), or antivirus quarantined `agentos-backend.exe` |
+| Splash shows "backend failed to start" | Read the last `[backend]` log lines shown on the splash. Typical: antivirus quarantined `agentos-backend.exe`, or a database newer than this version |
 | Packaging fails: `file not found: build-resources\agentos-backend.exe` | Run Step 1 (PyInstaller build) first |
 | Blank window in packaged app | `base: './'` missing from `vite.config.ts`, or `dist/` not rebuilt before packaging |
-| CORS error in renderer console | Origin `null` (file://) must stay in `CORS_ORIGINS` (`backend/app/config.py`) |
 | Missions never progress | The AI runtime (`OPENCODE_BASE_URL`, default `http://127.0.0.1:49100`) is external to the desktop package and must be running |
 | Windows SmartScreen / AV warning | Unsigned build. Sign the exe / installer with a code-signing certificate before wide distribution |
 
@@ -145,10 +142,6 @@ Any new frontend network call must go through `frontend/src/api/client.ts` (`API
 - AI CLIs are **not** bundled — the user installs and signs in to each engine. OpenCode uses `127.0.0.1:49100`; Claude Code, Codex and Antigravity use their installed CLIs. Browse/UI/data features work offline, and `mock` is available for deterministic demos.
 - No code signing, no auto-updater yet (planned: GitHub Releases + `electron-updater`).
 - App icon: custom multi-size `frontend/build/icon.ico` (regenerate via any SVG→ICO tool if the brand changes).
-- uvicorn runs with `h11` only (no `websockets` dependency installed); REST + SSE are unaffected.
+- The worker is single-process and does its (small) SQLite writes on the event loop; engine calls run as subprocesses, so the loop stays responsive.
 
 
-> **Update:** the sections above that mention ports, `/api/health`, tokens, CORS, uvicorn and `backend/app/cli.py`
-> describe the legacy FastAPI backend. The desktop app now talks to the Python worker (`backend/pyworker`,
-> see `docs/PYWORKER.md`). Plain-browser dev uses the Vite dev bridge (`frontend/vite-agentos-bridge.mjs`, serve-only).
-> Frozen build spec: `pyinstaller/agentos-worker.spec`.

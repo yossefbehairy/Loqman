@@ -28,7 +28,7 @@ AgentOS adheres to the **Agentic SDLC Quality Standards**, rejecting brittle sup
 
 ### Tier 2: Backend API Contracts & Database Integrity
 - **Scope**: REST endpoints, SQLite foreign key cascades, transaction atomicity, agent profile persistence, and direct manager consultation APIs (`POST /api/chat`, `PUT /api/agent-profiles/{id}`).
-- **Execution Target**: Pytest across `backend/tests/`; the current backend suite reports 560 passed, 6 skipped at its latest complete run. Fixtures use temporary file-backed SQLite with WAL and separate connections so worker-thread usage writes resemble production.
+- **Execution Target**: Pytest across `backend/tests/`; the current backend suite reports 270 passed, 1 skipped at its latest complete run. Worker tests run the real Python worker as a child process (or drive `Application` in-process) on temporary file-backed SQLite.
 - **Guarantees**: Verifies strict JSON serialization, SQLite WAL mode, foreign key enforcement (`PRAGMA foreign_keys=ON`), and persona seeded records.
 
 ### Tier 3: Playwright End-to-End User Journeys (R1 through R5)
@@ -55,23 +55,23 @@ Every requirement outlined in `ORIGINAL_REQUEST.md` is strictly traceable to an 
 |----------------|----------------------|--------------------------|------------------------------|------------------|
 | **R1.1** | Minimalist Landing: clean workspace with no canvas clutter | `frontend/src/components/company/CompanyView.tsx` | `frontend/e2e/r1_executive_chat.spec.ts` | M2 |
 | **R1.2** | Persona Selection: CEO and managers in the Conversations agent list | `frontend/src/components/conversations/ConversationsView.tsx` | `frontend/e2e/r1_executive_chat.spec.ts` | M2 |
-| **R1.3** | Manager Consultation & Delegated Mission Flow | `ConversationsView.tsx`, `backend/app/api/routes/missions.py` | `frontend/e2e/r1_executive_chat.spec.ts` | M1, M2 |
+| **R1.3** | Manager Consultation & Delegated Mission Flow | `ConversationsView.tsx`, `backend/pyworker/api/missions.py` | `frontend/e2e/r1_executive_chat.spec.ts` | M1, M2 |
 | **R1.4** | Sidebar Navigation: 1-click switching across all 7 views | `frontend/src/App.tsx` (inline sidebar nav) | `frontend/e2e/r1_executive_chat.spec.ts` | M2 |
 | **R2.1** | Hierarchical Department Structure (Planning, Research, QA) | `CompanyView.tsx`, `frontend/src/components/company/CompanyOrgChart.tsx` | `frontend/e2e/r2_organization_hierarchy.spec.ts` | M3 |
 | **R2.2** | Visual Designation: `Manager` / `Executive` / `Specialist` role tags | `CompanyView.tsx` inspector (`os-tag-amber` / `os-tag-mono` / `os-tag-green`) | `frontend/e2e/r2_organization_hierarchy.spec.ts` | M3, M4 |
-| **R2.3** | Natural Naming (د. سارة, م. طارق, أ. ياسمين, أحمد, خالد, ليلى) | `backend/app/runtime/mock_runtime.py`, `frontend/src/components/modals/NewTeamModal.tsx` | `frontend/e2e/r2_organization_hierarchy.spec.ts` | M1, M3 |
+| **R2.3** | Natural Naming (د. سارة, م. طارق, أ. ياسمين, أحمد, خالد, ليلى) | `backend/pyworker/runtime/mock_runtime.py`, `frontend/src/components/modals/NewTeamModal.tsx` | `frontend/e2e/r2_organization_hierarchy.spec.ts` | M1, M3 |
 | **R3.1** | Custom System Prompt Editing | `frontend/src/components/modals/ContractModal.tsx` | `frontend/e2e/r3_contracts_and_prompts.spec.ts` | M3 |
 | **R3.2** | Strict Execution Contract (Strict JSON, Retry Bound 0-5, Timeout) | `ContractModal.tsx`, `frontend/src/components/settings/SettingsView.tsx`, `PUT /api/agent-profiles/{id}` | `frontend/e2e/r3_contracts_and_prompts.spec.ts` | M1, M3 |
-| **R3.3** | Zero-Cost Model Catalog & Reasoning Variants (DeepSeek Free, Muse Spark; low, high, max) | `backend/app/api/routes/models.py`, `ContractModal.tsx` | `frontend/e2e/r3_contracts_and_prompts.spec.ts` | M1, M3 |
+| **R3.3** | Zero-Cost Model Catalog & Reasoning Variants (DeepSeek Free, Muse Spark; low, high, max) | `backend/pyworker/api/system.py`, `ContractModal.tsx` | `frontend/e2e/r3_contracts_and_prompts.spec.ts` | M1, M3 |
 | **R4.1** | Interactive Agent Map with Department Zones/Groupings | `frontend/src/components/company/CompanyGraphCanvas.tsx`, `CompanyView.tsx` (focus chips) | `frontend/e2e/r4_interactive_agent_map.spec.ts` | M4 |
 | **R4.2** | Execution Telemetry: completed duration in ms | `frontend/src/components/inbox/InboxView.tsx` review meta | `frontend/e2e/r4_interactive_agent_map.spec.ts` | M4 |
 | **R4.3** | Node Contract Inspection & Deliverable Preview | `frontend/src/components/company/AgentDetailPanel.tsx`, `frontend/src/components/modals/TaskInspectionModal.tsx` | `frontend/e2e/r4_interactive_agent_map.spec.ts` | M4 |
 | **R5.1** | Chronological Inter-Agent Feed Shell (Slack/Discord style) | `frontend/src/components/stream/TeamStreamView.tsx` | `frontend/e2e/r5_team_chat_stream.spec.ts` | M5 |
-| **R5.2** | Recorded Handover Progression (delegation turn, deliverable, sender labels) | `TaskInspectionModal.tsx`, `backend/app/runtime/mock_runtime.py` | `frontend/e2e/r5_team_chat_stream.spec.ts` | M5 |
+| **R5.2** | Recorded Handover Progression (delegation turn, deliverable, sender labels) | `TaskInspectionModal.tsx`, `backend/pyworker/runtime/mock_runtime.py` | `frontend/e2e/r5_team_chat_stream.spec.ts` | M5 |
 | **R5.3** | Expandable JSON Deliverables & Live Feed Ordering | `TaskInspectionModal.tsx`, `ConversationsView.tsx` mission polling | `frontend/e2e/r5_team_chat_stream.spec.ts` | M5 |
 | **G1** | Obsidian-Style Physics Graph (repulsion, link distance, gravity, pulse, labels) | `CompanyGraphCanvas.tsx` | `frontend/e2e/obsidian_physics_graph.spec.ts` | M4 |
 | **C1** | Workspace Craft Sweep (shell, Inbox, Results, Settings, modals, stream) | `App.tsx` shell + `frontend/src/components/*` views | `frontend/e2e/agentos_ui_craft.spec.ts` | M2-M6 |
-| **C2** | CEO Control Plane: ask over live company data + human-confirmed proposals (P1-P3), with approved teams materialized into the Company view | `frontend/src/components/ceo/CeoControlView.tsx`, `frontend/src/api/client.ts`, `frontend/src/App.tsx`, `backend/app/api/routes/ceo.py` | `frontend/e2e/ceo_control_plane.spec.ts` | P1-P3 |
+| **C2** | CEO Control Plane: ask over live company data + human-confirmed proposals (P1-P3), with approved teams materialized into the Company view | `frontend/src/components/ceo/CeoChatView.tsx`, `frontend/src/api/client.ts`, `frontend/src/App.tsx`, `backend/pyworker/api/ceo.py` | `frontend/e2e/ceo_control_plane.spec.ts` | P1-P3 |
 
 ### P3 approval → Company materialization
 Approving a `new_team` / `new_profile` action returns the really-created profile rows (`created_profiles`) and the proposed `team_name` in `ActionOut`. `CeoControlView.tsx` forwards them through `onProfilesCreated`; `App.tsx` re-fetches `/api/agent-profiles` for full contracts (falling back to the shallow response rows if that fetch fails) and appends one `Team` plus one `Agent` per profile to the local company state that feeds the Company graph and org chart. The dedicated E2E case asserts the approved team and all three members appear in the org chart right after approval.
@@ -82,9 +82,9 @@ Approving a `new_team` / `new_profile` action returns the really-created profile
 
 ### 4.1 Playwright Test Configuration
 - **Runner**: `@playwright/test` v1.64.1, `testDir: ./e2e`, single Chromium project (headless)
-- **Base URL**: `http://127.0.0.1:5173` (Vite dev server, proxying `/api` to the backend on `http://127.0.0.1:8000`)
+- **Base URL**: `http://127.0.0.1:5173` (Vite dev server; its dev-only bridge spawns the Python worker)
 - **Determinism**: `workers: 1`, `retries: 0`, `trace: on-first-retry`
-- **Managed Servers**: the config auto-starts both the Vite dev server and `uvicorn backend.app.main:app` (with `reuseExistingServer: true`)
+- **Managed Servers**: the config auto-starts the Vite dev server only; its bridge spawns `python -m backend.pyworker` with `RUNTIME_MODE=mock` and an isolated data dir (`reuseExistingServer: true`)
 - **Runtime Mode**: export `RUNTIME_MODE=mock` before any run; the mock runtime serves deterministic, zero-cost responses and the free-model catalog
 - **Isolation Principle**: each test opens a fresh browser context with clean `localStorage`; specs seed their own teams and missions through the UI
 
@@ -150,7 +150,7 @@ A composer message that names a role in the delegation grammar ("Delegate this m
 | Metric | Target Threshold | Enforcement Mechanism |
 |--------|------------------|----------------------|
 | **Playwright E2E Suite Pass Rate** | **100%** (0 failures, 0 skipped) | `npm test` with `RUNTIME_MODE=mock` / CI Pipeline |
-| **Pytest Backend Suite Pass Rate** | **560 passed, 6 skipped** at last complete run | `backend\.venv\Scripts\python.exe -m pytest backend\tests -q` |
+| **Pytest Backend Suite Pass Rate** | **270 passed, 1 skipped** at last complete run | `backend\.venv\Scripts\python.exe -m pytest backend\tests -q` |
 | **Requirements Traceability (R1-R5)** | **100%** | Audit against `TEST_INFRA.md` |
 | **TypeScript Typecheck** | **0 errors** | `tsc -b` |
 | **Linter Compliance** | **0 errors** | `npm run lint` (`oxlint`) |

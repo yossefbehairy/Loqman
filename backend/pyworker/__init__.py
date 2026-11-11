@@ -1,8 +1,8 @@
-"""AgentOS Python worker (phase 1): stdlib-only, JSON Lines over stdin/stdout.
+"""AgentOS Python worker: the whole backend, stdlib-only, JSON Lines over stdin/stdout.
 
-This package must never import ``backend.app`` (FastAPI/SQLAlchemy/Pydantic
-land) or any third-party module. ``backend/tests/test_pyworker_imports.py``
-enforces that by actually running the worker with those modules blocked.
+This package must never import a web framework, an ORM, Pydantic or any other
+third-party module. ``backend/tests/test_pyworker_imports.py`` enforces that by
+running the real worker with those modules blocked. Docs: docs/PYWORKER.md.
 """
 
 PROTOCOL = "agentos-worker/1"

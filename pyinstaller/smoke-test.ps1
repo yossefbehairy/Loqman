@@ -1,79 +1,60 @@
 <#
 .SYNOPSIS
-    Smoke test for the frozen agentos-backend.exe (ONEFILE build).
+    Smoke test for the frozen agentos-backend.exe (stdlib-only Python worker).
 
 .DESCRIPTION
-    Spawns the exe with a fresh --data-dir, polls /api/health until the first
-    200 response (measuring cold start), verifies agentos.db was created inside
-    the data dir, then kills the process tree and dumps the logs.
+    Spawns the exe with a fresh --data-dir and the mock engine, waits for the
+    "ready" line (cold start), sends `health`, checks agentos.db was created,
+    then asks the worker to shut down and verifies it exits cleanly.
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File pyinstaller\smoke-test.ps1 -Port 8231
+    powershell -ExecutionPolicy Bypass -File pyinstaller\smoke-test.ps1
 #>
 param(
-    [int]$Port = 8231,
-    [int]$TimeoutSec = 120,
+    [int]$TimeoutSec = 60,
     [string]$ExePath = (Join-Path (Split-Path -Parent $PSScriptRoot) "backend\dist\agentos-backend.exe")
 )
 
 $ErrorActionPreference = "Stop"
-
 if (-not (Test-Path $ExePath)) { throw "exe not found: $ExePath (build it first)" }
 
-# Fresh temp data dir, like the Electron shell would pass via --data-dir.
 $tmp = Join-Path $env:TEMP ("agentos-smoke-" + (Get-Random))
 New-Item -ItemType Directory -Path $tmp | Out-Null
-$stdout = Join-Path $tmp "stdout.log"
-$stderr = Join-Path $tmp "stderr.log"
-
 Write-Host "Exe      : $ExePath"
-Write-Host "Port     : $Port"
 Write-Host "Data dir : $tmp"
 
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $ExePath
+$psi.Arguments = "--data-dir `"$tmp`" --runtime-mode mock"
+$psi.RedirectStandardInput = $true
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-$proc = Start-Process -FilePath $ExePath `
-    -ArgumentList "--port", $Port, "--data-dir", $tmp `
-    -PassThru `
-    -RedirectStandardOutput $stdout `
-    -RedirectStandardError $stderr
-
-$health = $null
-$coldStartSec = $null
+$proc = [System.Diagnostics.Process]::Start($psi)
 try {
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ($true) {
-        if ($proc.HasExited) { throw "process exited early with code $($proc.ExitCode) - see $stderr" }
-        if ((Get-Date) -gt $deadline) { throw "no /api/health response within $TimeoutSec s" }
-        try {
-            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 5
-            $coldStartSec = [math]::Round($sw.Elapsed.TotalSeconds, 2)
-            break
-        } catch {
-            Start-Sleep -Milliseconds 500
-        }
-    }
+    $readyTask = $proc.StandardOutput.ReadLineAsync()
+    if (-not $readyTask.Wait($TimeoutSec * 1000)) { throw "no ready line within $TimeoutSec s" }
+    $cold = [math]::Round($sw.Elapsed.TotalSeconds, 2)
+    $ready = $readyTask.Result | ConvertFrom-Json
+    if ($ready.type -ne "ready") { throw "unexpected first line: $($readyTask.Result)" }
+    Write-Host "Ready in $cold s  (protocol $($ready.protocol), $($ready.methods) methods)"
+
+    $proc.StandardInput.WriteLine('{"id":1,"method":"health"}')
+    $line = $proc.StandardOutput.ReadLine()
+    Write-Host "Health   : $line"
+    if (($line | ConvertFrom-Json).result.status -ne "ok") { throw "health failed" }
+
+    if (-not (Test-Path (Join-Path $tmp "agentos.db"))) { throw "agentos.db was not created" }
+    $proc.StandardInput.WriteLine('{"id":2,"method":"shutdown"}')
+    $null = $proc.StandardOutput.ReadLine()
+    if (-not $proc.WaitForExit(10000)) { throw "worker did not exit after shutdown" }
+    Write-Host "Exit code: $($proc.ExitCode)"
+    if ($proc.ExitCode -ne 0) { throw "non-zero exit" }
+    Write-Host "SMOKE TEST PASSED"
 } finally {
-    $sw.Stop()
+    if (-not $proc.HasExited) { $proc.Kill() }
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
-
-Write-Host ""
-Write-Host "Health JSON : $($health | ConvertTo-Json -Compress)"
-Write-Host "Cold start  : $coldStartSec s (spawn -> first 200)"
-$db = Join-Path $tmp "agentos.db"
-Write-Host "agentos.db  : $(if (Test-Path $db) { 'PRESENT' } else { 'MISSING' })"
-
-Write-Host "Data dir contents:"
-Get-ChildItem $tmp | Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
-
-# Kill the whole process tree (onefile bootloader + python child).
-if (-not $proc.HasExited) {
-    & taskkill /PID $proc.Id /T /F 2>&1 | Out-Null
-}
-
-Write-Host "--- stdout.log (tail 20) ---"
-if (Test-Path $stdout) { Get-Content $stdout -Tail 20 | Write-Host }
-Write-Host "--- stderr.log (tail 20) ---"
-if (Test-Path $stderr) { Get-Content $stderr -Tail 20 | Write-Host }
-
-if (-not (Test-Path $db)) { exit 1 }
-exit 0

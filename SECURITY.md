@@ -25,7 +25,7 @@ Loqman (AgentOS) is **local-first**:
 - CORS allowlist is restricted to local Vite ports + `null` (file:// origin).
   Do not add wildcards or public origins.
 - Runtime errors that may contain credentials are redacted via `_redact()`
-  in `backend/app/runtime/opencode_runtime.py`. Keep that behavior for any new
+  in `backend/pyworker/runtime/opencode_runtime.py`. Keep that behavior for any new
   error logging near model transport.
 
 ## Reporting a Vulnerability
@@ -43,7 +43,7 @@ We aim to acknowledge within 72 hours and ship a fix + disclosure note.
 
 - [ ] No secrets/keys/tokens in code, tests, or fixtures.
 - [ ] No new `0.0.0.0` binds, no `allow_origins=["*"]`.
-- [ ] New backend endpoints validate input with Pydantic schemas.
+- [ ] New worker methods validate input explicitly (`backend/pyworker/validate.py`).
 - [ ] No `eval`/`exec`/shell injection; subprocess calls use arg arrays, never strings.
 - [ ] Frontend handles untrusted model output as text (no `dangerouslySetInnerHTML`
       without sanitization).

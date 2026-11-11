@@ -19,11 +19,9 @@ npm install
 
 ```powershell
 # Terminal 1 — backend (from repo root)
-$env:AGENTOS_INSECURE_DEV = '1' # local browser development only
-backend\.venv\Scripts\python.exe -m backend.app.cli
-# or: uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+# (no separate backend process: `npm run dev` starts the Python worker through the dev bridge)
 
-# Terminal 2 — frontend
+# Terminal 1 — frontend
 cd frontend
 npm run dev        # http://127.0.0.1:5173
 
@@ -49,6 +47,6 @@ npx playwright test
 
 - Local-first: no public binds, no wildcard CORS, no secrets in code.
 - All frontend network calls go through `src/api/client.ts`.
-- Backend input validated with Pydantic; errors redacted near runtime transport.
+- Backend input validated explicitly (`backend/pyworker/validate.py`); errors redacted near runtime transport.
 - Keep tests deterministic (`RUNTIME_MODE=mock` in tests).
 - Small focused PRs with description + test evidence.
