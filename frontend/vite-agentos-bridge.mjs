@@ -91,12 +91,13 @@ export default function agentosBridge() {
           const params = { topic: url.searchParams.get('topic'), id: url.searchParams.get('id') };
           const last = Number(url.searchParams.get('last') || 0);
           if (last > 0) params.last_event_id = last;
-          const { stream_id: streamId } = await client.request('stream.open', params, 15000);
-          res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-          res.write('retry: 2000\n\n');
-          sseClients.set(streamId, res);
-          req.on('close', () => {
-            if (sseClients.delete(streamId)) client.request('stream.close', { stream_id: streamId }, 5000).catch(() => {});
+          await client.request('stream.open', params, 15000, ({ stream_id: streamId }) => {
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+            res.write('retry: 2000\n\n');
+            sseClients.set(streamId, res);
+            res.on('close', () => {
+              if (sseClients.delete(streamId)) client.request('stream.close', { stream_id: streamId }, 5000).catch(() => {});
+            });
           });
         } catch (error) {
           sendJson(res, (error && error.status) || 500, { detail: (error && error.detail) ?? (error && error.message) ?? 'Stream failed' });

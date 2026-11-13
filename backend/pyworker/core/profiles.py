@@ -16,6 +16,7 @@ from backend.pyworker.db.org_defaults import (
     LEGACY_GM_NAMES,
     LEGACY_ORG_NAMES,
     LEGACY_ORG_TEAM_NAMES,
+    REMOVED_SEED_PROFILE_IDS,
     englishify_legacy_text,
 )
 
@@ -203,7 +204,10 @@ def seed_defaults(db: Database) -> int:
     existing = list_all(db)
     if existing:
         with db.tx():
-            _upgrade_existing_org(db, existing)
+            # The shipped specialists were removed from the product: drop them from older databases.
+            for pid in REMOVED_SEED_PROFILE_IDS:
+                db.execute("DELETE FROM agent_profiles WHERE id=?", (pid,))
+            _upgrade_existing_org(db, [p for p in existing if p["id"] not in REMOVED_SEED_PROFILE_IDS])
         return 0
     now = ts()
     with db.tx():

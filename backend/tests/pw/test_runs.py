@@ -50,6 +50,25 @@ async def new_conv(api, title="c"):
     return (await api("conversations.create", title=title))["id"]
 
 
+@pytest.mark.asyncio
+async def test_correction_cancels_old_attempt_and_is_idempotent(make_app):
+    runtime = FakeRuntime(ignore_abort=True)
+    api = Api(make_app(runtime_factory=lambda _: runtime, mode="real"))
+    cid = await new_conv(api)
+    original = await api("runs.start_turn", conversation_id=cid, engine="codex",
+                         model_id="m", prompt="Compare all columns")
+    await runtime.started.wait()
+    corrected = await api("runs.steer", run_id=original["id"], correction="Compare price only")
+    repeated = await api("runs.steer", run_id=original["id"], correction="Compare price only")
+    assert corrected["id"] == repeated["id"] != original["id"]
+    assert (await api("runs.get", run_id=original["id"]))["status"] == "cancelled"
+    runtime.gate.set()
+    await wait_status(api, corrected["id"], "succeeded")
+    assert len(runtime.calls) == 2
+    assert "Compare all columns" in runtime.calls[-1].prompt
+    assert "Compare price only" in runtime.calls[-1].prompt
+
+
 async def wait_status(api, run_id, status, timeout=5):
     for _ in range(int(timeout / 0.01)):
         run = await api("runs.get", run_id=run_id)

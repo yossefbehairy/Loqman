@@ -62,7 +62,10 @@ contextBridge.exposeInMainWorld('agentos', {
       throw unwrap(error);
     }
     handlers.set(streamId, onMessage);
-    for (const msg of early.get(streamId) || []) onMessage(msg);
+    for (const msg of early.get(streamId) || []) {
+      onMessage(msg);
+      if (msg.type === 'stream_end') handlers.delete(streamId);
+    }
     early.delete(streamId);
     return {
       close: () => {

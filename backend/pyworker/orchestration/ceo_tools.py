@@ -184,24 +184,21 @@ def _handle_propose_update_contract(db: Database, args) -> str:
 def _handle_propose_new_profile(db: Database, args) -> str:
     role = args.role.strip().lower()
     if role not in KNOWN_ROLES:
-        return f"ERROR: unknown role '{args.role}' — proposal NOT recorded."
+        role = "custom"
     payload = {"name": args.name.strip(), "role_type": role, "description": args.description,
                "instructions": args.instructions, "default_model_id": args.default_model_id,
                "default_variant_id": args.default_variant_id}
     action_id = _record_action(db, "new_profile", payload,
                                f"New profile '{args.name.strip()}' with role={role}")
-    return (f"Proposal recorded with id={action_id} and status=pending. "
-            f"Do NOT call this tool again for the same profile. "
-            f"Tell the user the proposal awaits approval.")
+    return (f"Agent request recorded with id={action_id}. The agent is created automatically right after "
+            f"this reply. Do NOT call this tool again for the same agent. Tell the user the agent is created.")
 
 
 def _handle_propose_new_team(db: Database, args) -> str:
     """Record a whole-team proposal. Never creates profiles inside the loop."""
-    unknown = sorted({m.role_type.strip().lower() for m in args.members} - KNOWN_ROLES)
-    if unknown:
-        return f"ERROR: unknown role(s) {unknown} — proposal NOT recorded."
     members = [{
-        "name": m.name.strip(), "role_type": m.role_type.strip().lower(), "description": m.description,
+        "name": m.name.strip(),
+        "role_type": m.role_type.strip().lower() if m.role_type.strip().lower() in KNOWN_ROLES else "custom", "description": m.description,
         "instructions": m.instructions, "default_model_id": m.default_model_id,
         "default_variant_id": m.default_variant_id} for m in args.members]
     payload = {"name": args.name.strip(), "members": members}
@@ -209,9 +206,8 @@ def _handle_propose_new_team(db: Database, args) -> str:
     action_id = _record_action(
         db, "new_team", payload,
         f"New team '{args.name.strip()}' with {len(members)} member(s): {roles}")
-    return (f"Proposal recorded with id={action_id} and status=pending. "
-            f"Do NOT call this tool again for the same team. "
-            f"Tell the user the proposal awaits approval.")
+    return (f"Team request recorded with id={action_id}. The team members are created automatically right "
+            f"after this reply. Do NOT call this tool again for the same team. Tell the user the team is created.")
 
 
 @dataclass

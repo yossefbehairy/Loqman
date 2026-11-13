@@ -31,6 +31,7 @@ from backend.pyworker.engine.events import (
 )
 from backend.pyworker.engine.state_machine import NodeState, WorkflowState
 from backend.pyworker.engine.validator import normalize_node_type, validate_workflow_graph
+from backend.pyworker.engine.output_validation import validate_output
 from backend.pyworker.runtime.base import AgentRuntime, ExecuteAgentTask
 from backend.pyworker.runtime.errors import safe_error_message
 from backend.pyworker.runtime.ledger import KIND_WORKFLOW_NODE, run_agent_task
@@ -319,6 +320,9 @@ async def execute_workflow(
                 task_depth = n_data.get("task_depth", "Standard")
                 timeout = int(n_data.get("timeout", DEFAULT_PER_NODE_TIMEOUT))
                 instructions = n_data.get("instructions", f"Perform your role as {role_type}.")
+                output_schema = n_data.get("output_schema")
+                if output_schema is not None:
+                    instructions += "\nRequired output schema:\n" + json.dumps(output_schema)
 
                 free_models = await runtime.list_available_models(free_only=True)
                 if not next((m for m in free_models if m.id == model_id), None):
@@ -378,6 +382,7 @@ async def execute_workflow(
                         agent_res = await run_agent_task(runtime, task, kind=KIND_WORKFLOW_NODE)
                         clean_text = sanitize_model_output(agent_res.text)
                         parsed_json = json.loads(clean_text)
+                        validate_output(parsed_json, output_schema)
                         duration_ms = int((time.time() - node_t0) * 1000)
                         # Guarded: a late runtime result is ignored if the execution was cancelled.
                         if not _transition_node(

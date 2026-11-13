@@ -61,6 +61,7 @@ Explicit limitations (do not oversell this adapter)
 """
 
 import asyncio
+from .process_io import communicate_bounded, RuntimeOutputLimit
 import logging
 import os
 import re
@@ -254,6 +255,8 @@ class AgyCliRuntime:
 
     # -- execution -----------------------------------------------------------
     async def execute_task(self, task: ExecuteAgentTask) -> AgentResult:
+        if task.mcp_servers:
+            raise RuntimeUnsupported("Scoped MCP tools are currently supported by the Claude adapter.")
         if not task.prompt or not task.prompt.strip():
             raise RuntimeErrorBase("Empty prompt: refusing to invoke the model.")
         if not self._cmd:
@@ -292,7 +295,10 @@ class AgyCliRuntime:
                 raise RuntimeOffline("agy CLI could not be started.")
             self._inflight[key] = proc
             try:
-                out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                out_b, err_b = await asyncio.wait_for(communicate_bounded(proc, kill=self._kill), timeout=timeout)
+            except RuntimeOutputLimit:
+                await self._kill(proc)
+                raise
             except asyncio.TimeoutError:
                 await self._kill(proc)
                 raise RuntimeTimeout(f"agy did not finish within {timeout}s; process killed.")

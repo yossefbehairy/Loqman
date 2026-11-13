@@ -2,6 +2,8 @@
 approvals and deliverables."""
 
 from __future__ import annotations
+import hashlib
+import json
 
 import base64
 import mimetypes
@@ -42,6 +44,7 @@ def _fs_error(exc: WorkspaceFsError):
 
 def _conv_out(r: Dict[str, Any]) -> Dict[str, Any]:
     return {"id": r["id"], "title": r["title"], "workspace_id": r["workspace_id"],
+            "profile_id": r.get("profile_id"),
             "created_at": iso(r["created_at"]), "updated_at": iso(r["updated_at"])}
 
 
@@ -60,13 +63,21 @@ def _conversation(ctx, conversation_id: str) -> Dict[str, Any]:
 
 @method("conversations.create")
 async def conversations_create(ctx, params):
-    check_keys(params, {"title"}, ("workspace_id",))
+    check_keys(params, {"title"}, ("workspace_id", "profile_id"))
     title = req_str(params, "title", 1, 255)
     workspace_id = opt_str(params, "workspace_id", 0, 36)
+    profile_id = opt_str(params, "profile_id", 1, 64)
+    if profile_id:
+        from backend.pyworker.core.profiles import get_by_id
+        profile = get_by_id(ctx.db, profile_id)
+        if profile is None:
+            raise api_error(404, "Profile not found")
+        profile_id = profile["id"]
     if workspace_id and not ctx.db.one("SELECT id FROM workspaces WHERE id=?", (workspace_id,)):
         raise api_error(404, "Workspace not found")
     now, cid = ts(), new_id()
     ctx.db.insert("conversations", {"id": cid, "workspace_id": workspace_id or None, "title": title,
+                                    "profile_id": profile_id,
                                     "created_at": now, "updated_at": now})
     return _conv_out(_conversation(ctx, cid))
 
@@ -163,7 +174,7 @@ def _skill_ref(item):
 @method("runs.start_turn")
 async def runs_start_turn(ctx, params):
     check_keys(params, {"conversation_id", "engine", "model_id", "prompt"},
-               ("skills", "input_files", "timeout", "variant", "request_key"))
+               ("skills", "input_files", "timeout", "variant", "request_key", "tool_mode", "computer_window"))
     cid = req_str(params, "conversation_id", 1, 64)
     engine = req_enum(params, "engine", ("claude-code", "codex", "opencode", "antigravity", "mock"))
     model_id = req_str(params, "model_id", 1, 128)
@@ -173,9 +184,11 @@ async def runs_start_turn(ctx, params):
     request_key = opt_str(params, "request_key", 1, 128)
     skills = opt_list(params, "skills", 3, _skill_ref) or []
     input_files = opt_list(params, "input_files", 3, lambda f: req_str({"f": f}, "f", 1)) or []
+    tool_mode = opt_enum(params, "tool_mode", ("none", "read", "write", "browser", "full", "computer"), "none")
+    computer_window = opt_int(params, "computer_window", None, 1, 2**63-1)
     try:
         return ctx.runs.start_turn(cid, engine, model_id, prompt, timeout, variant, request_key,
-                                   [(s["source_id"], s["skill_id"]) for s in skills], input_files)
+                                   [(s["source_id"], s["skill_id"]) for s in skills], input_files, tool_mode, computer_window)
     except (run_skills.SkillSelectionError, run_inputs.InputFileError) as exc:
         raise api_error(exc.status, exc.detail)
     except ConversationNotFound:
@@ -199,6 +212,36 @@ async def runs_get(ctx, params):
         raise api_error(404, "Run not found")
 
 
+@method("runs.write_proposals")
+async def runs_write_proposals(ctx, params):
+    check_keys(params, {"run_id"})
+    run_id = req_str(params, "run_id", 1, 64)
+    try:
+        ctx.runs.get_run(run_id)
+    except RunNotFound:
+        raise api_error(404, "Run not found")
+    return {"proposals": ctx.db.all(
+        "SELECT id,run_id,path,content,content_sha256,status,approval_id,created_at,finished_at "
+        "FROM workspace_writes WHERE run_id=? ORDER BY created_at,id", (run_id,))}
+
+
+@method("runs.tool_control")
+async def runs_tool_control(ctx, params):
+    check_keys(params, {"run_id", "owner"})
+    run_id = req_str(params, "run_id", 1, 64)
+    owner = req_enum(params, "owner", ("user", "agent"))
+    session = ctx.runs._tool_sessions.get(run_id)
+    if session is None:
+        raise api_error(409, "Run has no active browser session.")
+    session.browser.human_control = owner == "user"
+    if session.computer is not None:
+        session.computer.human_control = owner == "user"
+    if session.browser.cdp is not None:
+        await session.browser.evaluate("delete window.__agentosElements")
+    session.event("control.changed", owner=owner)
+    return {"run_id": run_id, "owner": owner}
+
+
 @method("runs.cancel")
 async def runs_cancel(ctx, params):
     check_keys(params, {"run_id"})
@@ -209,6 +252,41 @@ async def runs_cancel(ctx, params):
     if run["status"] not in ("cancelled",):
         raise api_error(409, f"Run already {run['status']}")
     return run
+
+
+@method("runs.steer")
+async def runs_steer(ctx, params):
+    """Stop the current attempt and start one idempotent corrected turn."""
+    check_keys(params, {"run_id", "correction"})
+    run_id = req_str(params, "run_id", 1, 64)
+    correction = req_str(params, "correction", 1, 4000)
+    try:
+        ctx.runs.get_run(run_id)
+    except RunNotFound:
+        raise api_error(404, "Run not found")
+    original = ctx.db.one("SELECT * FROM conversation_runs WHERE id=?", (run_id,))
+    if original["kind"] != "conversation":
+        raise api_error(422, "Corrections require a conversation run.")
+    message = ctx.db.scalar("SELECT content FROM conversation_messages WHERE seq=?",
+                            (original["user_message_seq"],))
+    prompt = f"Original task:\n{message}\n\nUser correction (apply this to the task):\n{correction}"
+    if len(prompt) > 24000:
+        raise api_error(422, "Corrected task exceeds the prompt limit.")
+    config = json.loads(original.get("tool_config_json") or "{}")
+    key = "steer-" + hashlib.sha256((run_id + "\0" + correction).encode()).hexdigest()
+    await ctx.runs.cancel(run_id)
+    next_params = {
+        "conversation_id": original["conversation_id"], "engine": original["engine"],
+        "model_id": original["model_id"], "prompt": prompt, "timeout": original["timeout"],
+        "variant": original["variant"], "request_key": key,
+        "skills": [{"source_id": source, "skill_id": skill}
+                   for source, skill in run_skills.stored_refs(original["skills_json"])],
+        "input_files": run_inputs.stored_refs(original["input_files_json"]),
+        "tool_mode": config.get("mode", "none"),
+    }
+    if config.get("computer_window"):
+        next_params["computer_window"] = config["computer_window"]["handle"]
+    return await runs_start_turn(ctx, next_params)
 
 
 @method("runs.events")

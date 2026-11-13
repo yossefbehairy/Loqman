@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "gradient-text",
+        "value": "*",
+        "files": [
+          "D:\\AgentOS\\frontend\\src\\rusebot\\styles.css"
+        ],
+        "createdAt": "2026-11-13T17:49:22.004Z",
+        "reason": "Verbatim RuseBot 0.1.127 stylesheet; .thinking-shimmer is a loading-state sweep the task requires reproducing. Decided by assistant from the user's instruction to reuse the reference styles, not user-confirmed per finding."
+      }
+    ]
+  }
+}

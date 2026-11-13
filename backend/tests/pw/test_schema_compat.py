@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 
 from backend.pyworker.db.core import Database
-from backend.pyworker.db.migrate import SchemaTooNew, init_db
+from backend.pyworker.db.migrate import ForeignDatabase, SchemaTooNew, init_db
 from backend.pyworker.db.schema import SCHEMA_VERSION, TABLES
 
 
@@ -20,7 +20,7 @@ def test_fresh_database_has_every_table_and_version(tmp_path):
     db = fresh(tmp_path / "n.db")
     names = {r["name"] for r in db.all("SELECT name FROM sqlite_master WHERE type='table'")}
     assert set(TABLES) <= names
-    assert db.scalar("PRAGMA user_version") == SCHEMA_VERSION == 16
+    assert db.scalar("PRAGMA user_version") == SCHEMA_VERSION == 17
     assert db.scalar("PRAGMA foreign_keys") == 1
     assert db.scalar("PRAGMA journal_mode") == "wal"
     # the partial unique index that guarantees one active run per conversation
@@ -33,21 +33,37 @@ def test_fresh_database_has_every_table_and_version(tmp_path):
 def test_existing_sqlite_is_backed_up_before_upgrade(tmp_path):
     path = tmp_path / "old.db"
     with sqlite3.connect(path) as con:
-        con.execute("CREATE TABLE missions (id VARCHAR PRIMARY KEY)")
-        con.execute("INSERT INTO missions (id) VALUES ('existing')")
+        con.execute(TABLES["conversations"].replace("\n\tworkspace_id VARCHAR(36), ", "")
+                    .replace(", \n\tFOREIGN KEY(workspace_id) REFERENCES workspaces (id) ON DELETE SET NULL", ""))
+        con.execute("INSERT INTO conversations VALUES ('existing','Old',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)")
     db = Database(str(path))
     init_db(db)
-    assert "source_conversation_id" in {r["name"] for r in db.all("PRAGMA table_info(missions)")}
+    assert "workspace_id" in {r["name"] for r in db.all("PRAGMA table_info(conversations)")}
     assert db.scalar("PRAGMA user_version") == SCHEMA_VERSION
-    assert db.scalar("SELECT id FROM missions") == "existing"
+    assert db.scalar("SELECT id FROM conversations") == "existing"
     backups = list(tmp_path.glob("old.db.pre-v*.bak"))
     assert len(backups) == 1
     with sqlite3.connect(backups[0]) as con:
-        assert con.execute("SELECT id FROM missions").fetchone() == ("existing",)
-        assert "source_conversation_id" not in {r[1] for r in con.execute("PRAGMA table_info(missions)")}
+        assert con.execute("SELECT id FROM conversations").fetchone() == ("existing",)
+        assert "workspace_id" not in {r[1] for r in con.execute("PRAGMA table_info(conversations)")}
     init_db(db)
     assert len(list(tmp_path.glob("old.db.pre-v*.bak"))) == 1
     db.close()
+
+
+@pytest.mark.parametrize("table", ["missions", "conversations", "workflows"])
+def test_overlapping_foreign_table_is_rejected_without_writes(tmp_path, table):
+    path = tmp_path / "foreign.db"
+    with sqlite3.connect(path) as con:
+        con.execute(f"CREATE TABLE {table} (id TEXT PRIMARY KEY)")
+        con.execute(f"INSERT INTO {table} VALUES ('keep')")
+    before = path.read_bytes()
+    db = Database(str(path))
+    with pytest.raises(ForeignDatabase):
+        init_db(db)
+    db.close()
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["foreign.db"]
 
 
 def test_newer_schema_fails_before_changes(tmp_path):

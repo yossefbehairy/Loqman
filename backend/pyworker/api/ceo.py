@@ -151,7 +151,17 @@ async def ceo_ask(ctx, params):
                                "created_at": ts()})
     if progress_id:
         _progress_write(ctx, progress_id, "done", "", result["iterations"], done=True)
-    return {"reply": result["reply"], "actions_proposed": result["actions_proposed"],
+    # The CEO may create agents and teams on its own: no approval step for those two kinds.
+    created_agents: List[Dict[str, Any]] = []
+    remaining: List[Dict[str, Any]] = []
+    for action in result["actions_proposed"]:
+        if action["kind"] in ("new_profile", "new_team"):
+            outcome = _decide(ctx, action["id"], True, "Created by the CEO", True)
+            if outcome["status"] == "approved":
+                created_agents.extend(outcome["created_profiles"])
+                continue
+        remaining.append(action)
+    return {"reply": result["reply"], "actions_proposed": remaining, "agents_created": created_agents,
             "iterations": result["iterations"], "fast": is_fast}
 
 
@@ -213,7 +223,7 @@ def _apply_update_contract(db: Database, payload: Dict[str, Any]) -> None:
 def _apply_new_profile(db: Database, payload: Dict[str, Any]) -> Dict[str, Any]:
     role = str(payload.get("role_type", "")).lower()
     if role not in KNOWN_ROLES:
-        raise ValueError(f"Unknown role '{role}'.")
+        role = "custom"
     data = {"id": f"custom-{uuid.uuid4().hex[:8]}", "name": payload.get("name"), "role_type": role,
             "description": payload.get("description"), "instructions": payload.get("instructions"),
             "default_model_id": payload.get("default_model_id"),
@@ -238,7 +248,7 @@ def _apply_new_team(db: Database, payload: Dict[str, Any]) -> Tuple[List[Dict[st
             raise ValueError(f"Team member #{i} must be an object.")
         role = str(member.get("role_type", "")).strip().lower()
         if role not in KNOWN_ROLES:
-            raise ValueError(f"Team member #{i} has unknown role '{member.get('role_type')}'.")
+            role = "custom"
         name = str(member.get("name") or "").strip()
         if not name or not member.get("instructions"):
             raise ValueError(f"Team member #{i} requires name and instructions.")

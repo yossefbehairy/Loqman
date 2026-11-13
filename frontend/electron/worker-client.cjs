@@ -100,7 +100,15 @@ class WorkerClient extends EventEmitter {
         this.pending.delete(msg.id);
         clearTimeout(entry.timer);
         if (msg.error) entry.reject(new WorkerError(msg.error));
-        else entry.resolve(msg.result);
+        else {
+          try {
+            // Install stream ownership before parsing the next line in this chunk.
+            if (entry.onResult) entry.onResult(msg.result);
+            entry.resolve(msg.result);
+          } catch (error) {
+            entry.reject(error);
+          }
+        }
         break;
       }
       case 'stream':
@@ -123,7 +131,7 @@ class WorkerClient extends EventEmitter {
   }
 
   /** @returns {Promise<any>} the method's `result`; rejects with WorkerError(status, detail). */
-  request(method, params = {}, timeoutMs = 10 * 60 * 1000) {
+  request(method, params = {}, timeoutMs = 10 * 60 * 1000, onResult) {
     if (typeof method !== 'string' || !METHOD_RE.test(method)) {
       return Promise.reject(new Error('Invalid method name'));
     }
@@ -136,7 +144,7 @@ class WorkerClient extends EventEmitter {
         this.pending.delete(id);
         reject(new Error(`Backend request timed out: ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer, onResult });
       this.child.stdin.write(JSON.stringify({ id, method, params }) + '\n', (err) => {
         if (err) {
           this.pending.delete(id);

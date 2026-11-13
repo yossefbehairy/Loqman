@@ -41,6 +41,7 @@ Explicit limitations (do not oversell this adapter)
 """
 
 import asyncio
+from .process_io import communicate_bounded, RuntimeOutputLimit
 import json
 import logging
 import os
@@ -261,6 +262,17 @@ class ClaudeCodeRuntime:
 
         t0 = time.time()
         with tempfile.TemporaryDirectory(prefix="agentos-claude-") as cwd:
+            if task.mcp_servers:
+                help_result = await self._probe(["--help"])
+                help_text = help_result.stdout if help_result else ""
+                if "--mcp-config" not in help_text or "--allowedTools" not in help_text:
+                    raise RuntimeUnsupported("Installed Claude CLI cannot mount scoped MCP tools.")
+                config_path = os.path.join(cwd, "mcp.json")
+                with open(config_path, "w", encoding="utf-8") as config_file:
+                    json.dump({"mcpServers": task.mcp_servers}, config_file)
+                argv += ["--mcp-config", config_path, "--allowedTools", "mcp__agentos_workspace__*",
+                         "--setting-sources", "project", "--disable-slash-commands"]
+                argv[argv.index("--tools") + 1] = "ToolSearch"
             try:
                 kwargs: Dict[str, Any] = {}
                 if sys.platform == "win32":
@@ -273,7 +285,10 @@ class ClaudeCodeRuntime:
             self._inflight[key] = proc
             try:
                 out_b, err_b = await asyncio.wait_for(
-                    proc.communicate(prompt.encode("utf-8")), timeout=timeout)
+                    communicate_bounded(proc, prompt.encode("utf-8"), kill=self._kill), timeout=timeout)
+            except RuntimeOutputLimit:
+                await self._kill(proc)
+                raise
             except asyncio.TimeoutError:
                 await self._kill(proc)
                 raise RuntimeTimeout(f"Claude Code did not finish within {timeout}s; process killed.")

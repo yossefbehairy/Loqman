@@ -55,6 +55,8 @@ class Application:
         db = Database(path)
         try:
             init_db(db)
+            from .core.workspace_writes import recover
+            recover(db)
             recovery = run_startup_crash_recovery(db)
             seeded = profile_repo.seed_defaults(db)
             if seeded:

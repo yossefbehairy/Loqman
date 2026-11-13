@@ -27,8 +27,7 @@ def test_mission_stream_snapshot_then_live_events(worker_factory):
     assert done["data"]["missionId"] == m["id"]
     events = [e["event"] for e in w.stream_events(sid)]
     assert "mission.status.changed" in events and "task.status.changed" in events
-    assert w.ok("stream.close", {"stream_id": sid}) == {"closed": True}
-    assert w.wait_stream_end(sid)["reason"] == "closed"
+    assert w.wait_stream_end(sid)["reason"] == "complete"
     assert w.ok("stream.close", {"stream_id": sid}) == {"closed": False}
     assert w.err("stream.open", {"topic": "mission", "id": "nope"})["status"] == 404
 
@@ -45,13 +44,27 @@ def test_execution_stream_replays_history_and_ends_on_terminal(worker_factory):
     run = w.ok("workflows.run", {"workflow_id": wf["id"], "sync": True})
     assert run["status"] == "succeeded"
     sid = w.open_stream("execution", run["execution_id"])
-    # history is persisted: a finished execution replays its team messages; live tail waits for a terminal event
+    # A finished execution replays persisted messages, then closes.
     deadline = time.monotonic() + 5
     while len(w.stream_events(sid)) < 3 and time.monotonic() < deadline:
         time.sleep(0.05)
     assert [e["event"] for e in w.stream_events(sid)].count("team.message") == 3
-    assert w.ok("stream.close", {"stream_id": sid})["closed"] is True
+    assert w.wait_stream_end(sid)["reason"] == "complete"
+    assert w.ok("stream.close", {"stream_id": sid})["closed"] is False
     assert w.ok("executions.messages", {"execution_id": run["execution_id"]})["count"] == 3
+    assert w.wait_stream_event(sid, "execution.finished")["data"]["status"] == "succeeded"
+    assert w.err("stream.open", {"topic": "execution", "id": run["execution_id"],
+                                "last_event_id": 1})["status"] == 422
+
+
+def test_completed_mission_streams_release_capacity(worker_factory):
+    w = worker_factory()
+    mission = w.ok("missions.create", {"objective": "Compare two short lists"})
+    _wait_mission(w, mission["id"])
+    for _ in range(70):
+        sid = w.open_stream("mission", mission["id"])
+        assert w.wait_stream_end(sid)["reason"] == "complete"
+        assert w.ok("stream.close", {"stream_id": sid})["closed"] is False
 
 
 def test_stream_limit_and_cleanup_on_shutdown(worker_factory):

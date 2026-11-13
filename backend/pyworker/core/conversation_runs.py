@@ -149,6 +149,8 @@ class ConversationRunManager:
         self._runtimes: Dict[str, Any] = {}      # one instance per engine so abort_task sees in-flight procs
         self._run_runtimes: Dict[str, Any] = {}  # mission runs: the exact adapter selected for the profile
         self._run_keys: Dict[str, str] = {}      # mission runs: session_title the adapter tracks the process by
+        self._tool_sessions = {}
+        self._computer_owner = None
 
     # -- helpers -------------------------------------------------------------
     def _runtime(self, engine_id: str):
@@ -301,6 +303,7 @@ class ConversationRunManager:
             "assistant_content": reply, "error": run["error"],
             "skills": run_skills.public_meta(run["skills_json"]),
             "input_files": run_inputs.public_meta(run["input_files_json"]),
+            "tool_mode": json.loads(run.get("tool_config_json") or "{}").get("mode", "none"),
             "created_at": iso(run["created_at"]), "started_at": iso(run["started_at"]),
             "finished_at": iso(run["finished_at"]),
         }
@@ -308,11 +311,12 @@ class ConversationRunManager:
     # -- turn start ----------------------------------------------------------
     def start_turn(self, conversation_id: str, engine: str, model_id: str, prompt: str,
                    timeout: int = 90, variant: Optional[str] = None, request_key: Optional[str] = None,
-                   skills: Optional[List[Any]] = None, input_files: Optional[List[str]] = None) -> Dict[str, Any]:
+                   skills: Optional[List[Any]] = None, input_files: Optional[List[str]] = None,
+                   tool_mode: str = "none", computer_window: Optional[int] = None) -> Dict[str, Any]:
         """Persist the user message + queued run, then schedule the task.
         Must run on the event loop (it creates the asyncio task)."""
         prepared = self._prepare_turn(conversation_id, engine, model_id, prompt, timeout, variant,
-                                      request_key, skills, input_files)
+                                      request_key, skills, input_files, tool_mode, computer_window)
         return self._finish_start(prepared)
 
     def _finish_start(self, prepared: Dict[str, Any]) -> Dict[str, Any]:
@@ -329,7 +333,8 @@ class ConversationRunManager:
 
     def _prepare_turn(self, conversation_id: str, engine: str, model_id: str, prompt: str, timeout: int,
                       variant: Optional[str], request_key: Optional[str], skills: Optional[List[Any]],
-                      input_files: Optional[List[str]]) -> Dict[str, Any]:
+                      input_files: Optional[List[str]], tool_mode: str = "none",
+                      computer_window: Optional[int] = None) -> Dict[str, Any]:
         if engine not in ENGINE_PROVIDERS:
             raise UnsupportedEngine(engine)
         if engine == "mock" and settings.RUNTIME_MODE != "mock":
@@ -341,6 +346,24 @@ class ConversationRunManager:
         conversation = db.one("SELECT * FROM conversations WHERE id=?", (conversation_id,))
         if conversation is None:
             raise ConversationNotFound(conversation_id)
+        tool_config = None
+        if tool_mode != "none":
+            if tool_mode not in ("read", "write", "browser", "full", "computer") or engine != "claude-code":
+                raise UnsupportedEngine("Workspace tools currently require claude-code.")
+            workspace = db.one("SELECT * FROM workspaces WHERE id=?", (conversation["workspace_id"],))
+            if workspace is None:
+                raise run_inputs.InputFileError(422, "Workspace tools require a registered workspace.")
+            tool_config = {"mode": tool_mode, "workspace_id": workspace["id"], "path": workspace["path"]}
+            if computer_window is not None:
+                from backend.pyworker.core.computer import windows
+                selected = next((w for w in windows() if w["handle"] == computer_window), None)
+                if selected is None or tool_mode not in ("computer", "full"):
+                    raise run_inputs.InputFileError(422, "Select a visible Windows window for computer tools.")
+                tool_config["computer_window"] = selected
+            elif tool_mode == "computer":
+                raise run_inputs.InputFileError(422, "computer_window is required.")
+        elif computer_window is not None:
+            raise run_inputs.InputFileError(422, "Computer tools require computer or full mode.")
 
         def existing_request():
             if not request_key:
@@ -348,6 +371,8 @@ class ConversationRunManager:
             existing = db.one("SELECT * FROM conversation_runs WHERE conversation_id=? AND request_key=?",
                               (conversation_id, request_key))
             if existing:
+                if json.loads(existing.get("tool_config_json") or "null") != tool_config:
+                    raise RequestKeyConflict(request_key)
                 original = db.one("SELECT content FROM conversation_messages WHERE seq=?",
                                   (existing["user_message_seq"],))
                 if (existing["engine"], existing["model_id"], existing["variant"], existing["timeout"],
@@ -378,6 +403,18 @@ class ConversationRunManager:
             raise run_skills.SkillSelectionError(
                 422, "prompt is too long to include the selected skills; shorten it or select fewer skills")
         prompt_for_engine = prompt
+        profile_snapshot = None
+        if conversation.get("profile_id"):
+            from backend.pyworker.core.profiles import get_by_id
+            profile_snapshot = get_by_id(db, conversation["profile_id"])
+            if profile_snapshot is None:
+                raise run_inputs.InputFileError(422, "Conversation profile is no longer available.")
+            profile_block = "Agent instructions:\n" + profile_snapshot["instructions"]
+            if profile_snapshot.get("output_schema_json"):
+                profile_block += "\nOutput schema:\n" + profile_snapshot["output_schema_json"]
+            skill_block = "\n\n".join(b for b in (profile_block, skill_block) if b)
+            if len(skill_block) + len(prompt) + 100 > 24000:
+                raise run_inputs.InputFileError(422, "Profile and inputs exceed the prompt budget.")
         budget = 24000 - len(prompt) - 100 - (len(skill_block) + 2 if skill_block else 0)
         if previous and budget > 100:
             selected: List[Dict[str, Any]] = []
@@ -407,6 +444,8 @@ class ConversationRunManager:
                     "id": run_id, "conversation_id": conversation_id, "kind": "conversation",
                     "engine": engine, "model_id": model_id, "variant": variant, "request_key": request_key,
                     "skills_json": run_skills.dump(snapshots), "input_files_json": run_inputs.dump(file_snapshots),
+                    "tool_config_json": json.dumps(tool_config) if tool_config else None,
+                    "profile_snapshot_json": json.dumps(profile_snapshot, ensure_ascii=False) if profile_snapshot else None,
                     "timeout": timeout, "status": "queued", "user_message_seq": user_seq, "created_at": now,
                 })
                 queued_event = self._add_event(run_id, "queued")
@@ -453,6 +492,9 @@ class ConversationRunManager:
         if event:
             self._publish([event])
         if won:
+            session = self._tool_sessions.get(run_id)
+            if session is not None:
+                session.revoke()
             task = self._tasks.get(run_id)
             if prior == "running":
                 try:
@@ -498,15 +540,38 @@ class ConversationRunManager:
                                         agent_id=settings.CHAT_AGENT_ID if engine == "opencode" else None,
                                         session_title=self._key(run_id))
                 try:
-                    result = await run_agent_task(self._runtime(engine), task,
-                                                  kind=KIND_CONVERSATION_RUN, run_id=run_id)
+                    config = self._db.scalar("SELECT tool_config_json FROM conversation_runs WHERE id=?", (run_id,))
+                    if config:
+                        from backend.pyworker.core.tool_session import ToolSession
+                        async with ToolSession(self, run_id, json.loads(config)) as session:
+                            task.mcp_servers = session.servers
+                            result = await run_agent_task(self._runtime(engine), task,
+                                                          kind=KIND_CONVERSATION_RUN, run_id=run_id)
+                            await session.verify_completion()
+                    else:
+                        result = await run_agent_task(self._runtime(engine), task,
+                                                      kind=KIND_CONVERSATION_RUN, run_id=run_id)
                 except asyncio.CancelledError:
                     raise  # cancel() already persisted; shutdown leaves the row for recovery
                 except Exception as exc:
+                    from backend.pyworker.core.tool_session import ToolVerificationFailed
+                    error = (str(exc) if isinstance(exc, ToolVerificationFailed)
+                             else f"Engine request failed ({getattr(exc, 'code', 'runtime_error')}).")
                     self._transition(run_id, "running", "failed",
-                                     error=f"Engine request failed ({getattr(exc, 'code', 'runtime_error')}).",
+                                     error=error,
                                      finished_at=ts())
                     return
+                profile_json = self._db.scalar("SELECT profile_snapshot_json FROM conversation_runs WHERE id=?", (run_id,))
+                if profile_json:
+                    profile = json.loads(profile_json)
+                    if profile.get("output_schema_json"):
+                        from backend.pyworker.engine.output_validation import validate_output
+                        try:
+                            validate_output(json.loads(result.text), json.loads(profile["output_schema_json"]))
+                        except (ValueError, TypeError):
+                            self._transition(run_id, "running", "failed", error="Output did not match the profile schema.",
+                                             finished_at=ts())
+                            return
                 self._complete(run_id, conversation_text=result.text)
         except asyncio.CancelledError:
             raise

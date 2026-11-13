@@ -595,6 +595,8 @@ class AgyAcpRuntime:
 
     # -- execution -------------------------------------------------------------
     async def execute_task(self, task: ExecuteAgentTask) -> AgentResult:
+        if task.mcp_servers:
+            raise RuntimeUnsupported("Scoped MCP tools are currently supported by the Claude adapter.")
         if not task.prompt or not task.prompt.strip():
             raise RuntimeErrorBase("Empty prompt: refusing to invoke the model.")
         if not self._cmd:

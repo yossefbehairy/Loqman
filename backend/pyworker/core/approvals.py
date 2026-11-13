@@ -1,9 +1,7 @@
-"""Persisted per-run approval state (infrastructure only).
+"""Persisted per-run approval state.
 
-HONEST SCOPE: no engine adapter (opencode / claude-code / codex / agy) can
-currently ask for an approval, so nothing in the product calls ``create``.
-``APPROVAL_CAPABILITIES`` reports every engine as unsupported and must only
-flip once an adapter really enforces approvals.
+Claude workspace report tools create approvals through the run's tool session.
+Other adapters retain their fixed policies.
 
 Guarantees (unchanged from the legacy implementation)
 - ``create`` is service-only and only for an ACTIVE run, checked in the same
@@ -29,6 +27,10 @@ MAX_TTL_SECONDS = 3600
 APPROVAL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     engine: {"tool_approvals": False, "reason": "adapter cannot request approvals; runs with its fixed policy"}
     for engine in ("opencode", "claude-code", "codex", "agy")
+}
+APPROVAL_CAPABILITIES["claude-code"] = {
+    "tool_approvals": True, "scope": "workspace_write",
+    "reason": "write proposals wait for a run-bound approval before publication",
 }
 
 

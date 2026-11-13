@@ -53,6 +53,7 @@ Explicit limitations (do not oversell this adapter)
 """
 
 import asyncio
+from .process_io import communicate_bounded, RuntimeOutputLimit
 import json
 import logging
 import os
@@ -293,6 +294,8 @@ class CodexCliRuntime:
 
     # -- execution -----------------------------------------------------------
     async def execute_task(self, task: ExecuteAgentTask) -> AgentResult:
+        if task.mcp_servers:
+            raise RuntimeUnsupported("Scoped MCP tools are currently supported by the Claude adapter.")
         if not task.prompt or not task.prompt.strip():
             raise RuntimeErrorBase("Empty prompt: refusing to invoke the model.")
         if not self._cmd:
@@ -338,7 +341,10 @@ class CodexCliRuntime:
             self._inflight[key] = proc
             try:
                 out_b, err_b = await asyncio.wait_for(
-                    proc.communicate(prompt.encode("utf-8")), timeout=timeout)
+                    communicate_bounded(proc, prompt.encode("utf-8"), kill=self._kill), timeout=timeout)
+            except RuntimeOutputLimit:
+                await self._kill(proc)
+                raise
             except asyncio.TimeoutError:
                 await self._kill(proc)
                 raise RuntimeTimeout(f"Codex did not finish within {timeout}s; process killed.")

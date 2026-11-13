@@ -66,7 +66,11 @@ async def engines_capabilities(ctx, params):
             "cancellation": "best_effort_remote_unconfirmed", "workspace_restriction": False}
     return {
         "opencode": {**base, "model_policy": "verified_free_only"},
-        "claude-code": {**base, "model_policy": "subscription_or_account"},
+        "claude-code": {**base, "model_policy": "subscription_or_account", "tool_approvals": True,
+                        "workspace_restriction": "scoped_mcp_tools",
+                        "workspace_tools": ["workspace_read", "workspace_write"],
+                        "browser_tools": True, "computer_tools": "selected_windows_window",
+                        "write_policy": "new_workspace_root_reports_only"},
         "codex": {**base, "model_policy": "subscription_or_account"},
         "antigravity": {**base, "model_policy": "subscription_or_account",
                         "permission_policy": "plan_mode_and_deny_all_requests"},
@@ -81,6 +85,13 @@ async def engines_status(ctx, params):
     check_keys(params)
     statuses = await asyncio.to_thread(engine_discovery.discover_engines)
     return {"engines": [vars(s) for s in statuses]}
+
+
+@method("computer.windows")
+async def computer_windows(ctx, params):
+    check_keys(params)
+    from backend.pyworker.core.computer import windows
+    return {"windows": await asyncio.to_thread(windows)}
 
 
 def _engine_id(params: dict) -> str:

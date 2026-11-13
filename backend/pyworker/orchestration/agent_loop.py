@@ -36,17 +36,11 @@ CEO_FAST_THREAD_TITLE = "ceo-fast-gm"
 # The company Loqman leads. Injected into every CEO prompt so the conversational
 # CEO always knows the two teams and the contract that binds them.
 _ORG_CONTEXT = (
-    "Company organization (two teams):\n"
-    "- Compass — planning, led by Dr. Sara (planner). "
-    "Members: Khaled (researcher), Layla (data_extractor), Nour (report_writer). "
-    "Contract: a measurable plan with owners, milestones and risks first; "
-    "no execution before Loqman approves it.\n"
-    "- Forge — execution, led by Eng. Tarek (analyst). "
-    "Members: Ahmed (coder), Prof. Yasmin (reviewer — the quality gate), "
-    "Omar (summarizer), Mona (translator). Contract: execute only the approved "
-    "Compass plan, and no final delivery until the quality gate signs off.\n"
-    "Display names in English: always write Loqman, Compass, Forge, Dr. Sara, "
-    "Eng. Tarek and Prof. Yasmin exactly in English, even inside an Arabic reply.\n"
+    "Company organization: you, Loqman, are the CEO. No other agents ship with the app. "
+    "You may create agents and teams whenever the user needs them: call propose_new_profile "
+    "(one agent) or propose_new_team (several) with a clear name and full working instructions. "
+    "Those two requests are applied immediately, with no approval step. "
+    "Always write the name Loqman exactly in English, even inside an Arabic reply.\n"
 )
 
 

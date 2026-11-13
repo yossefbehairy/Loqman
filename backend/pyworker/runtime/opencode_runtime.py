@@ -23,6 +23,7 @@ Notes:
 """
 
 import asyncio
+from .process_io import communicate_bounded, RuntimeOutputLimit
 import json
 import logging
 import platform
@@ -187,7 +188,10 @@ class RealOpenCodeRuntime:
         if run is not None:
             run.procs.add(proc)
         try:
-            out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            out_b, err_b = await asyncio.wait_for(communicate_bounded(proc, kill=self._kill_proc), timeout=timeout)
+        except RuntimeOutputLimit:
+            await self._kill_proc(proc)
+            raise
         except asyncio.TimeoutError:
             await self._kill_proc(proc)
             raise RuntimeTimeout(f"OpenCode request timed out after {timeout}s ({method} {path}).")
@@ -586,6 +590,8 @@ class RealOpenCodeRuntime:
         return session_id, False
 
     async def execute_task(self, task: ExecuteAgentTask) -> AgentResult:
+        if task.mcp_servers:
+            raise RuntimeErrorBase("Scoped MCP tools are currently supported by the Claude adapter.")
         if not task.prompt or not task.prompt.strip():
             raise RuntimeErrorBase("Empty prompt: refusing to invoke the model.")
 

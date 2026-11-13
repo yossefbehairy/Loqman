@@ -6,6 +6,7 @@ from backend.pyworker.runtime import ledger
 from backend.pyworker.runtime.mock_runtime import MockRuntime
 
 from .helpers import Api
+from .legacy_org import seed_legacy_specialists
 
 
 @pytest.fixture
@@ -14,11 +15,13 @@ def make_app(tmp_path, monkeypatch):
     created = []
     monkeypatch.setattr(settings, "RUNTIME_MODE", settings.RUNTIME_MODE)  # restored on teardown
 
-    def make(runtime=None, mode="mock", runtime_factory=None, **kw):
+    def make(runtime=None, mode="mock", runtime_factory=None, specialists=True, **kw):
         monkeypatch.setattr(settings, "RUNTIME_MODE", mode)
         extra = {} if runtime_factory is not None else {"runtime": runtime or MockRuntime()}
         app = Application.create(db_path=str(tmp_path / f"w{len(created)}.db"),
                                  runtime_factory=runtime_factory, **extra, **kw)
+        if specialists:
+            seed_legacy_specialists(app.ctx.db)
         created.append(app)
         return app
 

@@ -84,42 +84,38 @@ async def test_create_requires_fields(api):
 
 
 def test_default_org_structure(make_app):
-    app = make_app()
-    db = app.ctx.db
-    profiles = {p["id"]: p for p in repo.list_all(db)}
+    app = make_app(specialists=False)
+    profiles = {p["id"]: p for p in repo.list_all(app.ctx.db)}
+    assert set(profiles) == {"custom"}
     ceo = profiles["custom"]
     assert ceo["name"] == "Loqman"
     s = json.loads(ceo["settings_json"])
     assert s["team"] == "executive"
-    by_team = {}
-    for pid, p in profiles.items():
-        by_team.setdefault(json.loads(p["settings_json"]).get("team"), set()).add(pid)
-    assert by_team["planning"] == {"planner", "researcher", "data_extractor", "report_writer"}
-    assert by_team["execution"] == {"analyst", "coder", "reviewer", "summarizer", "translator"}
-    for p in profiles.values():
-        contract = json.loads(p["settings_json"])["contract"]
-        assert contract["mission"] and contract["responsibilities"] and contract["deliverables"] and contract["handoff"]
+    contract = s["contract"]
+    assert contract["mission"] and contract["responsibilities"] and contract["deliverables"] and contract["handoff"]
 
 
 def test_legacy_ceo_upgraded_and_user_customizations_survive(make_app):
-    app = make_app()
+    app = make_app(specialists=False)
     db = app.ctx.db
     db.update("agent_profiles", {"name": "General Manager (المدير العام)",
                                  "instructions": "You are the General Manager (المدير العام) — warm."},
               "id='custom'")
-    planner = repo.get_by_id(db, "planner")
-    legacy = json.loads(planner["settings_json"])
-    for key in ("team", "team_name", "team_name_en", "reports_to", "contract"):
-        legacy.pop(key, None)
-    legacy["timeout"] = 999
-    db.update("agent_profiles", {"settings_json": json.dumps(legacy, ensure_ascii=False)}, "id='planner'")
-
     assert repo.seed_defaults(db) == 0  # non-empty: upgrade only
     ceo = repo.get_by_id(db, "custom")
     assert ceo["name"] == "Loqman" and ceo["instructions"].startswith("You are Loqman")
-    planner = json.loads(repo.get_by_id(db, "planner")["settings_json"])
-    assert planner["timeout"] == 999  # user value wins
-    assert planner["team"] == "planning" and planner["contract"]  # missing keys merged
+
+
+def test_only_the_ceo_ships_and_old_specialists_are_pruned(make_app):
+    app = make_app(specialists=False)
+    db = app.ctx.db
+    assert [p["id"] for p in repo.list_all(db)] == ["custom"]
+    from .legacy_org import seed_legacy_specialists
+    seed_legacy_specialists(db)
+    mine = repo.create(db, {"id": "custom-mine", "name": "Mine", "role_type": "custom", "instructions": "x"})
+    assert len(repo.list_all(db)) == 11
+    assert repo.seed_defaults(db) == 0  # an older database: the shipped specialists are dropped
+    assert {p["id"] for p in repo.list_all(db)} == {"custom", mine["id"]}
 
 
 def test_user_renamed_ceo_is_left_alone(make_app):

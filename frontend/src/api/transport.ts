@@ -106,7 +106,9 @@ export async function openStream(
   const es = new EventSource(url);
   const forward = (ev: MessageEvent) => {
     try {
-      onMessage(JSON.parse(ev.data));
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'stream_end') es.close();
+      onMessage(msg);
     } catch {
       /* ignore malformed frames */
     }
@@ -153,6 +155,10 @@ export class WorkerEventSource {
     try {
       this.handle = await openStream(this.topic, this.id, (msg) => {
         if (msg.type === 'stream_end') {
+          if (msg.reason === 'complete' || msg.reason === 'closed') {
+            this.close();
+            return;
+          }
           if (!this.closed && msg.reason !== 'closed') {
             this.onerror?.();
             setTimeout(() => void this.connect(), 1500);

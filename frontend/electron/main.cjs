@@ -155,8 +155,8 @@ function registerIpc() {
     const params = { topic, id };
     if (Number.isInteger(lastEventId) && lastEventId > 0) params.last_event_id = lastEventId;
     try {
-      const { stream_id: streamId } = await worker.request('stream.open', params, 15000);
-      streamOwners.set(streamId, event.sender);
+      const { stream_id: streamId } = await worker.request('stream.open', params, 15000,
+        ({ stream_id }) => streamOwners.set(stream_id, event.sender));
       return streamId;
     } catch (error) {
       throw new Error(JSON.stringify({ status: (error && error.status) || null, detail: (error && error.detail) || (error && error.message) || 'Stream failed' }));

@@ -23,6 +23,23 @@ async def wait_mission(api, mission_id, timeout=10, until=TERMINAL):
     raise AssertionError(f"mission stuck in {m['status']}")
 
 
+@pytest.mark.asyncio
+async def test_reviewer_rejection_prevents_successful_mission(make_app):
+    class RejectingReviewer(MockRuntime):
+        async def execute_task(self, task):
+            if "You are the 'reviewer' employee." in task.prompt:
+                return AgentResult(text='{"approved":false,"reason":"The reported total is wrong"}',
+                                   model_id=task.model_id)
+            return await super().execute_task(task)
+
+    api = Api(make_app(runtime=RejectingReviewer()))
+    mission = await api("missions.create", objective="Plan and review the report")
+    done = await wait_mission(api, mission["id"])
+    assert done["status"] in ("failed", "partially_succeeded")
+    reviewer = next(t for t in done["tasks"] if t["employee_role"] == "reviewer")
+    assert reviewer["status"] == "failed"
+
+
 class ScriptedMock(MockRuntime):
     """MockRuntime with hooks for worker prompts (matched on 'employee')."""
 

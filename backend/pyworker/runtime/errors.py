@@ -50,7 +50,7 @@ def safe_error_message(error: BaseException) -> str:
     if isinstance(error, ValueError) and str(error) == "Mission task returned invalid JSON":
         return "Mission task returned invalid JSON"
     code = getattr(error, "code", "runtime_error")
-    if code not in {"offline", "auth", "rate_limited", "model_unavailable", "timeout", "cancelled", "unsupported_capability"}:
+    if code not in {"offline", "auth", "rate_limited", "model_unavailable", "timeout", "cancelled", "unsupported_capability", "output_limit"}:
         code = "runtime_error"
     return f"Request failed ({code})."
 

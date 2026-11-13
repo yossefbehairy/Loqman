@@ -61,6 +61,7 @@ class ExecuteAgentTask:
     timeout: int = 90
     # Locked OpenCode agent to run this task. None -> the work agent.
     agent_id: Optional[str] = None
+    mcp_servers: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

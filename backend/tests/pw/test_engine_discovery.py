@@ -138,7 +138,10 @@ async def test_capabilities_do_not_claim_unenforced_permissions(api):
     assert caps["claude-code"]["conversation_runs"] is True
     assert caps["antigravity"]["conversation_runs"] is True
     assert caps["antigravity"]["permission_policy"] == "plan_mode_and_deny_all_requests"
-    assert all(not c["tool_approvals"] and not c["workspace_restriction"] for c in caps.values())
+    assert caps["claude-code"]["tool_approvals"] is True
+    assert caps["claude-code"]["workspace_restriction"] == "scoped_mcp_tools"
+    assert all(not c["tool_approvals"] and not c["workspace_restriction"]
+               for name, c in caps.items() if name != "claude-code")
 
 
 @pytest.mark.asyncio

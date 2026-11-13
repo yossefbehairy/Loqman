@@ -8,7 +8,12 @@ on:
 
 jobs:
   backend:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUNTIME_MODE: mock
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +25,12 @@ jobs:
           pip install -r backend/requirements.txt
       - name: Pytest
         run: |
-          RUNTIME_MODE=mock python -m pytest backend/tests -q
+          python -m pytest backend/tests -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Worker transport regression tests
+        run: node --test frontend/electron/worker-client.test.cjs
 
   frontend:
     runs-on: ubuntu-latest
@@ -37,6 +47,8 @@ jobs:
       - name: Typecheck
         working-directory: frontend
         run: npx tsc -b
+      - name: Stream lifecycle regressions
+        run: node --test frontend/electron/transport.test.cjs
       - name: Lint
         working-directory: frontend
         run: npm run lint

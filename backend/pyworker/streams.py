@@ -23,6 +23,7 @@ logger = logging.getLogger("agentos.streams")
 
 MAX_STREAMS = 64
 EXECUTION_TERMINAL = ("execution.finished", "execution.failed", "execution.cancelled")
+MISSION_TERMINAL = ("succeeded", "failed", "partially_succeeded", "cancelled")
 Emit = Callable[[Dict[str, Any]], Awaitable[None]]
 
 
@@ -106,11 +107,16 @@ class StreamRegistry:
             for t in mission_repo.tasks_for(db, mission_id):
                 await self._emit(self._msg(sid, "task.status.changed", {
                     "missionId": mission_id, "taskKey": t["task_key"], "status": t["status"]}))
+            if current["status"] in MISSION_TERMINAL:
+                return
             while True:
                 ev = await q.get()
                 if ev["event"] == "stream.overflow":
                     return
                 await self._emit(self._msg(sid, ev["event"], ev["data"]))
+                if (ev["event"] == "mission.status.changed"
+                        and ev["data"].get("status") in MISSION_TERMINAL):
+                    return
         finally:
             event_hub.unsubscribe(mission_id, q)
 
@@ -126,6 +132,14 @@ class StreamRegistry:
                 except Exception:
                     data = {"raw": e["event_json"]}
                 await self._emit(self._msg(sid, e["event_type"], data))
+            current = ex.execution_get(db, execution_id)
+            if not current or current["status"] in ("succeeded", "failed", "cancelled"):
+                if current:
+                    event = {"succeeded": "execution.finished", "failed": "execution.failed",
+                             "cancelled": "execution.cancelled"}[current["status"]]
+                    await self._emit(self._msg(sid, event, {
+                        "executionId": execution_id, "status": current["status"]}))
+                return
             while True:
                 ev = await q.get()
                 if ev["event"] == "stream.overflow":

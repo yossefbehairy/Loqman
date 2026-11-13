@@ -334,6 +334,18 @@ async def _execute_single_task(
         + ("\n".join(context_parts[1:]) if len(context_parts) > 1 else "")
         + "\nReturn STRICT JSON only matching the expected output. No markdown fences."
     )[: settings.MISSION_MAX_PROMPT_CHARS]
+    output_schema_json = profile.get("output_schema_json") if profile else None
+    if output_schema_json:
+        full_prompt += "\nRequired output schema:\n" + output_schema_json
+
+    def validate_worker(text):
+        from backend.pyworker.engine.output_validation import validate_output
+        parsed = _parse_worker_json(text)
+        output_schema = json.loads(output_schema_json) if output_schema_json else None
+        validate_output(parsed, output_schema)
+        if t["employee_role"] == "reviewer" and isinstance(parsed, dict) and parsed.get("approved") is False:
+            raise ValueError("Quality review rejected the deliverable.")
+        return parsed
 
     try:
         task_runtime, task_provider, task_engine = await _select_task_runtime(
@@ -371,7 +383,7 @@ async def _execute_single_task(
                     model_id=model_id, variant=variant, prompt=full_prompt,
                     session_title=f"mission-{mission_id[:8]}-{task_key}",
                     timeout=settings.MISSION_TASK_TIMEOUT, max_output_chars=settings.MISSION_MAX_OUTPUT_CHARS,
-                    validate=_parse_worker_json)
+                    validate=validate_worker)
                 if mission_was_cancelled(db, mission_id):
                     await _finalize_task_cancelled(db, mission_id, t)
                     return

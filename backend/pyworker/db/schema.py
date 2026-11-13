@@ -1,6 +1,6 @@
 """GENERATED from the legacy SQLAlchemy models (schema v16). Static DDL for sqlite3."""
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 TABLES = {
     'agent_profiles': 'CREATE TABLE agent_profiles (\n\tid VARCHAR(64) NOT NULL, \n\tname VARCHAR(255) NOT NULL, \n\trole_type VARCHAR(64) NOT NULL, \n\tdescription TEXT, \n\tinstructions TEXT NOT NULL, \n\tinput_schema_json TEXT, \n\toutput_schema_json TEXT, \n\tdefault_model_id VARCHAR(128) NOT NULL, \n\tdefault_variant_id VARCHAR(64), \n\ttask_depth VARCHAR(32) NOT NULL, \n\tsettings_json TEXT, \n\tengine VARCHAR(32), \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)',
@@ -24,6 +24,20 @@ TABLES = {
     'deliverable_drafts': 'CREATE TABLE deliverable_drafts (\n\tid VARCHAR(36) NOT NULL, \n\trun_id VARCHAR(36) NOT NULL, \n\tfilename VARCHAR(128) NOT NULL, \n\tmime VARCHAR(64) NOT NULL, \n\tcontent TEXT NOT NULL, \n\tcontent_sha256 VARCHAR(64) NOT NULL, \n\tsize_bytes INTEGER NOT NULL, \n\tprovenance_json TEXT NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tdecided_at DATETIME, \n\tdecision_note TEXT, \n\tPRIMARY KEY (id), \n\tCONSTRAINT uq_deliverable_run_content_name UNIQUE (run_id, content_sha256, filename), \n\tFOREIGN KEY(run_id) REFERENCES conversation_runs (id) ON DELETE CASCADE\n)',
     'execution_events': 'CREATE TABLE execution_events (\n\tid VARCHAR(36) NOT NULL, \n\texecution_id VARCHAR(36) NOT NULL, \n\tnode_execution_id VARCHAR(36), \n\tevent_type VARCHAR(64) NOT NULL, \n\tevent_json TEXT NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(execution_id) REFERENCES workflow_executions (id) ON DELETE CASCADE, \n\tFOREIGN KEY(node_execution_id) REFERENCES node_executions (id) ON DELETE CASCADE\n)',
 }
+
+TABLES["workspace_writes"] = """CREATE TABLE workspace_writes (
+    id TEXT PRIMARY KEY,
+    run_id VARCHAR(36) NOT NULL REFERENCES conversation_runs(id),
+    root TEXT NOT NULL,
+    path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    approval_id TEXT,
+    temporary_path TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+)"""
 
 # Indexes per table (created with the table, like SQLAlchemy create_all).
 INDEXES = {

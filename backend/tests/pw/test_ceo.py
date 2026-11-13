@@ -80,7 +80,8 @@ async def test_duplicate_write_proposals_are_not_repeated(make_app):
     rt = Recorder(scripted=[call, call, '{"final": "done"}'])
     api = Api(make_app(runtime=rt))
     out = await api("ceo.ask", question="Please do the status thing")
-    assert out["reply"] == "done" and len(out["actions_proposed"]) == 1
+    assert out["reply"] == "done" and out["actions_proposed"] == []
+    assert len(out["agents_created"]) == 1  # the CEO creates agents on its own, once
     assert "already recorded" in rt.prompts[2].prompt
 
 
@@ -173,29 +174,38 @@ async def test_newer_manual_edit_wins_over_stale_proposal(api):
 
 
 @pytest.mark.asyncio
-async def test_approve_new_profile_and_team_create_real_profiles(api):
-    pid = await proposal(api, "أضف موظف جديد")
-    out = await api("ceo.approve", action_id=pid, confirm=True)
-    assert out["status"] == "approved" and len(out["created_profiles"]) == 1
-    created = out["created_profiles"][0]
+async def test_ceo_creates_agents_and_teams_without_approval(api):
+    before = len((await api("profiles.list"))["profiles"])
+    out = await api("ceo.ask", question="أضف موظف جديد")
+    assert out["actions_proposed"] == [] and len(out["agents_created"]) == 1
+    created = out["agents_created"][0]
     assert created["id"].startswith("custom-") and created["role_type"] == "researcher"
     assert (await api("profiles.get", profile_id=created["id"]))["name"].startswith("Nadia")
+    assert (await api("ceo.actions"))["actions"] == []  # nothing waits for approval
 
-    tid = await proposal(api, "create a security team")
-    out = await api("ceo.approve", action_id=tid, confirm=True)
-    assert out["status"] == "approved" and len(out["created_profiles"]) == 3 and "Security Review" in out["team_name"]
-    assert len((await api("profiles.list"))["profiles"]) == 10 + 1 + 3
+    out = await api("ceo.ask", question="create a security team")
+    assert len(out["agents_created"]) == 3 and out["actions_proposed"] == []
+    assert len((await api("profiles.list"))["profiles"]) == before + 1 + 3
+
+
+@pytest.mark.asyncio
+async def test_unknown_roles_become_custom_agents(api):
+    bad_team = {"name": "T", "members": [{"name": "wiz", "role_type": "wizard", "instructions": "i"}]}
+    api.db.insert("pending_actions", {"id": "w1", "kind": "new_team", "payload_json": json.dumps(bad_team),
+                                      "summary": "s", "status": "pending", "created_at": "2026-01-01 00:00:00.000000"})
+    out = await api("ceo.approve", action_id="w1", confirm=True)
+    assert out["status"] == "approved" and out["created_profiles"][0]["role_type"] == "custom"
 
 
 @pytest.mark.asyncio
 async def test_invalid_team_is_atomic_zero_profiles_created(api):
     bad_team = {"name": "T", "members": [
         {"name": "ok", "role_type": "coder", "instructions": "i"},
-        {"name": "bad", "role_type": "wizard", "instructions": "i"}]}
+        {"name": "bad", "role_type": "coder", "instructions": ""}]}
     api.db.insert("pending_actions", {"id": "a1", "kind": "new_team", "payload_json": json.dumps(bad_team),
                                       "summary": "s", "status": "pending", "created_at": "2026-01-01 00:00:00.000000"})
     out = await api("ceo.approve", action_id="a1", confirm=True)
-    assert out["status"] == "failed" and out["decision_note"] == "Team member has unknown role."
+    assert out["status"] == "failed" and out["decision_note"] == "Team member requires name and instructions."
     assert len((await api("profiles.list"))["profiles"]) == 10  # no zombie rows
     api.db.insert("pending_actions", {"id": "a2", "kind": "bogus_kind", "payload_json": "{}", "summary": "s",
                                       "status": "pending", "created_at": "2026-01-01 00:00:00.000000"})
@@ -212,9 +222,9 @@ async def test_proposal_tools_validate_before_recording(make_app):
         db, "propose_update_contract", {"profile": "planner", "changes": {"id": "hacked"}})
     assert "not found" in ceo_tools.run_tool(db, "propose_update_contract",
                                              {"profile": "ghost", "changes": {"name": "x"}})
-    assert "unknown role" in ceo_tools.run_tool(db, "propose_new_profile",
-                                                {"name": "n", "role": "wizard", "instructions": "i"})
+    assert "recorded" in ceo_tools.run_tool(db, "propose_new_profile",
+                                            {"name": "n", "role": "wizard", "instructions": "i"})  # unknown role -> custom
     assert ceo_tools.run_tool(db, "propose_new_team", {"name": "t", "members": []}).startswith("ERROR: invalid args")
     assert ceo_tools.run_tool(db, "get_profile", {"identifier": "dr_sara"}).startswith("planner |")
     assert ceo_tools.run_tool(db, "list_missions", {"limit": 99}).startswith("ERROR: invalid args")
-    assert db.scalar("SELECT COUNT(*) FROM pending_actions") == 0
+    assert db.scalar("SELECT COUNT(*) FROM pending_actions") == 1  # only the valid new_profile request

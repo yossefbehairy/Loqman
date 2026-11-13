@@ -14,6 +14,9 @@ from .config import parse_args, setup_logging
 
 
 def main(argv: list[str] | None = None) -> int:
+    if (sys.argv[1:] if argv is None else argv) == ["--mcp-proxy"]:
+        from .mcp_proxy import main as proxy_main
+        return proxy_main()
     settings = parse_args(sys.argv[1:] if argv is None else argv)
     proto_out = sys.stdout.buffer
     proto_in = sys.stdin.buffer

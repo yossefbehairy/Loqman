@@ -139,7 +139,7 @@ def test_mock_engine_is_refused_outside_mock_mode_without_fallback(worker_factor
     err = w.err("runs.start_turn", {"conversation_id": cid, "engine": "mock", "model_id": "m", "prompt": "hi"})
     assert err["status"] == 422 and "Unsupported engine" in err["message"]
     assert w.ok("conversations.messages", {"conversation_id": cid})["messages"] == []
-    assert w.err("profiles.update", {"profile_id": "coder", "engine": "mock"})["status"] == 422
+    assert w.err("profiles.update", {"profile_id": "custom", "engine": "mock"})["status"] == 422
 
 
 def test_run_events_replay_in_order_without_duplicates_and_stream_resume(worker_factory):

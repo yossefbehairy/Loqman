@@ -19,6 +19,8 @@ async def stream_open(ctx, params):
     topic = req_enum(params, "topic", ("run", "mission", "execution"))
     key = req_str(params, "id", 1, 64)
     last = opt_int(params, "last_event_id", 0, 0, 2**63 - 1)
+    if topic != "run" and last:
+        raise api_error(422, "Only run streams support last_event_id; reopen this topic for a fresh snapshot.")
     if topic == "run":
         try:
             ctx.runs.get_run(key)

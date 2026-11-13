@@ -57,7 +57,7 @@ def _upgrade_run_table(db: Database) -> None:
     new_fields = {"kind", "mission_id", "mission_task_id", "attempt", "result_text"}
     if cols["conversation_id"]["notnull"] == 0 and new_fields.issubset(cols):
         return
-    wanted = set(_columns_from_ddl(TABLES["conversation_runs"]))
+    wanted = set(_columns_from_ddl(TABLES["conversation_runs"])) | {"tool_config_json", "profile_snapshot_json"}
     if set(cols) - wanted:
         raise RuntimeError("Run table contains unrecognized columns; automatic rebuild refused")
     names = ", ".join(cols)
@@ -99,8 +99,30 @@ def init_db(db: Database) -> None:
         raise SchemaTooNew(f"Database schema version {version} is newer than supported version {SCHEMA_VERSION}")
     existing = _tables(db)
     own = existing - {"sqlite_sequence"}
-    if own and not (own & set(TABLES)):
-        raise ForeignDatabase("The file is not an AgentOS database; refusing to modify it.")
+    if own:
+        # These columns were introduced by additive migrations below.
+        added = {
+            "missions": {"source_conversation_id", "request_fingerprint"},
+            "mission_tasks": {"expected_output"},
+            "agent_profiles": {"engine"},
+            "usage_events": {"tokens_cache_read", "run_id"},
+            "conversations": {"workspace_id"},
+            "conversation_runs": {
+                "variant", "request_key", "skills_json", "input_files_json",
+                "kind", "mission_id", "mission_task_id", "attempt", "result_text",
+                "user_message_seq", "assistant_message_seq", "error",
+                "started_at", "finished_at", "tool_config_json", "profile_snapshot_json",
+            },
+        }
+        recognized = own & set(TABLES)
+        if not recognized:
+            raise ForeignDatabase("The file is not an AgentOS database; refusing to modify it.")
+        for name in recognized:
+            columns = _columns(db, name)
+            required = set(_columns_from_ddl(TABLES[name])) - added.get(name, set())
+            if not required.issubset(columns) or not any(c["pk"] for c in columns.values()):
+                raise ForeignDatabase(
+                    f"Table {name} does not match an AgentOS schema; refusing to modify it.")
     db.enable_wal()
     if version < SCHEMA_VERSION and own:
         _backup(db)
@@ -130,9 +152,12 @@ def init_db(db: Database) -> None:
         _add_column(db, "conversation_runs", "request_key", "VARCHAR(128)")
         _add_column(db, "conversation_runs", "skills_json", "TEXT")
         _add_column(db, "conversation_runs", "input_files_json", "TEXT")
+        _add_column(db, "conversation_runs", "tool_config_json", "TEXT")
+        _add_column(db, "conversation_runs", "profile_snapshot_json", "TEXT")
     if "conversations" in existing:
         _add_column(db, "conversations", "workspace_id",
                     "VARCHAR(36) REFERENCES workspaces(id) ON DELETE SET NULL")
+        _add_column(db, "conversations", "profile_id", "VARCHAR(64)")
     # Indexes the legacy upgrade path added explicitly to pre-existing tables.
     explicit = {"conversations": ("ix_conversations_workspace_id",),
                 "missions": ("ix_missions_source_conversation_id",),
