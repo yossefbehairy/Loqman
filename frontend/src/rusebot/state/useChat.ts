@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CEO_PROFILE_ID,
-  addMessage,
+  bindConversationProfile,
   askCeo,
   cancelRun,
   createConversation,
   decideApproval,
   decideDraft,
   draftContent,
-  engineCapabilities,
-  engineModels,
-  engineStatuses,
   createDraft,
   followRun,
   freeModels,
@@ -19,7 +16,9 @@ import {
   isTerminal,
   listApprovals,
   listConversations,
+  listAllDrafts,
   listDrafts,
+  listRuns,
   listMessages,
   startTurn,
   type Approval,
@@ -28,18 +27,28 @@ import {
   type Draft,
   type EngineCapabilities,
   type EngineModel,
+  type EngineStateId,
   type EngineStatus,
   type RunSnapshot,
 } from '../data/worker';
 import type { StreamHandle } from '../../api/transport';
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
 import type { Agent } from '../../types/agentos';
+import {
+  loadProviderModels,
+  selectProviderEngine,
+  setProviderChoice,
+  useProviders,
+  type EngineChoice,
+} from './useProviders';
 
 const KEY_DRAFTS = 'agentos.rusebot.drafts.v1';
 const KEY_RUNS = 'agentos.rusebot.runs.v1';
 const KEY_SELECTED = 'agentos.rusebot.selected.v1';
-const KEY_ENGINE = 'agentos.rusebot.engine.v1';
 const KEY_AGENTS = 'agentos.rusebot.convAgents.v1';
+
+/** ceo.ask refuses longer questions (backend/pyworker/api/ceo.py), so refuse them before anything is saved. */
+export const CEO_MAX_CHARS = 2000;
 
 export const CONTRACT_OPEN = '[[contract]]';
 export const CONTRACT_CLOSE = '[[/contract]]';
@@ -67,75 +76,40 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
-export interface EngineChoice {
-  engine: string;
-  model: string;
-}
+export type { EngineChoice } from './useProviders';
 
 export interface EngineState {
-  engines: Array<{ id: string; status: EngineStatus | null; caps: EngineCapabilities }>;
+  engines: Array<{ id: string; status: EngineStatus | null; caps: EngineCapabilities; state: EngineStateId; title: string }>;
+  /** Models of the current provider. */
   models: EngineModel[];
   choice: EngineChoice | null;
   loading: boolean;
   setChoice: (choice: EngineChoice) => void;
+  /** Switch provider and use its preferred model. */
+  selectEngine: (engine: string) => Promise<void>;
   loadModels: (engine: string) => Promise<EngineModel[]>;
 }
 
+/** Thin adapter over the shared provider store (see useProviders.ts). */
 export function useEngines(): EngineState {
-  const [engines, setEngines] = useState<EngineState['engines']>([]);
-  const [models, setModels] = useState<EngineModel[]>([]);
-  const [choice, setChoiceState] = useState<EngineChoice | null>(() => readJson<EngineChoice | null>(KEY_ENGINE, null));
-  const [loading, setLoading] = useState(true);
-
-  const loadModels = useCallback(async (engine: string) => {
-    try {
-      const list = engine === 'mock' ? await freeModels() : await engineModels(engine);
-      setModels(list);
-      return list;
-    } catch {
-      setModels([]);
-      return [];
-    }
-  }, []);
-
-  const setChoice = useCallback((next: EngineChoice) => {
-    setChoiceState(next);
-    writeJson(KEY_ENGINE, next);
-  }, []);
-
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const [caps, statuses] = await Promise.all([
-        engineCapabilities().catch(() => ({}) as Record<string, EngineCapabilities>),
-        engineStatuses().catch(() => [] as EngineStatus[]),
-      ]);
-      if (!alive) return;
-      const usable = Object.entries(caps)
-        .filter(([, c]) => c.conversation_runs)
-        .map(([id, c]) => ({ id, caps: c, status: statuses.find((s) => s.engine_id === id) ?? null }));
-      setEngines(usable);
-      const stored = readJson<EngineChoice | null>(KEY_ENGINE, null);
-      const pick =
-        usable.find((e) => e.id === stored?.engine) ??
-        usable.find((e) => e.id === 'mock') ??
-        usable.find((e) => e.status?.install_state === 'installed') ??
-        usable[0];
-      if (pick) {
-        const list = await loadModels(pick.id);
-        if (!alive) return;
-        const model = list.find((m) => m.id === stored?.model && pick.id === stored?.engine)?.id ?? list[0]?.id ?? '';
-        if (model) setChoiceState({ engine: pick.id, model });
-      }
-      setLoading(false);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [loadModels]);
-
-  return { engines, models, choice, loading, setChoice, loadModels };
+  const s = useProviders();
+  const engines = useMemo(
+    () => s.selectable.map((e) => ({ id: e.id, status: e.status, caps: e.caps, state: e.state, title: e.title })),
+    [s.selectable]
+  );
+  const models = s.choice ? (s.models[s.choice.engine]?.list ?? NO_MODELS) : NO_MODELS;
+  return {
+    engines,
+    models,
+    choice: s.choice,
+    loading: s.loading,
+    setChoice: setProviderChoice,
+    selectEngine: selectProviderEngine,
+    loadModels: loadProviderModels,
+  };
 }
+
+const NO_MODELS: EngineModel[] = [];
 
 export interface RunState {
   runId: string;
@@ -175,6 +149,12 @@ export interface ChatState {
 
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function cacheRuns(conversationId: string, ids: string[]): void {
+  const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+  all[conversationId] = ids.slice(-30);
+  writeJson(KEY_RUNS, all);
 }
 
 export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAgentsChanged?: () => void): ChatState {
@@ -219,8 +199,14 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   const loadThread = useCallback(async (conversationId: string) => {
     const list = await listMessages(conversationId);
     if (selectedRef.current === conversationId) setMessages(list);
-    const ids = readJson<Record<string, string[]>>(KEY_RUNS, {})[conversationId] ?? [];
-    const snaps = await Promise.all(ids.slice(-30).map((id) => getRun(id).catch(() => null)));
+    // The worker knows this conversation's runs; the browser index is only a fallback when it is unreachable.
+    let snaps: Array<RunSnapshot | null> | null = await listRuns(conversationId, 30).catch(() => null);
+    if (snaps) {
+      cacheRuns(conversationId, snaps.map((s) => s!.id));
+    } else {
+      const ids = readJson<Record<string, string[]>>(KEY_RUNS, {})[conversationId] ?? [];
+      snaps = await Promise.all(ids.slice(-30).map((id) => getRun(id).catch(() => null)));
+    }
     const bySeq: Record<number, RunSnapshot> = {};
     const nextDrafts: Record<string, Draft[]> = {};
     for (const snap of snaps) {
@@ -294,9 +280,19 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         if (!alive) return;
         setConversations(list);
         const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+        // Recover from the cache, and ask the worker about recent chats the cache does not know (cleared storage).
+        const lastRun: Record<string, string | undefined> = {};
+        for (const [cid, ids] of Object.entries(all)) lastRun[cid] = ids[ids.length - 1];
+        const unknown = list.filter((c) => !(c.id in lastRun)).slice(0, 10);
+        await Promise.all(
+          unknown.map(async (c) => {
+            const found = await listRuns(c.id, 1).catch(() => []);
+            if (found[0]) lastRun[c.id] = found[0].id;
+          })
+        );
+        if (!alive) return;
         const active: Record<string, RunState> = {};
-        for (const [cid, ids] of Object.entries(all)) {
-          const last = ids[ids.length - 1];
+        for (const [cid, last] of Object.entries(lastRun)) {
           if (!last) continue;
           const snap = await getRun(last).catch(() => null);
           if (snap && !isTerminal(snap.status)) {
@@ -371,17 +367,32 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     async (text: string) => {
       const prompt = text.trim();
       if (!prompt) return;
-      if (!engine) {
-        setError('No engine is available yet. Open Settings → AI to check your engines.');
+      if (!engine?.model) {
+        setError('No AI provider is ready. Open Settings > AI to sign in or pick a model.');
         return;
       }
       setError(null);
       let cid = selectedRef.current;
       const draftKey = cid ?? '';
+      const known = cid && !cid.startsWith('legacy:') ? cid : null;
+      const target = known
+        ? (agents.find((a) => a.id === agentMapRef.current[known]) ?? ceo)
+        : (agents.find((a) => a.id === draftAgentRef.current) ?? ceo);
+      if ((!target || target.id === CEO_PROFILE_ID) && prompt.length > CEO_MAX_CHARS) {
+        setError(
+          `Loqman reads messages of up to ${CEO_MAX_CHARS.toLocaleString('en-US')} characters; this one has ${prompt.length.toLocaleString('en-US')}. Shorten it and send again.`
+        );
+        return;
+      }
+      let boundProfile: string | null | undefined = cid ? conversations.find((c) => c.id === cid)?.profile_id : null;
       try {
         if (!cid || cid.startsWith('legacy:')) {
-          const created = await createConversation(prompt.replace(/\s+/g, ' ').slice(0, 60));
+          const created = await createConversation(
+            prompt.replace(/\s+/g, ' ').slice(0, 60),
+            target && target.id !== CEO_PROFILE_ID ? target.id : undefined
+          );
           cid = created.id;
+          boundProfile = created.profile_id;
           setConversations((prev) => [created, ...prev]);
           selectedRef.current = cid;
           setSelectedId(cid);
@@ -405,33 +416,43 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           clearDraft();
           setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'running', error: null } }));
           try {
-            await addMessage(conversationId, 'user', prompt);
-            setMessages(await listMessages(conversationId));
             const free = await freeModels().catch(() => [] as EngineModel[]);
             const model = free.find((m) => m.id === engine.model)?.id ?? free[0]?.id ?? engine.model;
-            const answer = await askCeo(prompt, model, ticket);
-            const made = answer.agents_created.map((a) => a.name);
-            const note = made.length ? `
-
-✓ ${made.length === 1 ? 'Agent created' : 'Agents created'}: ${made.join(', ')}` : '';
-            await addMessage(conversationId, 'assistant', `${answer.reply}${note}`);
-            if (made.length) onAgentsChanged?.();
+            // The worker stores both sides of the exchange in this chat (the question before generating, the
+            // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
+            const answer = await askCeo(prompt, model, ticket, conversationId);
+            if (answer.agents_created.length) onAgentsChanged?.();
           } catch (e) {
             setError(messageOf(e));
+            setDraftMap((prev) => {
+              const next = { ...prev, [conversationId]: prev[conversationId] || prompt };
+              writeJson(KEY_DRAFTS, next);
+              return next;
+            });
           } finally {
             setPendingUser(null);
             setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'succeeded', error: null } }));
             await refreshConversations().catch(() => undefined);
-            if (selectedRef.current === conversationId) setMessages(await listMessages(conversationId).catch(() => []));
+            const list = await listMessages(conversationId).catch(() => null);
+            if (list && selectedRef.current === conversationId) setMessages(list);
           }
           return;
         }
-        const first = (await listMessages(cid)).length === 0;
-        const outgoing = first && agent?.prompt ? `${CONTRACT_OPEN}
+        // A chat made before conversations were bound to their agent has no profile: bind it now so the
+        // worker applies the agent's instructions; only if that fails does the first message carry the contract.
+        let outgoing = prompt;
+        if (agent && !boundProfile) {
+          const bound = await bindConversationProfile(cid, agent.id).catch(() => null);
+          if (bound) {
+            setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
+          } else if (agent.prompt && (await listMessages(cid).catch(() => [{}])).length === 0) {
+            outgoing = `${CONTRACT_OPEN}
 ${agent.prompt}
 ${CONTRACT_CLOSE}
 
-${prompt}` : prompt;
+${prompt}`;
+          }
+        }
         setPendingUser(prompt);
         const snap = await startTurn({
           conversationId: cid,
@@ -448,7 +469,8 @@ ${prompt}` : prompt;
           return next;
         });
         setRuns((prev) => ({ ...prev, [cid!]: { runId: snap.id, status: snap.status, error: null } }));
-        setMessages(await listMessages(cid));
+        const list = await listMessages(cid).catch(() => null);
+        if (list && selectedRef.current === cid) setMessages(list);
         follow(cid, snap.id);
       } catch (e) {
         setPendingUser(null);
@@ -456,7 +478,7 @@ ${prompt}` : prompt;
         throw e;
       }
     },
-    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations]
+    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations, conversations]
   );
 
   const openAgentChat = useCallback(
@@ -468,7 +490,10 @@ ${prompt}` : prompt;
         select(existing);
         return existing;
       }
-      const created = await createConversation(`${agent.name} — ${agent.role}`.slice(0, 120));
+      const created = await createConversation(
+        `${agent.name} — ${agent.role}`.slice(0, 120),
+        agent.id !== CEO_PROFILE_ID ? agent.id : undefined
+      );
       bindAgent(created.id, agent.id);
       setConversations((prev) => [created, ...prev]);
       select(created.id);
@@ -507,11 +532,17 @@ ${prompt}` : prompt;
   }, []);
 
   const loadAllDrafts = useCallback(async () => {
-    const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
     const next: Record<string, Draft[]> = {};
-    for (const id of Object.values(all).flat()) {
-      const list = await listDrafts(id).catch(() => []);
-      if (list.length) next[id] = list;
+    const fromWorker = await listAllDrafts().catch(() => null);
+    if (fromWorker) {
+      for (const d of fromWorker) (next[d.run_id] ??= []).push(d);
+      for (const list of Object.values(next)) list.reverse(); // the worker lists newest first; cards read oldest first
+    } else {
+      const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+      for (const id of Object.values(all).flat()) {
+        const list = await listDrafts(id).catch(() => []);
+        if (list.length) next[id] = list;
+      }
     }
     setDrafts((prev) => ({ ...prev, ...next }));
   }, []);

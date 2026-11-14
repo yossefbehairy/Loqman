@@ -1,8 +1,9 @@
 """Canonical engine lookup shared by setup/catalog APIs."""
 from backend.pyworker.runtime.base import AgentRuntime
+from backend.pyworker.runtime.providers import PROVIDERS
 
 
-ENGINE_IDS = ("opencode", "claude-code", "codex", "antigravity")
+ENGINE_IDS = tuple(p.engine_id for p in PROVIDERS)
 
 
 def create_engine_runtime(engine_id: str) -> AgentRuntime:

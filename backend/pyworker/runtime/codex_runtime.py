@@ -287,7 +287,7 @@ class CodexCliRuntime:
         free (free_only=True therefore returns [])."""
         if free_only:
             return []
-        return [ModelCatalogEntry(id=slug, name=f"{name} (Codex, unverified)",
+        return [ModelCatalogEntry(id=slug, name=name,
                                   provider_id="openai-codex", cost=ModelCost(),
                                   variants=efforts, is_free=False, status="unverified")
                 for slug, name, efforts in await self._catalog()]

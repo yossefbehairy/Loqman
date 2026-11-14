@@ -7,9 +7,10 @@
  * the "+" menu holds the engine and model choice.
  */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowUp, Plus, Square, UserPlus } from 'lucide-react';
+import { ArrowUp, Plus, Server, Square, UserPlus } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { EngineState } from '../state/useChat';
+import { STATE_SHORT, selectable } from '../state/providerText';
 
 export interface ComposerProps {
   placeholder: string;
@@ -21,9 +22,12 @@ export interface ComposerProps {
   disabled?: boolean;
   engines: EngineState;
   onNewAgent?: () => void;
+  /** Opens Settings on the AI page. */
+  onManageProviders?: () => void;
 }
 
-export function Composer({ placeholder, value, onChange, onSend, onStop, running, disabled, engines, onNewAgent }: ComposerProps) {
+export function Composer({ placeholder, value, onChange, onSend, onStop, running, disabled, engines, onNewAgent, onManageProviders }: ComposerProps) {
+  const choice = engines.choice;
   const ref = useRef<HTMLTextAreaElement>(null);
   const [menu, setMenu] = useState(false);
   const [sending, setSending] = useState(false);
@@ -50,7 +54,9 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, running
     };
   }, [menu]);
 
-  const canSend = value.trim().length > 0 && !running && !sending && !disabled;
+  // No usable provider with a model: sending would go nowhere, so say so and point to Settings > AI.
+  const noProvider = !disabled && !(choice?.model);
+  const canSend = value.trim().length > 0 && !running && !sending && !disabled && !noProvider;
   const submit = async () => {
     if (!canSend) return;
     const text = value;
@@ -65,13 +71,24 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, running
     }
   };
 
-  const choice = engines.choice;
-
   return (
     <div
       data-tour="composer"
       className="@container/composer relative z-[1] rounded-3xl bg-composer px-2 py-1.5 ring-1 ring-composer-ring"
     >
+      {noProvider && (
+        <p role="status" data-composer-no-provider className="px-3 pb-1 pt-1.5 text-[12.5px] leading-relaxed text-ink-secondary">
+          No AI provider is ready to answer.{' '}
+          {onManageProviders ? (
+            <button type="button" onClick={onManageProviders} className="font-medium text-accent-text hover:underline">
+              Open Settings &gt; AI
+            </button>
+          ) : (
+            'Open Settings > AI'
+          )}{' '}
+          to sign in or pick a model.
+        </p>
+      )}
       <div data-composer-row="true" className="flex items-end gap-1 @max-[30rem]/composer:flex-wrap">
         <div className="flex flex-wrap items-center gap-1">
           <div className="relative" ref={menuRef}>
@@ -112,21 +129,23 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, running
                   </button>
                 )}
                 <label className="block px-2 pb-1 pt-1 text-[12px] font-medium text-ink-secondary" htmlFor="rb-engine">
-                  Engine
+                  Provider
                 </label>
                 <select
                   id="rb-engine"
                   value={choice?.engine ?? ''}
-                  onChange={async (e) => {
-                    const list = await engines.loadModels(e.target.value);
-                    engines.setChoice({ engine: e.target.value, model: list[0]?.id ?? '' });
-                  }}
+                  onChange={(e) => void engines.selectEngine(e.target.value)}
                   className="mb-2 w-full rounded-lg border border-hairline/40 bg-control px-2 py-1.5 text-[13px] text-ink focus:outline-none focus:ring-1 focus:ring-focus"
                 >
+                  {!choice && (
+                    <option value="" disabled>
+                      Choose a provider
+                    </option>
+                  )}
                   {engines.engines.map((e) => (
-                    <option key={e.id} value={e.id} disabled={e.id !== 'mock' && e.status?.install_state !== 'installed'}>
-                      {e.id}
-                      {e.status && e.status.install_state !== 'installed' ? ' (not installed)' : ''}
+                    <option key={e.id} value={e.id} disabled={e.id !== 'mock' && !selectable(e.state)}>
+                      {e.title}
+                      {e.id !== 'mock' && e.state !== 'ready' ? ` (${STATE_SHORT[e.state]})` : ''}
                     </option>
                   ))}
                 </select>
@@ -145,6 +164,20 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, running
                     </option>
                   ))}
                 </select>
+                {onManageProviders && (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    data-composer-manage-providers
+                    onClick={() => {
+                      setMenu(false);
+                      onManageProviders();
+                    }}
+                    className="mt-2 flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left text-[13.5px] text-ink hover:bg-raised/70"
+                  >
+                    <Server size={15} aria-hidden="true" /> Manage providers…
+                  </button>
+                )}
               </div>
             )}
           </div>

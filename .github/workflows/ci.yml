@@ -49,6 +49,8 @@ jobs:
         run: npx tsc -b
       - name: Stream lifecycle regressions
         run: node --test frontend/electron/transport.test.cjs
+      - name: Bridge origin and content-type regressions
+        run: node --test frontend/electron/bridge.test.cjs
       - name: Lint
         working-directory: frontend
         run: npm run lint

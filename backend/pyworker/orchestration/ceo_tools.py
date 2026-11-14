@@ -8,6 +8,7 @@ database excerpts. Write tools NEVER mutate: they insert exactly one row into
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timezone
 from types import SimpleNamespace
@@ -150,11 +151,18 @@ def _handle_get_profile(db: Database, args) -> str:
             f"Instructions: {_excerpt(prof['instructions'] or '')}")
 
 
+# Ids of proposals recorded by the tool call currently running (set by run_tool, per request).
+_recording: ContextVar[Optional[List[str]]] = ContextVar("ceo_tools_recording", default=None)
+
+
 def _record_action(db: Database, kind: str, payload: dict, summary: str) -> str:
     action_id = new_id()
     db.insert("pending_actions", {
         "id": action_id, "kind": kind, "payload_json": json.dumps(payload, ensure_ascii=False),
         "summary": summary, "status": "pending", "created_by": "ceo-loop", "created_at": ts()})
+    sink = _recording.get()
+    if sink is not None:
+        sink.append(action_id)
     return action_id
 
 
@@ -244,8 +252,9 @@ def tool_catalog_prompt() -> str:
     return "\n".join(f"- {spec.name} ({spec.kind}): {spec.description}" for spec in TOOLS.values())
 
 
-def run_tool(db: Database, name: str, args: Dict[str, Any]) -> str:
-    """Validate + dispatch one tool call. Returns the observation string."""
+def run_tool(db: Database, name: str, args: Dict[str, Any], created: Optional[List[str]] = None) -> str:
+    """Validate + dispatch one tool call. Returns the observation string.
+    Ids of proposals this call records are appended to ``created`` (the caller's own list)."""
     spec = TOOLS.get(name)
     if spec is None:
         return f"ERROR: unknown tool '{name}'. Available: {sorted(TOOLS)}."
@@ -253,10 +262,13 @@ def run_tool(db: Database, name: str, args: Dict[str, Any]) -> str:
         parsed = spec.parse(args or {})
     except Exception:
         return f"ERROR: invalid args for '{name}'"
+    token = _recording.set(created)
     try:
         return spec.handler(db, parsed)
     except Exception:
         return f"ERROR: tool '{name}' failed"
+    finally:
+        _recording.reset(token)
 
 
 def pending_action_ids(db: Database) -> List[str]:

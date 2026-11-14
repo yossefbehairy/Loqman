@@ -30,7 +30,7 @@ from backend.pyworker.engine.events import (
     record_event,
 )
 from backend.pyworker.engine.state_machine import NodeState, WorkflowState
-from backend.pyworker.engine.validator import normalize_node_type, validate_workflow_graph
+from backend.pyworker.engine.validator import normalize_agent_data, normalize_node_type, validate_workflow_graph
 from backend.pyworker.engine.output_validation import validate_output
 from backend.pyworker.runtime.base import AgentRuntime, ExecuteAgentTask
 from backend.pyworker.runtime.errors import safe_error_message
@@ -221,8 +221,8 @@ async def execute_workflow(
 
     for nid in topological_order:
         n_def = node_map[nid]
-        n_data = n_def.get("data", {})
         n_type = normalize_node_type(n_def.get("type"))
+        n_data = normalize_agent_data(n_def.get("data")) if n_type == "agent" else n_def.get("data", {})
         node_db_records[nid] = exec_repo.record_node_execution(db, {
             "execution_id": execution_id, "node_id": nid,
             "role_type": n_data.get("role_type") or n_type, "model_id": n_data.get("model_id"),
@@ -247,7 +247,7 @@ async def execute_workflow(
 
             n_def = node_map[nid]
             n_type = normalize_node_type(n_def.get("type"))
-            n_data = n_def.get("data", {})
+            n_data = normalize_agent_data(n_def.get("data")) if n_type == "agent" else n_def.get("data", {})
             n_rec = node_db_records[nid]
             upstreams = upstream_map.get(nid, [])
 

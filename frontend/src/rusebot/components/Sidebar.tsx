@@ -9,6 +9,7 @@ import { ChevronLeft, ChevronRight, FileText, Loader2, MessageSquarePlus, Packag
 import { cn } from '../lib/cn';
 import { GlassBar, GlassScrollFrame, GlassScroller } from './GlassScrollFrame';
 import type { Conversation } from '../data/worker';
+import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
 
 export type View = 'chat' | 'team' | 'contracts' | 'results';
@@ -17,7 +18,7 @@ const SIMPLE_TOP_BUTTON =
   'flex size-[30px] shrink-0 items-center justify-center rounded-full bg-raised/50 text-ink hover:bg-raised focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus';
 
 function stamp(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   if (Number.isNaN(d.getTime())) return '';
   const today = new Date();
   return d.toDateString() === today.toDateString()
@@ -107,9 +108,14 @@ export function Sidebar(props: SidebarProps) {
   }, [plusOpen]);
   const q = query.trim().toLowerCase();
 
-  useEffect(() => {
-    if (!searchOpen) setQuery('');
-  }, [searchOpen]);
+  const toggleSearch = () => {
+    if (searchOpen) setQuery('');
+    setSearchOpen(!searchOpen);
+  };
+  const closeSearch = () => {
+    setQuery('');
+    setSearchOpen(false);
+  };
 
   const rows = useMemo(
     () => props.conversations.filter((c) => !q || c.title.toLowerCase().includes(q)),
@@ -206,7 +212,7 @@ export function Sidebar(props: SidebarProps) {
               <button
                 type="button"
                 data-sidebar-search-toggle
-                onClick={() => setSearchOpen((o) => !o)}
+                onClick={toggleSearch}
                 aria-label="Search chats"
                 aria-expanded={searchOpen}
                 title="Search chats"
@@ -273,7 +279,7 @@ export function Sidebar(props: SidebarProps) {
                   onKeyDown={(e) => {
                     if (e.key === 'Escape') {
                       e.preventDefault();
-                      setSearchOpen(false);
+                      closeSearch();
                     }
                   }}
                   placeholder="Search chats"
@@ -282,7 +288,7 @@ export function Sidebar(props: SidebarProps) {
                 />
                 <button
                   type="button"
-                  onClick={() => setSearchOpen(false)}
+                  onClick={closeSearch}
                   aria-label="Close search"
                   title="Close search"
                   className="flex size-6 shrink-0 items-center justify-center rounded-full text-ink-tertiary hover:bg-raised hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-focus"

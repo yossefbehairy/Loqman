@@ -6,18 +6,16 @@ import { useEffect, useRef, useState } from 'react';
 import { UserPlus, X } from 'lucide-react';
 import { createProfile, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
+import { useProviders, type EngineChoice } from '../state/useProviders';
+import { ProviderPicker } from './ai/ProviderPicker';
 
 const FIELD =
   'w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none focus:ring-1 focus:ring-focus';
 
 export function NewAgentDialog({
-  defaultModel,
-  engine,
   onClose,
   onCreated,
 }: {
-  defaultModel: string;
-  engine: string | null;
   onClose: () => void;
   onCreated: (profile: Profile) => void;
 }) {
@@ -27,6 +25,10 @@ export function NewAgentDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  // Starts from the current default (Settings / Composer); changing it here only affects this agent.
+  const providers = useProviders();
+  const [picked, setPicked] = useState<EngineChoice | null>(null);
+  const choice = picked ?? providers.choice;
 
   useEffect(() => {
     nameRef.current?.focus();
@@ -45,8 +47,8 @@ export function NewAgentDialog({
         name: name.trim(),
         role: role.trim() || 'Agent',
         instructions: instructions.trim(),
-        modelId: defaultModel || undefined,
-        engine: engine && engine !== 'mock' ? engine : undefined,
+        modelId: choice?.model || undefined,
+        engine: choice?.engine && choice.engine !== 'mock' ? choice.engine : undefined,
       });
       onCreated(profile);
     } catch (e) {
@@ -99,10 +101,11 @@ export function NewAgentDialog({
             placeholder="Describe how this agent works, what it owns and how it reports back."
             className={`${FIELD} resize-y`}
           />
-          <p className="text-[12px] text-ink-secondary">
-            Runs on {engine ?? 'the selected engine'}
-            {defaultModel ? ` · ${defaultModel}` : ''}. You can also ask Loqman to create agents for you.
-          </p>
+          <div className="mt-1 flex flex-col gap-2">
+            <div className="text-[12px] font-medium text-ink-secondary">Runs on</div>
+            <ProviderPicker idPrefix="na" value={choice} onChange={setPicked} />
+            <p className="text-[12px] text-ink-secondary">You can also ask Loqman to create agents for you.</p>
+          </div>
           {error && (
             <p role="alert" className="text-[12.5px] text-danger">
               {error}

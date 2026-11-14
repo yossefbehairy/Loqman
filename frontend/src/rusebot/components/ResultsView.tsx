@@ -5,7 +5,7 @@
  * proposals) and every deliverable draft produced by recorded runs.
  */
 import { PackageCheck } from 'lucide-react';
-import { ApprovalCard } from './ApprovalCard';
+import { ApprovalCard, type DecideResult } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
 import type { Approval, CeoAction, Draft } from '../data/worker';
 import type { ChatState } from '../state/useChat';
@@ -18,7 +18,7 @@ export function ResultsView({
 }: {
   chat: ChatState;
   ceoActions: CeoAction[];
-  onCeoDecide: (action: CeoAction, decision: 'approve' | 'deny') => Promise<void>;
+  onCeoDecide: (action: CeoAction, decision: 'approve' | 'deny') => Promise<DecideResult>;
 }) {
   const drafts: Draft[] = Object.values(chat.drafts).flat();
   const { shown: approvals, decide: decideApproval } = useKeepDecided<Approval>(chat.approvals);

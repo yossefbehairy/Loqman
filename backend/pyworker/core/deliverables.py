@@ -159,6 +159,30 @@ class DeliverableManager:
         rows = self._db.all("SELECT * FROM deliverable_drafts WHERE run_id=? ORDER BY created_at, id", (run_id,))
         return [view(r) for r in rows]
 
+    def list_all(self, limit: int = 200, cursor: Optional[str] = None) -> Dict[str, Any]:
+        """One page of drafts across every run, newest first, each tagged with the conversation of its run.
+
+        Order is (created_at, id) descending. ``cursor`` is the opaque ``next_cursor`` of the previous page and is
+        exclusive: the page starts strictly after that row. ``next_cursor`` is None on the last page.
+        """
+        limit = max(1, min(int(limit), 500))
+        where, args = "", []
+        if cursor:
+            created, sep, row_id = cursor.partition("|")
+            if not sep or not created or not row_id:
+                raise ValueError("invalid cursor")
+            where = "WHERE (d.created_at < ? OR (d.created_at = ? AND d.id < ?)) "
+            args = [created, created, row_id]
+        rows = self._db.all(
+            "SELECT d.*, r.conversation_id AS conversation_id FROM deliverable_drafts d "
+            "LEFT JOIN conversation_runs r ON r.id = d.run_id " + where +
+            "ORDER BY d.created_at DESC, d.id DESC LIMIT ?", (*args, limit + 1))
+        more = len(rows) > limit
+        rows = rows[:limit]
+        next_cursor = f"{rows[-1]['created_at']}|{rows[-1]['id']}" if more else None
+        return {"drafts": [{**view(r), "conversation_id": r["conversation_id"]} for r in rows],
+                "next_cursor": next_cursor}
+
     def _get(self, run_id: str, draft_id: str) -> Dict[str, Any]:
         row = self._db.one("SELECT * FROM deliverable_drafts WHERE id=?", (draft_id,))
         if row is None or row["run_id"] != run_id:

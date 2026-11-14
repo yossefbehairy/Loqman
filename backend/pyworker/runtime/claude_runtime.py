@@ -231,7 +231,7 @@ class ClaudeCodeRuntime:
         'unverified' and never free (free_only=True therefore returns [])."""
         if free_only:
             return []
-        return [ModelCatalogEntry(id=a, name=f"Claude {a} (alias, unverified)",
+        return [ModelCatalogEntry(id=a, name=f"Claude {a.capitalize()}",
                                   provider_id="anthropic", cost=ModelCost(), variants=[],
                                   is_free=False, status="unverified")
                 for a in KNOWN_MODEL_ALIASES]

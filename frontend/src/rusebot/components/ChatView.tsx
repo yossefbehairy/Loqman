@@ -19,6 +19,7 @@ import { stripContract, type ChatState, type EngineState } from '../state/useCha
 import type { Agent } from '../../types/agentos';
 import { useKeepDecided } from '../state/useKeepDecided';
 import type { Conversation } from '../data/worker';
+import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
 
 const FALLBACK_NAME = 'Loqman';
@@ -64,12 +65,12 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
 }
 
 function clock(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
 function dayLabel(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   if (Number.isNaN(d.getTime())) return '';
   const when = clock(iso);
   return d.toDateString() === new Date().toDateString()
@@ -96,7 +97,7 @@ function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string;
             mine ? 'bg-bubble-user whitespace-pre-wrap text-ink user-bubble-colored antialiased' : 'bg-card text-ink'
           )}
           style={mine ? USER_BUBBLE_STYLE : undefined}
-          title={new Date(iso).toLocaleString()}
+          title={parseWorkerTime(iso).toLocaleString()}
         >
           {mine ? <div className="chat-text">{text}</div> : <ChatMarkdown text={text} />}
         </div>
@@ -155,6 +156,7 @@ export function ChatView({
   agent,
   onOpenProfile,
   onNewAgent,
+  onManageProviders,
 }: {
   chat: ChatState;
   engines: EngineState;
@@ -163,6 +165,7 @@ export function ChatView({
   agent: Agent | null;
   onOpenProfile: () => void;
   onNewAgent: () => void;
+  onManageProviders?: () => void;
 }) {
   const dockRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -185,7 +188,7 @@ export function ChatView({
 
   const rows = chat.messages.map((m, i) => {
     const prev = chat.messages[i - 1];
-    const showDay = !prev || new Date(prev.created_at).toDateString() !== new Date(m.created_at).toDateString();
+    const showDay = !prev || parseWorkerTime(prev.created_at).toDateString() !== parseWorkerTime(m.created_at).toDateString();
     const run = m.role === 'assistant' ? chat.runsBySeq[m.seq] : undefined;
     const drafts = run ? (chat.drafts[run.id] ?? []) : [];
     return (
@@ -244,7 +247,9 @@ export function ChatView({
                       className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent @max-4xl/chathead:px-1.5"
                     >
                       <Cpu size={11} aria-hidden="true" />
-                      <span className="@max-4xl/chathead:sr-only">{engines.choice.engine}</span>
+                      <span className="@max-4xl/chathead:sr-only">
+                        {engines.engines.find((e) => e.id === engines.choice?.engine)?.title ?? engines.choice.engine}
+                      </span>
                     </span>
                   )}
                 </button>
@@ -330,6 +335,7 @@ export function ChatView({
                   disabled={engines.loading}
                   engines={engines}
                   onNewAgent={onNewAgent}
+                  onManageProviders={onManageProviders}
                 />
               </div>
             </div>

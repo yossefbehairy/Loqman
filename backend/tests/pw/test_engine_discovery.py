@@ -164,3 +164,13 @@ async def test_endpoint_typed_and_leak_free(monkeypatch, api):
 async def test_direct_engine_tasks_are_not_exposed(api):
     err = await api.fail("engines.tasks", engine_id="antigravity", prompt="hello", model_id="x")
     assert err.code == "method_not_found"
+
+
+def test_opencode_v2_credential_rows_count_as_signed_in(monkeypatch):
+    rows = "OpenAI       API key                     stored\nNvidia       NVIDIA_API_KEY              environment\n"
+    install(monkeypatch, {"opencode": "/bin/opencode"},
+            {("opencode", "--version"): cp(0, "2.0.29\n"), ("opencode", "auth"): cp(0, rows)})
+    assert by_id(ed.discover_engines())["opencode"].auth_state == "authenticated"
+    install(monkeypatch, {"opencode": "/bin/opencode"},
+            {("opencode", "--version"): cp(0, "2.0.29\n"), ("opencode", "auth"): cp(0, "something unrecognized\n")})
+    assert by_id(ed.discover_engines())["opencode"].auth_state == "unknown"

@@ -33,6 +33,17 @@ def normalize_node_type(raw_type: Optional[str]) -> str:
     return t
 
 
+def normalize_agent_data(data: Any) -> Dict[str, Any]:
+    """Agent node config with the accepted aliases (role, model) folded into
+    role_type / model_id. Shared by validation and execution so both agree."""
+    out = dict(data) if isinstance(data, dict) else {}
+    if not out.get("role_type") and out.get("role"):
+        out["role_type"] = out["role"]
+    if not out.get("model_id") and out.get("model"):
+        out["model_id"] = out["model"]
+    return out
+
+
 def validate_workflow_graph(definition: Dict[str, Any], max_nodes: int = 20) -> ValidationResult:
     """
     Rigorously validates a workflow definition against all AgentOS engineering rules:
@@ -92,9 +103,9 @@ def validate_workflow_graph(definition: Dict[str, Any], max_nodes: int = 20) -> 
             output_node_ids.append(nid)
         elif ntype == "agent":
             # 9. Configuration Check for AI Agent Nodes
-            data = node.get("data", {})
-            role = data.get("role_type") or data.get("role")
-            model = data.get("model_id") or data.get("model")
+            data = normalize_agent_data(node.get("data"))
+            role = data.get("role_type")
+            model = data.get("model_id")
             timeout = data.get("timeout")
             max_retries = data.get("max_retries")
 

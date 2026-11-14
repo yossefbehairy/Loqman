@@ -130,6 +130,7 @@ async def run_ceo_ask(
     timeout: int = 120,
     progress: Optional[Callable[[str, str, int], None]] = None,
     history: Optional[List[Dict[str, Any]]] = None,
+    thread_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run the bounded tool loop. Returns {reply, actions_proposed, iterations}."""
     if runtime is None or db is None:
@@ -141,7 +142,7 @@ async def run_ceo_ask(
     system = build_loop_system_prompt(question, history)
     transcript: List[str] = []
     used_write_calls: set = set()
-    baseline_pending = {r["id"] for r in db.all("SELECT id FROM pending_actions")}
+    own_actions: List[str] = []  # proposals THIS request recorded (never diffed from the shared table)
     observations: List[str] = []
     iterations = 0
 
@@ -158,7 +159,7 @@ async def run_ceo_ask(
             model_id=model_id,
             provider_id=provider_id,
             variant=variant,
-            session_title=CEO_ASK_THREAD_TITLE,
+            session_title=f"{CEO_ASK_THREAD_TITLE}-{thread_id}" if thread_id else CEO_ASK_THREAD_TITLE,
             timeout=timeout,
             agent_id=settings.CHAT_AGENT_ID,
         ), kind=KIND_CEO_ASK)
@@ -176,7 +177,7 @@ async def run_ceo_ask(
         if isinstance(envelope.get("final"), str):
             reply = envelope["final"].strip() or _fallback_summary(observations)
             _emit(progress, "final", "", iterations)
-            return _result(db, baseline_pending, reply, iterations)
+            return _result(db, own_actions, reply, iterations)
         call = envelope.get("tool_call")
         if not isinstance(call, dict):
             transcript.append(
@@ -203,14 +204,14 @@ async def run_ceo_ask(
                 )
                 continue
             used_write_calls.add(key)
-        observation = ceo_tools.run_tool(db, name, args)
+        observation = ceo_tools.run_tool(db, name, args, own_actions)
         observations.append(observation)
         transcript.append(f"[tool_observation] {observation}")
         _emit(progress, "tool", str(name), iterations)
 
     _emit(progress, "final", "limit", iterations)
     return _result(
-        db, baseline_pending,
+        db, own_actions,
         _fallback_summary(observations) + " (Reached the reasoning limit; partial answer.)",
         iterations,
     )
@@ -231,6 +232,7 @@ async def run_ceo_fast(
     runtime=None,
     timeout: int = 60,
     history: Optional[List[Dict[str, Any]]] = None,
+    thread_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Single-call plain-text path for small talk.
 
@@ -249,7 +251,7 @@ async def run_ceo_fast(
         model_id=model_id,
         provider_id=provider_id,
         variant=variant,
-        session_title="ceo-fast-gm",
+        session_title=f"{CEO_FAST_THREAD_TITLE}-{thread_id}" if thread_id else CEO_FAST_THREAD_TITLE,
         timeout=timeout,
         agent_id=settings.CHAT_AGENT_ID,
     ), kind=KIND_CEO_ASK_FAST)
@@ -267,10 +269,10 @@ async def run_ceo_fast(
     return {"reply": reply[:2000], "actions_proposed": [], "iterations": 1}
 
 
-def _result(db: Database, baseline_pending: set, reply: str, iterations: int) -> Dict[str, Any]:
+def _result(db: Database, own_actions: List[str], reply: str, iterations: int) -> Dict[str, Any]:
     fresh = db.all("SELECT id, kind, summary FROM pending_actions WHERE status='pending'")
     proposed = [
         {"id": a["id"], "kind": a["kind"], "summary": a["summary"]}
-        for a in fresh if a["id"] not in baseline_pending
+        for a in fresh if a["id"] in own_actions
     ]
     return {"reply": reply, "actions_proposed": proposed, "iterations": iterations}

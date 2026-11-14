@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Sequence
 
+from backend.pyworker.runtime.providers import PROVIDERS
+
 PROBE_TIMEOUT_SECONDS = 5.0
 
 INSTALLED = "installed"
@@ -53,6 +55,15 @@ class EngineStatus:
     detail: str
 
 
+def engine_state(install_state: str, auth_state: str) -> str:
+    """UI-facing state: not_installed | error | ready | needs_login | unverified."""
+    if install_state == NOT_INSTALLED:
+        return "not_installed"
+    if install_state != INSTALLED:
+        return "error"
+    return {AUTHENTICATED: "ready", UNAUTHENTICATED: "needs_login"}.get(auth_state, "unverified")
+
+
 def _parse_codex_auth(code: int, out: str) -> str:
     low = out.lower()
     if code == 0 and "logged in" in low and "not logged in" not in low:
@@ -76,9 +87,13 @@ def _parse_opencode_auth(code: int, out: str) -> str:
     if code != 0:
         return UNKNOWN
     m = re.search(r"(\d+)\s+credentials?", out, re.IGNORECASE)
-    if not m:
-        return UNKNOWN
-    return AUTHENTICATED if int(m.group(1)) > 0 else UNAUTHENTICATED
+    if m:
+        return AUTHENTICATED if int(m.group(1)) > 0 else UNAUTHENTICATED
+    # OpenCode 2.x prints one row per credential ("<provider>  <label>  stored|environment")
+    # and no summary line.
+    if re.search(r"\s(?:stored|environment)\s*$", out, re.IGNORECASE | re.MULTILINE):
+        return AUTHENTICATED
+    return UNKNOWN
 
 
 ENGINE_SPECS: List[EngineSpec] = [
@@ -129,37 +144,36 @@ def probe_engine(spec: EngineSpec) -> EngineStatus:
         if exe:
             break
     base = dict(engine_id=spec.engine_id, display_name=spec.display_name,
-                adapter_supported=spec.engine_id in {"opencode", "claude-code", "codex", "antigravity"})
+                adapter_supported=spec.engine_id in {p.engine_id for p in PROVIDERS})
     if not exe:
         return EngineStatus(**base, install_state=NOT_INSTALLED, auth_state=UNKNOWN,
                             version=None, executable=None,
-                            detail="CLI not found on PATH.")
+                            detail="Not installed on this computer.")
 
     ver = _run(exe, spec.version_args)
     if ver is None:
         return EngineStatus(**base, install_state=UNKNOWN, auth_state=UNKNOWN,
                             version=None, executable=exe,
-                            detail="Version probe timed out or could not start.")
+                            detail="The CLI did not respond to a version check.")
     version = _extract_version((ver.stdout or "") + " " + (ver.stderr or ""))
     if ver.returncode != 0 and version is None:
         return EngineStatus(**base, install_state=UNKNOWN, auth_state=UNKNOWN,
                             version=None, executable=exe,
-                            detail="Version probe failed; install state unverified.")
+                            detail="The CLI is present, but its version check failed.")
 
     auth = UNKNOWN
-    detail = "Installed. Authentication not checked: no supported status command."
+    detail = "Installed. Sign-in status cannot be checked automatically."
     if spec.auth_args and spec.auth_parser:
         res = _run(exe, spec.auth_args)
         if res is None:
-            detail = "Installed. Auth status probe timed out or failed to start."
+            detail = "Installed. The sign-in check timed out."
         else:
             auth = spec.auth_parser(res.returncode, (res.stdout or "") + (res.stderr or ""))
             detail = {
-                AUTHENTICATED: "Installed; CLI reports an authenticated session.",
-                UNAUTHENTICATED: "Installed; CLI reports no authenticated session.",
-                UNKNOWN: "Installed; auth status output not recognized.",
+                AUTHENTICATED: "Installed and signed in.",
+                UNAUTHENTICATED: "Installed, but not signed in.",
+                UNKNOWN: "Installed. Sign-in status could not be read.",
             }[auth]
-    detail += " Discovery does not verify actual model execution."
     return EngineStatus(**base, install_state=INSTALLED, auth_state=auth,
                         version=version, executable=exe, detail=detail)
 

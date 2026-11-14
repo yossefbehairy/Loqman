@@ -6,11 +6,11 @@
  * zoom or drag-to-arrange). Structure comes from the classic AgentOS company
  * storage; profiles, missions and delegation use the AgentOS worker.
  */
-import { useMemo, useState } from 'react';
-import { FileText, MessageCircle, Send, Trash2, UserPlus, UsersRound, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { ChevronDown, FileText, MessageCircle, Send, Trash2, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { Agent, Team } from '../../types/agentos';
-import { CEO_PROFILE_ID, createMission, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
+import { CEO_PROFILE_ID, isMissionTerminal, delegateToAgent, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
 
 const DOTS = {
@@ -31,6 +31,88 @@ function PageHeader({ icon, title, count, subtitle, action }: { icon: React.Reac
       </div>
       {action}
     </header>
+  );
+}
+
+const MISSION_POLL_MS = 3000;
+
+/** A stored output or summary is plain text, a `{ result }` object, or some other JSON. */
+function resultText(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && typeof (value as { result?: unknown }).result === 'string') return (value as { result: string }).result;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function MissionRow({ mission, open, onToggle }: { mission: Mission; open: boolean; onToggle: () => void }) {
+  const summary = resultText(mission.final_summary);
+  const failure = typeof mission.error_summary === 'string' ? mission.error_summary : '';
+  const tasks = mission.tasks ?? [];
+  return (
+    <li data-mission={mission.id} className="rounded-lg border border-hairline/40 bg-card text-[12.5px]">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={onToggle}
+        className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left hover:bg-raised focus-visible:outline-2 focus-visible:outline-accent"
+      >
+        <ChevronDown size={14} className={cn('shrink-0 text-ink-secondary transition-transform', !open && '-rotate-90')} />
+        <span dir="auto" className="min-w-0 flex-1 truncate">
+          {mission.title}
+        </span>
+        <span className="shrink-0 text-ink-secondary">{tasks.length} tasks</span>
+        <span className="shrink-0 rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-secondary">{mission.status}</span>
+      </button>
+      {open && (
+        <div data-mission-detail className="flex flex-col gap-2 border-t border-hairline/30 px-3 py-2.5">
+          {summary && (
+            <div>
+              <div className="text-[11px] font-semibold text-ink-secondary">Summary</div>
+              <p dir="auto" className="mt-1 whitespace-pre-wrap break-words text-ink">
+                {summary}
+              </p>
+            </div>
+          )}
+          {failure && (
+            <p role="alert" dir="auto" className="whitespace-pre-wrap break-words text-danger">
+              {failure}
+            </p>
+          )}
+          {tasks.map((t) => {
+            const out = resultText(t.output);
+            const err = typeof t.error_message === 'string' ? t.error_message : '';
+            return (
+              <div key={t.id} data-mission-task={t.id} className="rounded-md bg-inset px-2.5 py-2">
+                <div className="flex items-center gap-2">
+                  <span dir="auto" className="min-w-0 flex-1 truncate font-medium">
+                    {t.title ?? 'Task'}
+                  </span>
+                  <span className="shrink-0 text-[11px] text-ink-secondary">{t.status}</span>
+                </div>
+                {out && (
+                  <pre dir="auto" className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] text-ink">
+                    {out}
+                  </pre>
+                )}
+                {err && (
+                  <p dir="auto" className="mt-1 whitespace-pre-wrap break-words text-danger">
+                    {err}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+          {!summary && !failure && tasks.length === 0 && <p className="text-ink-secondary">Nothing to show yet.</p>}
+          {!summary && !failure && tasks.length > 0 && !isMissionTerminal(mission.status) && (
+            <p className="text-ink-secondary">Still working. This updates by itself.</p>
+          )}
+        </div>
+      )}
+    </li>
   );
 }
 
@@ -112,7 +194,11 @@ export function AgentPanel({
     setBusy(true);
     setNote(null);
     try {
-      const mission = await createMission(task.trim(), task.trim().slice(0, 80), [profile?.role_type ?? agent.role], defaultModel || undefined);
+      if (!profile) throw new Error('This agent has no profile to run the work under.');
+      // A profile bound to an engine must use that engine's model, never the global pick.
+      const model = profile.default_model_id || (profile.engine ? '' : defaultModel);
+      if (!model) throw new Error('Pick a model for this agent in Settings before delegating.');
+      const mission = await delegateToAgent(profile, task.trim(), model);
       setNote({ kind: 'ok', text: `Delegated. Mission ${mission.status}.` });
       setTask('');
       onChanged();
@@ -263,6 +349,9 @@ export interface TeamViewProps {
   defaultModel: string;
   onOpenChat: (agent: Agent) => void;
   onChanged: () => void;
+  /** Re-read only the mission list (cheap); used while missions are active. */
+  /** Resolves when the request has settled; polling waits for it before scheduling the next one. */
+  onPollMissions: () => Promise<void>;
   onPanelChange: (open: boolean) => void;
   onNewAgent: () => void;
 }
@@ -286,6 +375,25 @@ export function TeamView(props: TeamViewProps) {
   }, [agents, teams]);
 
   const contracts = props.mode === 'contracts';
+  const [openMission, setOpenMission] = useState<string | null>(null);
+  const shownMissions = missions.slice(0, 8);
+  const anyActive = shownMissions.some((m) => !isMissionTerminal(m.status));
+  const { onPollMissions } = props;
+  useEffect(() => {
+    if (!anyActive) return;
+    let alive = true;
+    let timer: number | undefined;
+    // The next poll is scheduled only after the previous one settles, so slow requests never overlap.
+    const tick = async () => {
+      if (document.visibilityState === 'visible') await onPollMissions().catch(() => undefined);
+      if (alive) timer = window.setTimeout(() => void tick(), MISSION_POLL_MS);
+    };
+    timer = window.setTimeout(() => void tick(), MISSION_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [anyActive, onPollMissions]);
 
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app" data-view={props.mode}>
@@ -362,14 +470,8 @@ export function TeamView(props: TeamViewProps) {
             <section aria-label="Delegated missions" className="mx-auto max-w-3xl px-6 pb-8">
               <h2 className="mb-2 text-[13px] font-semibold">Delegated missions</h2>
               <ul className="flex flex-col gap-1.5">
-                {missions.slice(0, 8).map((m) => (
-                  <li key={m.id} data-mission={m.id} className="flex items-center gap-3 rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[12.5px]">
-                    <span dir="auto" className="min-w-0 flex-1 truncate">
-                      {m.title}
-                    </span>
-                    <span className="shrink-0 text-ink-secondary">{m.tasks?.length ?? 0} tasks</span>
-                    <span className="shrink-0 rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-secondary">{m.status}</span>
-                  </li>
+                {shownMissions.map((m) => (
+                  <MissionRow key={m.id} mission={m} open={openMission === m.id} onToggle={() => setOpenMission(openMission === m.id ? null : m.id)} />
                 ))}
               </ul>
             </section>

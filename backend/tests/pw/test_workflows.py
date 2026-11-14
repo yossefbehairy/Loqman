@@ -243,3 +243,20 @@ async def test_crash_recovery_fails_dangling_executions(make_app):
     finally:
         ledger.bind(None)
         app2.ctx.db.close()
+
+
+@pytest.mark.asyncio
+async def test_validated_alias_fields_also_execute(api):
+    """data.model / data.role pass validation, so they must also reach the executor."""
+    definition = {"nodes": [{"id": "start-1", "type": "start"},
+                            {"id": "a-1", "type": "agent", "data": {"role": "planner", "model": MODEL}},
+                            {"id": "output-1", "type": "output"}],
+                  "edges": [{"id": "e1", "source": "start-1", "target": "a-1"},
+                            {"id": "e2", "source": "a-1", "target": "output-1"}]}
+    wf = await make_wf(api, definition, "aliases")
+    assert (await api("workflows.validate", workflow_id=wf["id"]))["valid"] is True
+    run = await api("workflows.run", workflow_id=wf["id"], sync=True)
+    assert run["status"] == "succeeded"
+    ex = await api("executions.get", execution_id=run["execution_id"])
+    agent = next(n for n in ex["node_executions"] if n["node_id"] == "a-1")
+    assert agent["model_id"] == MODEL and agent["role_type"] == "planner"

@@ -21,13 +21,7 @@ import {
   parseFenceInfo,
 } from '../lib/code-block';
 import 'katex/dist/katex.min.css';
-
-const RTL_LETTER = /[֐-ࣿיִ-﷿ﹰ-﻿\u{10800}-\u{10FFF}\u{1E800}-\u{1EFFF}]/u;
-
-export function textDirection(value: string): 'rtl' | 'ltr' {
-  const strong = /\p{Letter}/u.exec(value);
-  return strong && RTL_LETTER.test(strong[0]) ? 'rtl' : 'ltr';
-}
+import { textDirection } from '../lib/textDirection';
 
 interface HastNode {
   type?: string;
@@ -144,17 +138,14 @@ async function highlightFence(code: string, lang: string): Promise<string> {
 export function CodeBlock({ code, lang, initialWrap = false }: { code: string; lang: string; initialWrap?: boolean }) {
   const highlightable = code.length <= HIGHLIGHT_MAX_CHARS;
   const key = `${lang}:${code}`;
-  const [html, setHtml] = useState<string | null>(() => (highlightable ? (highlightCache.get(key) ?? null) : null));
+  const [highlighted, setHtml] = useState<string | null>(() => (highlightable ? (highlightCache.get(key) ?? null) : null));
+  const html = highlightable ? (highlightCache.get(key) ?? highlighted) : highlighted;
   const [wrapLines, setWrapLines] = useState(initialWrap);
   const [copied, setCopied] = useState<'idle' | 'copied' | 'failed'>('idle');
 
   useEffect(() => {
     if (!highlightable) return;
-    const cached = highlightCache.get(key);
-    if (cached) {
-      setHtml(cached);
-      return;
-    }
+    if (highlightCache.get(key)) return;
     let alive = true;
     highlightFence(code, lang || 'text')
       .then((out) => {

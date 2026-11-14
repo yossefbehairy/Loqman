@@ -154,7 +154,9 @@ async def test_proxy_failure_is_a_clean_502_without_leaks(make_app):
 # -- models / health / engines -----------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_health_models_and_engine_endpoints(api):
+async def test_health_models_and_engine_endpoints(api, monkeypatch):
+    from backend.pyworker.runtime import engine_discovery as ed
+    monkeypatch.setattr(ed, "discover_engines", lambda: [])  # no real CLI probes
     assert (await api("health"))["status"] == "ok"
     assert (await api("app.info"))["status"] == "online"
     rh = await api("runtime.health")

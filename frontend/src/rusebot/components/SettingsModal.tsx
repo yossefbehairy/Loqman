@@ -13,7 +13,7 @@ import { FONT_IDS, applyFont, readFont, type FontId } from '../lib/fonts';
 import { CHAT_WIDTH_IDS, applyChatWidth, readChatWidth, type ChatWidthId } from '../lib/chat-width';
 import { AiProviders } from './AiProviders';
 
-type PageId = 'general' | 'appearance' | 'ai' | 'about';
+export type PageId = 'general' | 'appearance' | 'ai' | 'about';
 const PAGES: Array<{ id: PageId; label: string; icon: typeof User; keywords?: string }> = [
   { id: 'general', label: 'General', icon: User, keywords: 'profile name' },
   { id: 'appearance', label: 'Appearance', icon: Palette, keywords: 'theme font chat width skin' },
@@ -54,12 +54,14 @@ export function SettingsModal({
   onClose,
   userName,
   onUserName,
+  initialPage = 'general',
 }: {
   onClose: () => void;
+  initialPage?: PageId;
   userName: string;
   onUserName: (name: string) => void;
 }) {
-  const [page, setPage] = useState<PageId>('general');
+  const [page, setPage] = useState<PageId>(initialPage);
   const [search, setSearch] = useState('');
   const [skin, setSkin] = useState<SkinId>(() => readSkin());
   const [font, setFont] = useState<FontId>(() => readFont());

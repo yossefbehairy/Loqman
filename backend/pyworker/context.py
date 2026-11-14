@@ -30,6 +30,9 @@ class Context:
     # Live progress registry for synchronous CEO asks.
     ask_progress: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+    # Per-app cache of the last engine discovery (see engines.status).
+    engine_cache: Dict[str, Any] = field(default_factory=dict)
+
     def spawn(self, coro, name: str = "background") -> asyncio.Task:
         task = asyncio.get_running_loop().create_task(coro, name=name)
         self.background.add(task)

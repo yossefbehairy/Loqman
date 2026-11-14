@@ -9,17 +9,17 @@ import { useCallback, useState } from 'react';
  */
 export function useKeepDecided<T extends { id: string }>(
   items: T[]
-): { shown: T[]; decide: (item: T, run: () => Promise<void>) => Promise<void> } {
+): { shown: T[]; decide: <R>(item: T, run: () => Promise<R>) => Promise<R> } {
   const [decided, setDecided] = useState<Record<string, { item: T; index: number }>>({});
   const [current, setCurrent] = useState<T[]>(items);
   if (current !== items && (current.length !== items.length || current.some((c, i) => c.id !== items[i]?.id))) {
     setCurrent(items);
   }
   const decide = useCallback(
-    async (item: T, run: () => Promise<void>) => {
+    async <R,>(item: T, run: () => Promise<R>): Promise<R> => {
       setDecided((prev) => ({ ...prev, [item.id]: { item, index: Math.max(0, current.findIndex((c) => c.id === item.id)) } }));
       try {
-        await run();
+        return await run();
       } catch (e) {
         setDecided((prev) => {
           const next = { ...prev };

@@ -86,15 +86,38 @@ def _progress_write(ctx, request_id: str, stage: str, detail: str = "",
     record["updated_at"] = datetime.now(timezone.utc).isoformat()
 
 
+_CONV_CONTENT_CAP = 60000
+
+
+def _store_message(db: Database, conversation_id: str, role: str, content: str, client_id: str) -> bool:
+    """Idempotent write into a chat (unique conversation + client id). True when this call inserted the row."""
+    content = content[:_CONV_CONTENT_CAP] or "(empty reply)"
+    row = db.one("SELECT role, content FROM conversation_messages WHERE conversation_id=? AND client_message_id=?",
+                 (conversation_id, client_id))
+    if row:
+        if row["role"] != role or row["content"] != content:
+            raise api_error(409, "Request id already used for a different message.")
+        return False
+    now = ts()
+    with db.tx():
+        db.execute("INSERT INTO conversation_messages(conversation_id,client_message_id,role,content,created_at) "
+                   "VALUES(?,?,?,?,?)", (conversation_id, client_id, role, content, now))
+        db.update("conversations", {"updated_at": now}, "id=?", (conversation_id,))
+    return True
+
+
 @method("ceo.ask")
 async def ceo_ask(ctx, params):
-    check_keys(params, {"question"}, ("model_id", "variant", "request_id"))
+    check_keys(params, {"question"}, ("model_id", "variant", "request_id", "conversation_id"))
     question = req_str(params, "question", 1, 2000).strip()
     if not question:
         raise api_error(400, "Question must not be empty.")
     model_id = opt_str(params, "model_id") or settings.DEFAULT_MODEL_ID
     variant = opt_str(params, "variant")
     progress_id = (opt_str(params, "request_id", 0, 64) or "").strip()
+    conversation_id = (opt_str(params, "conversation_id", 1, 64) or "").strip() or None
+    if conversation_id and not ctx.db.one("SELECT id FROM conversations WHERE id=?", (conversation_id,)):
+        raise api_error(404, "Conversation not found.")
     runtime = ctx.get_runtime()
     try:
         free_models = await runtime.list_available_models(free_only=True)
@@ -127,28 +150,51 @@ async def ceo_ask(ctx, params):
 
     db = ctx.db
     # Backend-owned memory: recent turns feed every prompt and every exchange is recorded.
-    recent = db.all("SELECT role, content FROM ceo_messages ORDER BY seq DESC, id DESC LIMIT ?",
-                    (2 * CEO_HISTORY_TURNS,))
-    history = [{"role": m["role"], "content": m["content"]} for m in reversed(recent)]
-    next_seq = (db.scalar("SELECT MAX(seq) FROM ceo_messages") or 0) + 1
     record_cap = 12000
-    db.insert("ceo_messages", {"id": new_id(), "seq": next_seq, "role": "user", "content": question[:record_cap],
-                               "fast": 1 if is_fast else 0, "created_at": ts()})
+    ask_key = progress_id or new_id()
+    user_key, reply_key = f"ask:{ask_key}:user", f"ask:{ask_key}:assistant"
+    stored_user = False
+    if conversation_id:
+        # A chat remembers only itself: its own stored exchange, not the company-wide log. The current question
+        # is read out of the history (it may already be stored by an earlier attempt with the same request id).
+        recent = db.all("SELECT role, content FROM conversation_messages WHERE conversation_id=? "
+                        "AND role IN ('user', 'assistant') AND COALESCE(client_message_id, '') <> ? "
+                        "ORDER BY seq DESC LIMIT ?", (conversation_id, user_key, 2 * CEO_HISTORY_TURNS))
+        # Durable before generating: a reload mid-generation still finds the user's message in its chat.
+        stored_user = _store_message(db, conversation_id, "user", question, user_key)
+    else:
+        recent = db.all("SELECT role, content FROM ceo_messages ORDER BY seq DESC, id DESC LIMIT ?",
+                        (2 * CEO_HISTORY_TURNS,))
+    history = [{"role": m["role"], "content": m["content"]} for m in reversed(recent)]
+    next_seq = 0
+    if not conversation_id:
+        # Unscoped exchanges (no chat of their own) live only in the company-wide log. Their ids carry a "g"
+        # prefix so conversations.import_ceo can tell them from rows written while scoped asks were also logged.
+        next_seq = (db.scalar("SELECT MAX(seq) FROM ceo_messages") or 0) + 1
+        db.insert("ceo_messages", {"id": "g" + uuid.uuid4().hex, "seq": next_seq, "role": "user",
+                                   "content": question[:record_cap], "fast": 1 if is_fast else 0, "created_at": ts()})
     try:
         if is_fast:
             result = await run_ceo_fast(question=question, model_id=model_id, provider_id=target.provider_id,
-                                        variant=fast_variant, runtime=runtime, history=history)
+                                        variant=fast_variant, runtime=runtime, history=history,
+                                        thread_id=conversation_id)
         else:
             result = await run_ceo_ask(question=question, model_id=model_id, provider_id=target.provider_id,
                                        variant=variant, runtime=runtime, db=db,
-                                       progress=_report if progress_id else None, history=history)
+                                       progress=_report if progress_id else None, history=history,
+                                       thread_id=conversation_id)
     except Exception:
+        if stored_user:
+            # Nothing was answered: take the question back so the restored draft can be re-sent without a duplicate.
+            db.execute("DELETE FROM conversation_messages WHERE conversation_id=? AND client_message_id=?",
+                       (conversation_id, user_key))
         if progress_id:
             _progress_write(ctx, progress_id, "error", "CEO ask failed.", done=True)
         raise api_error(502, "CEO ask failed.")
-    db.insert("ceo_messages", {"id": new_id(), "seq": next_seq + 1, "role": "assistant",
-                               "content": result["reply"][:record_cap], "fast": 1 if is_fast else 0,
-                               "created_at": ts()})
+    if not conversation_id:
+        db.insert("ceo_messages", {"id": "g" + uuid.uuid4().hex, "seq": next_seq + 1, "role": "assistant",
+                                   "content": result["reply"][:record_cap], "fast": 1 if is_fast else 0,
+                                   "created_at": ts()})
     if progress_id:
         _progress_write(ctx, progress_id, "done", "", result["iterations"], done=True)
     # The CEO may create agents and teams on its own: no approval step for those two kinds.
@@ -161,6 +207,11 @@ async def ceo_ask(ctx, params):
                 created_agents.extend(outcome["created_profiles"])
                 continue
         remaining.append(action)
+    if conversation_id:
+        made = [p["name"] for p in created_agents]
+        label = "Agent created" if len(made) == 1 else "Agents created"
+        note = f"\n\n✓ {label}: {', '.join(made)}" if made else ""
+        _store_message(db, conversation_id, "assistant", f"{result['reply']}{note}", reply_key)
     return {"reply": result["reply"], "actions_proposed": remaining, "agents_created": created_agents,
             "iterations": result["iterations"], "fast": is_fast}
 
@@ -255,7 +306,9 @@ def _apply_new_team(db: Database, payload: Dict[str, Any]) -> Tuple[List[Dict[st
         planned.append({"name": name, "role_type": role, "description": member.get("description"),
                         "instructions": member.get("instructions"),
                         "default_model_id": member.get("default_model_id"),
-                        "default_variant_id": member.get("default_variant_id")})
+                        "default_variant_id": member.get("default_variant_id"),
+                        # The UI derives team membership only from settings_json.team_name.
+                        "settings_json": json.dumps({"team_name": team_name}, ensure_ascii=False)})
     created = [profile_repo.create(db, {"id": f"custom-{uuid.uuid4().hex[:8]}", **m}) for m in planned]
     return created, team_name
 
