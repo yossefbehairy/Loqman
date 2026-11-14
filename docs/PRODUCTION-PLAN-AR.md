@@ -52,7 +52,7 @@ cd frontend && npx tsc -b && npx oxlint && npm run build && npx playwright test
 
 ## سجل التقدم
 
-- [ ] P1 — التوجيه
+- [x] P1 — التوجيه (pytest 378، Playwright 68/68، تجربة حقيقية ناجحة)
 - [ ] P2 — تنظيف وتحييد
 - [ ] P3 — توصيل وإصلاحات صغيرة
 - [ ] P4 — عقد turns وأحداث
@@ -65,3 +65,10 @@ cd frontend && npx tsc -b && npx oxlint && npm run build && npx playwright test
 ### ملاحظات التنفيذ
 
 (نتيجة كل مرحلة: ما تم، ما فشل، ما بقي، ورقم الـ commit.)
+
+**P1 (Sonnet 5.5، تمت).** `core/preferences.py` (ملف `preferences.json` بجوار القاعدة)، `orchestration/routing.py`، `api/preferences.py`، و27 اختبارًا في `test_routing.py`. تجربة حقيقية ببيانات معزولة: Loqman ردّ من Claude Haiku ومن Codex (`gpt-6-luna`) بـ `engine` صريح؛ بعد ضبط الافتراضي على Claude أنشأ Loqman agent خُتم بـ `claude-code`/`haiku`؛ تفويض مهمة لذلك الـ agent نجح على Claude؛ الاستخدام سُجّل لكل محرك.
+ملاحظات للمراحل التالية: المسار السريع (smalltalk) ردّ بالعربية على سؤال إنجليزي (P3). لا ترحيل تلقائي لاختيار المتصفح القديم إلى تفضيل الـ worker: حتى يختار المستخدم افتراضيًا في Settings تبقى المهام على OpenCode. أربع نسخ من جدول محرك←مزوّد ومصانع المحركات ما زالت موجودة (P2).
+
+**تمهيد P9 (Codex gpt-6.1-terra، كُتب دون تشغيل بناء).** `pyinstaller/smoke_test.py` و`smoke-test.ps1` (بوابة فعلية للـ exe)، مهمة Windows في CI، `docs/RELEASE.md`. غير متحقق منه حتى يُشغَّل بناء حقيقي في P9.
+
+**تصميم P4 (Codex gpt-6.1-sol).** `docs/DRIVER-CONTRACT-DESIGN.md`: يُراجع قبل بدء P4.
