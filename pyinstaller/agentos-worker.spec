@@ -15,13 +15,15 @@ from PyInstaller.utils.hooks import collect_submodules
 
 REPO_ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
-# Runtime adapters / orchestration are imported lazily (factories), so pin them.
+# Include all worker modules, including dynamic runtime factories and the MCP proxy.
 hiddenimports = collect_submodules("backend.pyworker")
 
 a = Analysis(
     [os.path.join(REPO_ROOT, "pyinstaller", "worker_entry.py")],
     pathex=[REPO_ROOT],
     binaries=[],
+    # Schema and defaults are Python modules; .env, workspaces and databases
+    # are external user data, not files to freeze into the executable.
     datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -38,7 +40,7 @@ exe = EXE(
     name="agentos-backend",
     debug=False, bootloader_ignore_signals=False, strip=False, upx=False, upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Electron talks to it over stdin/stdout
+    console=True,  # Keep stdio handles; Electron uses windowsHide to suppress the window.
     disable_windowed_traceback=False, argv_emulation=False,
     target_arch=None, codesign_identity=None, entitlements_file=None,
 )
