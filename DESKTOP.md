@@ -10,7 +10,7 @@ Desktop packaging for AgentOS uses **Electron** (shell + UI) and **PyInstaller**
 AgentOS-Setup-x.x.x.exe (electron-builder · NSIS)
 └── AgentOS.exe  (Electron)
     ├── app.asar
-    │   ├── electron/         ← main.cjs · preload.cjs · splash.html
+    │   ├── electron/         ← main.cjs · preload.cjs · worker-client.cjs · splash.html
     │   └── dist/             ← built React frontend (vite, base "./")
     └── resources/
         └── agentos-backend.exe   ← frozen Python worker (PyInstaller onefile)
@@ -19,7 +19,7 @@ Runtime:
   Electron main ──spawns──▶ agentos-backend.exe --data-dir <userData>   (Python worker, stdlib only)
   Electron main ◀──ready──  first stdout line; JSON Lines over stdin/stdout (docs/PYWORKER.md)
   Renderer (file://) ─────▶ window.agentos.call(method, params) / openStream(...)  (preload → IPC → main → worker)
-  SQLite data ────────────▶ %APPDATA%\AgentOS\agentos.db
+  SQLite data ────────────▶ %APPDATA%\Loqman\agentos.db
 ```
 
 Key properties:
@@ -29,7 +29,7 @@ Key properties:
 | Renderer load path | `file://…/app.asar/dist/index.html` (packaged) or `http://127.0.0.1:5173` (dev) |
 | API in renderer | `window.agentos.call(method, params)` / `openStream(...)` (exposed by `electron/preload.cjs`); a plain browser uses the dev-only Vite bridge |
 | Backend transport | stdin/stdout pipes to the worker — no HTTP server, no ports, no token, no CORS |
-| Database location | `app.getPath('userData')` → `%APPDATA%\AgentOS\agentos.db` (WAL mode) |
+| Database location | `app.getPath('userData')` → `%APPDATA%\Loqman\agentos.db` (WAL mode). `main.cjs` calls `app.setName('Loqman')` so dev and packaged builds share the folder |
 | Backend lifecycle | Stopped gracefully on quit (`shutdown`, in-flight runs saved as interrupted); killed with its process tree if it lingers |
 | Single instance | Enforced via `app.requestSingleInstanceLock()` |
 
@@ -80,7 +80,7 @@ Verify the frozen backend standalone:
 powershell -ExecutionPolicy Bypass -File pyinstaller\smoke-test.ps1
 ```
 
-The smoke test spawns the exe with a temp data dir and the mock engine, waits for the `ready` line, sends `health`, asserts `agentos.db` was created, then sends `shutdown` and checks a clean exit. Expected cold start: ~1 s.
+The smoke test spawns the exe with a temp data dir and the mock engine, waits for the `ready` line, sends `health`, asserts `agentos.db` was created, then sends `shutdown` and checks a clean exit. It fails if the `ready` line does not arrive within its timeout.
 
 ### Step 2 — Build the frontend
 
@@ -110,7 +110,7 @@ Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` 
 
 | Flag | Description |
 |---|---|
-| `--data-dir <path>` | SQLite lives at `<path>gentos.db` |
+| `--data-dir <path>` | SQLite lives at `<path>\agentos.db` |
 | `--db <file>` | Explicit database file (alternative to `--data-dir`) |
 | `--runtime-mode real\|mock\|claude\|codex\|agy` | Overrides `RUNTIME_MODE` |
 
@@ -121,7 +121,7 @@ Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` 
 - `window.agentos` — `call(method, params)` and `openStream(topic, id, lastEventId, onMessage)`
 - `window.__AGENTOS_DESKTOP__` — `true`
 
-Any new frontend backend call must go through `frontend/src/api/client.ts` (`call` from `transport.ts`); event streams use `openStream`.
+Any new frontend backend call must go through `call` from `frontend/src/api/transport.ts` (typed wrappers live in `frontend/src/rusebot/data/worker.ts`); event streams use `openStream`.
 
 ---
 
@@ -129,7 +129,7 @@ Any new frontend backend call must go through `frontend/src/api/client.ts` (`cal
 
 | Symptom | Cause / Fix |
 |---|---|
-| Splash shows "backend failed to start" | Read the last `[backend]` log lines shown on the splash. Typical: antivirus quarantined `agentos-backend.exe`, or a database newer than this version |
+| Splash shows "Startup failed", then a dialog titled "Loqman failed to start" | The dialog shows the last backend log lines and offers Retry or Quit. Typical: antivirus quarantined `agentos-backend.exe`, or a database newer than this version |
 | Packaging fails: `file not found: build-resources\agentos-backend.exe` | Run Step 1 (PyInstaller build) first |
 | Blank window in packaged app | `base: './'` missing from `vite.config.ts`, or `dist/` not rebuilt before packaging |
 | Missions never progress | The AI runtime (`OPENCODE_BASE_URL`, default `http://127.0.0.1:49100`) is external to the desktop package and must be running |

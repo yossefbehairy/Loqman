@@ -2,29 +2,29 @@
 
 [![CI](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml/badge.svg)](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml)
 ![Version](https://img.shields.io/badge/version-0.2.2-blue)
-![Tests](https://img.shields.io/badge/tests-270%20backend%20%7C%2043%20E2E-brightgreen)
+![Tests](https://img.shields.io/badge/tests-304%20backend%20%7C%2059%20E2E-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![Node](https://img.shields.io/badge/node-22-green)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Loqman is a local-first desktop app for running a small company of specialized AI agents. You chat with managers, approve governance contracts, delegate work, and watch every handover move from delegation to deliverable on a live ledger. The in-app engine is called **AgentOS**.
+Loqman is a local-first desktop app for running a small company of specialized AI agents. You chat with Loqman, the CEO agent, who can create agents and teams for you and answer questions about your company. You talk to the agents directly, delegate work, and review what they deliver. The in-app engine is called **AgentOS**.
 
-Everything runs on your machine: SQLite for state, a free-model-only AI runtime, and a frozen backend sidecar inside the installer. No cloud account, no paid fallback model.
+Everything runs on your machine: SQLite for state and a frozen backend sidecar inside the installer. There is no Loqman cloud account and no paid fallback model. OpenCode is limited to its free models; Claude Code, Codex and Antigravity use the accounts you signed in to in their own CLIs.
 
 ## Product surfaces
 
-The sidebar opens seven surfaces:
+The sidebar opens these surfaces:
 
 | Surface | What it does |
 | --- | --- |
-| **CEO** | Ask the general manager in natural language. Pick the model and reasoning effort right on the card, watch live progress while it works, and every write proposal waits for your approval. |
-| **Company** | Interactive physics graph and org chart of your departments, with department focus chips, agent inspection, and execution contract editing against the live free-model catalog. |
-| **Inbox** | Deliverables and review items that reached your desk, with structured JSON output and statuses. |
-| **Conversations** | Direct chats with managers and employees. Delegations become real missions with recorded handover turns. |
-| **Team Stream** | Chronological ledger of inter-agent handovers: delegation, deliverable, and review, with expandable JSON payloads. |
-| **Results** | Run receipts and success metrics for completed work. |
-| **Settings** | Default model, reasoning variant, timeouts, and notification preferences — always populated from the live free-model catalog. |
+| **Chats** | Conversations with Loqman (the CEO) and with each agent. Choose the provider and model in the Composer. Loqman's proposals and answers appear in the thread. |
+| **New** | Create an agent. The provider and model are chosen explicitly in the dialog. |
+| **Needs you** | Counts tool approvals and manager proposals waiting for a decision; opens Results. |
+| **Team** | Departments and their members as a map. Open a member to chat with it or inspect it, and see delegated missions with their status and results. |
+| **Contracts** | Every agent and its execution contract: instructions, model and output rules. |
+| **Results** | Tool approvals, manager proposals, deliverables and run results. |
+| **Settings** | General (your name), Appearance (skin, font and chat width), AI (providers: install, sign in, test, and the default provider and model) and About. |
 
 ## Architecture
 
@@ -35,7 +35,7 @@ flowchart LR
         Renderer["Renderer: React 19 + TypeScript"]
     end
     subgraph Sidecar["Python worker (stdlib only, frozen)"]
-        API["79 JSON Lines methods + event streams"]
+        API["87 JSON Lines methods (incl. shutdown) + event streams"]
         DB[("SQLite (WAL)")]
         API --- DB
     end
@@ -50,57 +50,57 @@ flowchart LR
 
 | Layer | Technology |
 | --- | --- |
-| Backend | Python 3.13 standard library only (asyncio, subprocess, sqlite3 in WAL): a persistent worker speaking JSON Lines on stdin/stdout, pytest |
-| Frontend | React 19, TypeScript, Vite 8, Tailwind CSS, `@xyflow/react`, `react-force-graph` |
+| Backend | Python 3.13 standard library only (asyncio, subprocess, sqlite3 in WAL): a persistent worker speaking JSON Lines on stdin/stdout, pytest for tests |
+| Frontend | React 19, TypeScript, Vite 8, Tailwind CSS 4 (`@tailwindcss/postcss`), react-markdown, shiki |
 | Desktop | Electron 44, electron-builder (NSIS), PyInstaller one-file worker |
 | AI runtime | Provider adapters for OpenCode, Claude Code, Codex CLI, and Antigravity ACP; deterministic `MockRuntime` for tests |
 
-`RUNTIME_MODE=real` uses OpenCode and its verified free-model policy. `mock` is a deterministic, offline test/demo mode. `claude`, `codex`, and the experimental `agy` mode use the logged-in local CLI account; Antigravity ACP is also available by selecting the `antigravity` engine for a conversation or employee. Account eligibility and billing remain unknown where the CLI cannot verify them, and there is no silent provider fallback.
+`RUNTIME_MODE=real` uses OpenCode and its verified free-model policy. `mock` is a deterministic, offline test/demo mode. `claude`, `codex`, and the experimental `agy` mode use the logged-in local CLI account; Antigravity ACP is also available by selecting the `antigravity` engine for a conversation or agent. Account eligibility and billing remain unknown where the CLI cannot verify them, and there is no silent provider fallback.
 
 ## CEO control plane
 
-The CEO surface answers questions and proposes changes, with a strict separation between reading and writing:
+Loqman answers questions and changes the company under a strict split between reading and writing:
 
-- Read tools (`list_missions`, `get_mission`, `list_profiles`, `get_profile`) run immediately inside a bounded ReAct loop of at most six rounds and return real database excerpts.
-- Write tools never mutate inside the loop. `propose_update_contract`, `propose_new_profile`, and `propose_new_team` record one row in `pending_actions` and return its id.
-- Approve and deny require the `X-AgentOS-Confirm: true` header, which only the local UI sends. A decided action cannot transition again.
-- Team approvals validate every member before the first write, then create all profiles in one pass. A failed batch leaves no partial rows.
-- A small in-memory registry tracks every in-flight ask: the UI generates a `request_id`, polls `GET /api/ceo/ask-progress/{request_id}`, and shows the live stage (thinking, calling a tool, writing the final answer) plus an elapsed timer — so a slow free-model round trip is visible instead of a silent spinner.
+- Read tools (`list_missions`, `get_mission`, `list_profiles`, `get_profile`) run immediately inside a bounded loop of at most three iterations and return real database excerpts.
+- `propose_new_profile` and `propose_new_team` create the agent or team at once, with no approval step. The reply reports them as `agents_created`. A team is created in one savepoint: a failed apply leaves no partial rows.
+- `propose_update_contract` never mutates anything inside the loop. It records one row in `pending_actions` and returns its id. Nothing changes until you approve it.
+- Approve and deny (`ceo.approve`, `ceo.deny`) require `confirm: true`, which only the local UI sends. A decided action cannot transition again.
+- `ceo.ask` accepts questions of up to 2,000 characters and an optional `conversation_id`, so each conversation reads and writes its own memory.
 
 ```mermaid
 sequenceDiagram
     actor User
-    participant UI as CEO view
-    participant API as CEO API
-    participant Loop as Bounded ReAct loop (max 6 rounds)
+    participant UI as Loqman chat
+    participant Worker as Python worker
+    participant Loop as Bounded loop (max 3 iterations)
     participant DB as SQLite
     User->>UI: Create a security review team
-    UI->>API: POST ask
-    API->>Loop: question plus tool catalog
-    Loop->>DB: read tools (missions, profiles, contracts)
-    Loop->>DB: propose_new_team records one pending action
-    Loop-->>UI: reply with proposed actions
-    User->>UI: approve in the in-app confirmation strip
-    UI->>API: POST approve with confirm header
-    API->>API: validate the full batch before any write
-    API->>DB: create all member profiles
-    API-->>UI: created_profiles
-    UI->>User: the new team appears in the Company view
+    UI->>Worker: ceo.ask with question and conversation_id
+    Worker->>Loop: question plus tool catalog
+    Loop->>DB: read tools (missions, profiles)
+    Loop->>DB: propose_new_team creates the team at once
+    Loop-->>Worker: reply and created agents
+    Worker-->>UI: reply with agents_created
+    User->>UI: approve a proposed contract change in Results
+    UI->>Worker: ceo.approve with confirm true
+    Worker->>DB: validate and apply in one savepoint
+    Worker-->>UI: decided action
 ```
 
 The full design notes live in `docs/ceo-control-plan.md`.
 
 ## Mission lifecycle
 
-A delegation in a conversation, or an approved CEO proposal, becomes a mission. The planner decomposes the objective, employees execute on their selected engine, and structured worker results are validated before they count as successful.
+A delegation in a conversation creates one employee assignment directly (`missions.delegate`, with no CEO planning step). A mission the CEO builds goes through the planner, which splits the objective into tasks. Employees execute on their selected engine, and structured worker results are validated before they count as successful.
 
 ```mermaid
 flowchart LR
-    Goal["Goal"] --> Plan["Planner decomposes the goal into tasks"]
+    Goal["Goal"] --> Plan["Planner splits the goal into tasks"]
+    Direct["Direct delegation to one employee"] --> Exec
     Plan --> Exec["Employees execute on selected engines"]
-    Exec --> Out["Validated worker results and reviewable deliverables"]
-    Out --> Review["Inbox review and approval"]
-    Out --> Ledger["Team Stream handover ledger"]
+    Exec --> Out["Validated results and deliverables"]
+    Out --> Review["Results: review deliverables"]
+    Out --> Team["Team: delegated missions and status"]
 ```
 
 Every execution revalidates its model against the selected engine's catalog. OpenCode remains free-only; other CLI engines use their local account catalog and never claim an unknown model is free. Unsupported models fail without switching providers.
@@ -132,8 +132,7 @@ npm install
 npm run dev
 ```
 
-The dev server listens on `http://127.0.0.1:5173` and proxies `/api` to the backend.
-Without `AGENTOS_INSECURE_DEV=1`, standalone API requests require `AGENTOS_LOCAL_TOKEN` in the `X-AgentOS-Token` header. Desktop sets a random token automatically.
+The dev server listens on `http://127.0.0.1:5173`. Its dev-only bridge (`/__agentos/call` and `/__agentos/stream`, see `frontend/vite-agentos-bridge.mjs`) starts the worker and rejects requests from other origins.
 
 Run the desktop shell, which spawns and supervises the backend by itself:
 
@@ -159,19 +158,26 @@ Copy `.env.example` to `.env` in the repository root and adjust what you need:
 
 | Key | Default | Notes |
 | --- | --- | --- |
-| CLI flags | - | `python -m backend.pyworker` takes `--data-dir` (or `--db`), `--runtime-mode`, `--max-message-bytes`, `--shutdown-timeout`. No host/port: there is no HTTP server. |
+| CLI flags | - | `python -m backend.pyworker` takes `--data-dir` (or `--db`), `--runtime-mode`, `--max-message-bytes`, `--shutdown-timeout`, and `--log-level`. There is no host or port: the worker has no HTTP server. |
 | `RUNTIME_MODE` | `real` | `real` uses OpenCode; `claude` and `codex` use their CLIs; `agy` is an experimental legacy adapter; `mock` is deterministic. Antigravity ACP is selected per engine. |
 | `OPENCODE_BASE_URL` | `http://127.0.0.1:49100` | The AI runtime lives outside the desktop bundle. |
-| `DEFAULT_MODEL_ID` | `muse-spark-1.3-contributor-free` | Revalidated against the selected runtime catalog before a mission starts. |
-| `AGENTOS_DATA_DIR` | set by Electron | Points `agentos.db` at the app data folder. |
+| `DEFAULT_MODEL_ID` | `deepseek-v4.1-flash-free` | Revalidated against the selected runtime catalog before a mission starts. |
+| `AGENTOS_DATA_DIR` | - | Folder for `agentos.db`; the database path is derived from it (`apply_data_dir` in `backend/pyworker/appsettings.py`). The dev bridge and Playwright use it. |
 
 ## Testing
 
-The backend suite currently reports 270 passed and 1 skipped test. The repository also contains 43 Playwright end-to-end tests across 8 specs; run them separately when verifying frontend changes.
+Counts below are static counts of test definitions, taken when this section was written. They are not run results.
+
+- Backend: 304 test functions in `backend/tests` (34 files, including `backend/tests/pw`).
+- Node: 11 tests in `frontend/electron/*.test.cjs`.
+- End to end: 59 Playwright tests in one spec, `frontend/e2e/rusebot_ui.spec.ts`.
 
 ```powershell
-# Backend: last run 270 passed, 1 skipped
+# Backend
 backend\.venv\Scripts\python.exe -m pytest backend\tests -q
+
+# Node: transport, worker client, dev bridge
+node --test frontend/electron/transport.test.cjs frontend/electron/worker-client.test.cjs frontend/electron/bridge.test.cjs
 
 # Frontend gates: types, lint, production build
 cd frontend
@@ -179,65 +185,66 @@ npx tsc -b
 npm run lint
 npm run build
 
-# End to end: 43 tests on a deterministic mock runtime
+# End to end on the deterministic mock runtime
 npx playwright test
 ```
 
-Playwright starts both servers on its own and runs the backend in `mock` mode. Target a single spec with `npx playwright test e2e/r1_executive_chat.spec.ts`.
+Playwright starts only the Vite dev server, and its bridge spawns the worker with `RUNTIME_MODE=mock` and an isolated data folder. Target the single spec with `npx playwright test e2e/rusebot_ui.spec.ts`.
 
 Continuous integration runs four jobs on every push:
 
 ```mermaid
 flowchart LR
-    Push["Push or pull request"] --> Backend["backend: pytest (270 passed, 1 skipped at last run)"]
-    Push --> Frontend["frontend: tsc, oxlint, vite build"]
-    Push --> E2E["e2e: Playwright (43 tests, mock runtime)"]
-    Push --> Scan["secrets scan"]
+    Push["Push or pull request"] --> Backend["backend: pytest and worker client Node tests"]
+    Push --> Frontend["frontend: tsc -b, transport and bridge Node tests, oxlint, vite build"]
+    Push --> E2E["e2e: Playwright on the mock runtime"]
+    Push --> Scan["secrets scan (gitleaks)"]
 ```
 
-`TEST_INFRA.md` describes the five-tier test pyramid and the R1 to R5 traceability matrix. `TEST_READY.md` lists the exact run commands per suite.
+`TEST_INFRA.md` describes the test layers and what each one covers. `TEST_READY.md` is now only a pointer.
 
 ## Project structure
 
 ```text
 backend/
-  app/
-    api/routes/      # health, models, chat, missions, ceo, workflows, executions, agent_profiles
-    core/            # lifecycle and crash recovery
-    db/              # session, models, repository, seed profiles
-    engine/          # executor, state machine, validator, context, events
-    orchestration/   # CEO ReAct loop, tool registry, planner
-    runtime/         # OpenCode, Claude Code, Codex, Antigravity ACP, and mock adapters
-  tests/             # Backend unit, contract, lifecycle, migration, and security tests
+  pyworker/          # the worker: stdlib-only Python, JSON Lines on stdin/stdout
+    api/             # method handlers registered with @method (ceo, chat, convo, missions, org, system, ...)
+    core/            # runs, run tools, approvals, deliverables, executions, backups
+    db/              # SQLite schema (version 17) and migrations
+    engine/          # executor, state machine, validator, events
+    orchestration/   # CEO loop, CEO tools, planner
+    runtime/         # providers.py (engine catalog), OpenCode, Claude Code, Codex, Antigravity, and mock adapters
+  tests/             # pytest: worker protocol, lifecycle and streams; pw/ holds unit and contract tests
 frontend/
-  src/
-    api/             # typed API client
-    components/      # ceo, company, conversations, stream, inbox, settings
-    data/ types/ utils/
-  electron/          # main, preload, splash
-  e2e/               # 8 Playwright specs, 43 tests
-pyinstaller/         # backend freeze and smoke test scripts
-docs/                # architecture notes, CEO control plan
+  electron/          # main.cjs, preload.cjs, worker-client.cjs, splash.html, Node tests
+  src/main.tsx       # mounts the UI from src/rusebot
+  src/rusebot/       # the UI: Shell.tsx, components/, state/, data/, lib/, styles.css
+  src/api/           # transport.ts: call() and openStream() to the worker
+  src/types/         # shared types
+  e2e/               # rusebot_ui.spec.ts (Playwright, mock runtime)
+pyinstaller/         # frozen worker spec and build and smoke-test scripts
+docs/                # worker protocol (PYWORKER.md), CEO control plan, dated audits and plans
 ```
 
 ## Security
 
-- The backend binds to `127.0.0.1` only. Do not change it to `0.0.0.0` or add `allow_origins=["*"]`.
+- The worker has no network listener: it reads requests on stdin and answers on stdout. Its only sockets are on loopback. The run tool broker binds `127.0.0.1` on an ephemeral port for each run, and the dev server binds `127.0.0.1:5173`. Do not change them to `0.0.0.0`.
 - No secrets live in code. `.env`, `*.db`, `node_modules`, `.venv`, and `release/` are ignored by git.
-- Runtime errors pass through `_redact()` before they reach the logs.
-- Electron runs with `contextIsolation` on and `nodeIntegration` off, exposing only `window.agentos` (`call`, `openStream`) and `window.__AGENTOS_DESKTOP__`; the main process validates the sender and method and never exposes `shutdown`.
+- OpenCode runtime errors pass through `_redact()` before they are reported.
+- Electron runs with `contextIsolation` on and `nodeIntegration` off, exposing only `window.agentos` (`call`, `openStream`) and `window.__AGENTOS_DESKTOP__`. The main process validates the sender and the method name and never exposes `shutdown`.
 - Report vulnerabilities through a private advisory. See `SECURITY.md`.
 
 ## Known limits
 
-- AI CLIs are not bundled; the user installs and authenticates each engine. The React UI is not yet wired to all new conversation-run and engine setup APIs.
-- CLI adapters do not offer confirmed workspace isolation, tool approvals, streaming text, or session resume as a cross-engine feature. See `docs/BACKEND-IMPLEMENTATION-STATUS-AR.md` for the current boundaries.
+- AI CLIs are not bundled; the user installs and authenticates each engine.
+- Run-scoped tools (`runs.start_turn` with a `tool_mode` other than `none`) require the Claude adapter; other engines run without them. See `docs/PYWORKER.md`.
+- The worker exposes `ceo.ask_progress`, but the UI does not poll it yet.
 - No code signing and no auto-updater yet. The plan is GitHub Releases plus `electron-updater`.
-- Real engines (OpenCode, Claude Code, Codex, Antigravity) are covered by contract tests with fake CLIs; live model calls are only verified by hand.
+- Real engines (OpenCode, Claude Code, Codex, Antigravity) are covered by contract tests with fake CLIs; live model calls are only verified by hand. See `docs/BACKEND-IMPLEMENTATION-STATUS-AR.md` for the current boundaries.
 
 ## Contributing
 
-Read `CONTRIBUTING.md` first. Quality gates: `pytest`, `tsc -b`, `oxlint`, `vite build`, and `playwright` all pass before a release. Keep pull requests small and focused, with test evidence.
+Read `CONTRIBUTING.md` first. Quality gates: `pytest`, the Node tests, `tsc -b`, `oxlint`, `vite build`, and `playwright` all pass before a release. Keep pull requests small and focused, with test evidence.
 
 ## License
 

@@ -92,17 +92,17 @@ thread and the binding is checked again before returning the result.
 | `backup` | `backup.cleanup`, `backup.create` |
 | `ceo` | `ceo.actions`, `ceo.approve`, `ceo.ask`, `ceo.ask_progress`, `ceo.deny`, `ceo.history` |
 | `chat` | `chat.consult`, `chat.opencode_proxy`, `chat.session.get`, `chat.session.save` |
-| `conversations` | `conversations.add_message`, `conversations.create`, `conversations.import_ceo`, `conversations.list`, `conversations.messages` |
+| `conversations` | `conversations.add_message`, `conversations.bind_profile`, `conversations.create`, `conversations.import_ceo`, `conversations.list`, `conversations.messages` |
 | `computer` | `computer.windows` |
-| `deliverables` | `deliverables.content`, `deliverables.create`, `deliverables.decide`, `deliverables.get`, `deliverables.list` |
-| `engines` | `engines.capabilities`, `engines.check`, `engines.models`, `engines.setup`, `engines.status` |
+| `deliverables` | `deliverables.content`, `deliverables.create`, `deliverables.decide`, `deliverables.get`, `deliverables.list`, `deliverables.list_all` |
+| `engines` | `engines.capabilities`, `engines.check`, `engines.models`, `engines.open_setup`, `engines.setup`, `engines.status`, `engines.test` |
 | `executions` | `executions.cancel`, `executions.get`, `executions.list`, `executions.messages` |
 | `health` | `health` |
 | `managers` | `managers.consult` |
 | `missions` | `missions.cancel`, `missions.create`, `missions.delegate`, `missions.get`, `missions.list`, `missions.runs` |
 | `models` | `models.free`, `models.refresh` |
 | `profiles` | `profiles.create`, `profiles.delete`, `profiles.get`, `profiles.list`, `profiles.update` |
-| `runs` | `runs.cancel`, `runs.events`, `runs.get`, `runs.start_turn`, `runs.write_proposals`, `runs.tool_control`, `runs.steer` |
+| `runs` | `runs.cancel`, `runs.events`, `runs.get`, `runs.list`, `runs.start_turn`, `runs.write_proposals`, `runs.tool_control`, `runs.steer` |
 | `runtime` | `runtime.health` |
 | `shutdown` | `shutdown` |
 | `skills` | `skills.list`, `skills.read`, `skills.sources.delete`, `skills.sources.list`, `skills.sources.register` |
@@ -110,6 +110,8 @@ thread and the binding is checked again before returning the result.
 | `usage` | `usage.events`, `usage.summary` |
 | `workflows` | `workflows.create`, `workflows.delete`, `workflows.get`, `workflows.list`, `workflows.run`, `workflows.update`, `workflows.validate` |
 | `workspaces` | `workspaces.create`, `workspaces.get`, `workspaces.list` |
+
+Engine notes: all four engines are defined once in `runtime/providers.py`. `engines.status` takes optional `force` (discovery is cached 30 s per app) and adds `state` (`ready`/`needs_login`/`unverified`/`not_installed`/`error`), `title`, `vendor`, `checked_at`. `engines.setup` adds `state`, `install`, `login`, `docs_url`. `engines.test` runs one fixed-prompt generation (60 s limit; it accepts no prompt). `engines.open_setup` (`step`: `install`/`login`) opens a Windows terminal with the catalog command. `usage.summary` also returns `by_engine`.
 
 ## Data
 Opens the existing `agentos.db` and upgrades to schema v17, backs it up
@@ -119,9 +121,9 @@ re-run); dangling missions/workflows become `failed`.
 ## Clients
 - **Electron** (`frontend/electron/{worker-client,main,preload}.cjs`): main spawns the worker, waits for `ready`, exposes
   `window.agentos.call/openStream` through IPC (sender + method validated, `shutdown` never exposed); quit is graceful.
-- **React** (`frontend/src/api/{transport,client,opencode}.ts`): same function names as the old REST client.
+- **React** (`frontend/src/api/transport.ts`): `call` and `openStream`. Typed wrappers for the methods live in `frontend/src/rusebot/data/worker.ts`.
 - **Browser dev / Playwright**: `frontend/vite-agentos-bridge.mjs` (serve-only Vite plugin) spawns the same worker.
-- **Frozen build**: `pyinstaller/agentos-worker.spec` -> `agentos-backend.exe` (verified: ready in ~1 s, runs/missions/CEO work).
+- **Frozen build**: `pyinstaller/agentos-worker.spec` -> `agentos-backend.exe`. An earlier build reached `ready` in about 1 s; this was not re-measured for this update.
 
 ## Status
 The legacy FastAPI backend (`backend/app`), its tests, its PyInstaller spec and the framework dependencies are removed.
@@ -132,9 +134,4 @@ cover test-window capture, revoked control and stale handles. Input compatibilit
 across Windows applications, other engines' MCP adapters and a fresh Windows
 account remain unverified.
 
-Latest verification on Windows completed 306 backend tests with one symlink
-privilege skip and seven Node transport tests. The frozen executable completed a
-live combined acceptance task with Claude, CSV comparison, browser lookup and
-approved report publication. The report was checked against generated input
-values before approval and after publication.
-The frontend typecheck and production build also passed after the stream lifecycle fixes.
+Test counts at the time of writing (static counts of test definitions, not run results): 304 test functions in `backend/tests` and 11 Node tests in `frontend/electron`. Earlier revisions of this section recorded a live Claude acceptance run and a frozen-executable run; those were not repeated for this update.

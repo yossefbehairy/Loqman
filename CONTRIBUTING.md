@@ -18,10 +18,8 @@ npm install
 ## Run (dev)
 
 ```powershell
-# Terminal 1 — backend (from repo root)
+# Terminal 1 — frontend (from repo root)
 # (no separate backend process: `npm run dev` starts the Python worker through the dev bridge)
-
-# Terminal 1 — frontend
 cd frontend
 npm run dev        # http://127.0.0.1:5173
 
@@ -35,6 +33,9 @@ npm run desktop
 # Backend
 backend\.venv\Scripts\pytest.exe backend\tests -v
 
+# Node: Electron transport, worker client, dev bridge
+node --test frontend/electron/transport.test.cjs frontend/electron/worker-client.test.cjs frontend/electron/bridge.test.cjs
+
 # Frontend
 cd frontend
 npx tsc -b
@@ -46,7 +47,7 @@ npx playwright test
 ## Rules
 
 - Local-first: no public binds, no wildcard CORS, no secrets in code.
-- All frontend network calls go through `src/api/client.ts`.
-- Backend input validated explicitly (`backend/pyworker/validate.py`); errors redacted near runtime transport.
-- Keep tests deterministic (`RUNTIME_MODE=mock` in tests).
+- All frontend calls to the worker go through `call` or `openStream` in `frontend/src/api/transport.ts`.
+- Backend input is validated explicitly (`backend/pyworker/validate.py`); OpenCode runtime errors pass through `_redact()` before they are reported.
+- Keep tests deterministic: use the mock runtime or fake CLIs, and make no live model calls.
 - Small focused PRs with description + test evidence.
