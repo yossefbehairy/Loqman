@@ -211,7 +211,6 @@ export function Shell() {
             agents={company.agents}
             profiles={profiles}
             missions={missions}
-            defaultModel={engines.choice?.model ?? ''}
             onOpenChat={(a) => void openChatWith(a)}
             onPollMissions={refreshMissions}
             onChanged={() => {

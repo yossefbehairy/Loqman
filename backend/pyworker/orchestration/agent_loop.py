@@ -16,6 +16,7 @@ itself cannot mutate contracts or profiles.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.pyworker.appsettings import settings
@@ -100,6 +101,15 @@ def build_fast_system_prompt(
     )
 
 
+def _lane(title: str, engine: str) -> tuple:
+    """(agent_id, session_title) for a CEO task. The locked OpenCode agent and the shared, reusable session
+    title are OpenCode (and mock) concepts. Account engines key running tasks by session title (a repeated
+    title is refused while one runs) and never receive OpenCode's agent id."""
+    if engine in ("opencode", "mock"):
+        return settings.CHAT_AGENT_ID, title
+    return None, f"{title}-{uuid.uuid4().hex[:8]}"
+
+
 def _parse_envelope(text: str) -> Optional[Dict[str, Any]]:
     try:
         data = json.loads(sanitize_model_output(text))
@@ -131,6 +141,7 @@ async def run_ceo_ask(
     progress: Optional[Callable[[str, str, int], None]] = None,
     history: Optional[List[Dict[str, Any]]] = None,
     thread_id: Optional[str] = None,
+    engine: str = "opencode",
 ) -> Dict[str, Any]:
     """Run the bounded tool loop. Returns {reply, actions_proposed, iterations}."""
     if runtime is None or db is None:
@@ -154,14 +165,16 @@ async def run_ceo_ask(
             prompt += "\n\nConversation so far:\n" + "\n".join(transcript)
         prompt = prompt[: settings.MISSION_MAX_PROMPT_CHARS]
 
+        agent_id, session_title = _lane(
+            f"{CEO_ASK_THREAD_TITLE}-{thread_id}" if thread_id else CEO_ASK_THREAD_TITLE, engine)
         res = await run_agent_task(runtime, ExecuteAgentTask(
             prompt=prompt,
             model_id=model_id,
             provider_id=provider_id,
             variant=variant,
-            session_title=f"{CEO_ASK_THREAD_TITLE}-{thread_id}" if thread_id else CEO_ASK_THREAD_TITLE,
+            session_title=session_title,
             timeout=timeout,
-            agent_id=settings.CHAT_AGENT_ID,
+            agent_id=agent_id,
         ), kind=KIND_CEO_ASK)
         raw = (res.text or "").strip()
         if not raw:
@@ -233,6 +246,7 @@ async def run_ceo_fast(
     timeout: int = 60,
     history: Optional[List[Dict[str, Any]]] = None,
     thread_id: Optional[str] = None,
+    engine: str = "opencode",
 ) -> Dict[str, Any]:
     """Single-call plain-text path for small talk.
 
@@ -246,14 +260,16 @@ async def run_ceo_fast(
     if not question:
         raise ValueError("Empty question.")
     # PR6: one stable smalltalk thread — the GM remembers previous greetings.
+    agent_id, session_title = _lane(
+        f"{CEO_FAST_THREAD_TITLE}-{thread_id}" if thread_id else CEO_FAST_THREAD_TITLE, engine)
     res = await run_agent_task(runtime, ExecuteAgentTask(
         prompt=build_fast_system_prompt(question, history)[: settings.MISSION_MAX_PROMPT_CHARS],
         model_id=model_id,
         provider_id=provider_id,
         variant=variant,
-        session_title=f"{CEO_FAST_THREAD_TITLE}-{thread_id}" if thread_id else CEO_FAST_THREAD_TITLE,
+        session_title=session_title,
         timeout=timeout,
-        agent_id=settings.CHAT_AGENT_ID,
+        agent_id=agent_id,
     ), kind=KIND_CEO_ASK_FAST)
     reply = sanitize_model_output(res.text or "").strip()
     # Unwrap harmless JSON wrappers without ever re-encoding.

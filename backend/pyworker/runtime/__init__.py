@@ -4,11 +4,21 @@ from backend.pyworker.appsettings import settings
 from backend.pyworker.runtime.base import AgentRuntime
 
 _runtime_instance = None
+_engine_instances: dict = {}
 
 
-def get_runtime() -> AgentRuntime:
-    """Returns the configured default runtime instance (created lazily)."""
+def get_runtime(engine: str = None) -> AgentRuntime:
+    """Returns the default runtime instance (created lazily).
+
+    In real mode ``engine`` selects which engine's runtime is the default (cached per
+    engine; OpenCode when None). Other modes ignore it: mock stays mock and the
+    claude/codex/agy modes stay pinned to their adapter."""
     global _runtime_instance
+    if engine not in (None, "opencode") and settings.RUNTIME_MODE == "real":
+        if engine not in _engine_instances:
+            from backend.pyworker.runtime.engine_registry import create_engine_runtime
+            _engine_instances[engine] = create_engine_runtime(engine)
+        return _engine_instances[engine]
     if _runtime_instance is None:
         mode = settings.RUNTIME_MODE
         if mode == "mock":

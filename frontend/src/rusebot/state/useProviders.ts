@@ -8,6 +8,9 @@
  * first unverified, each only if it has a model to offer. When nothing qualifies the choice is
  * cleared and the Composer refuses to send, pointing to Settings > AI. "mock" only exists when
  * the worker runs in test mode, and stays preferred there so e2e never calls a real model.
+ * The worker owns the default for new chats (preferences.get / preferences.set_default). On the first
+ * load it replaces a remembered choice when that default is usable and still offers its model; localStorage
+ * stays as the cache and for the per-chat choice. The Settings strip saves through saveDefaultProvider.
  * A late answer never overrides a choice made after it was requested (see choiceSeq).
  */
 import { useEffect, useSyncExternalStore } from 'react';
@@ -16,6 +19,9 @@ import {
   engineModels,
   engineStatuses,
   freeModels,
+  preferencesGet,
+  preferencesSetDefault,
+  type DefaultPreference,
   type EngineCapabilities,
   type EngineCheckResult,
   type EngineModel,
@@ -60,6 +66,8 @@ export interface ProvidersSnapshot {
   refreshing: boolean;
   error: string | null;
   checkedAt: string | null;
+  /** Why the last attempt to save the default to the worker failed, if it did. */
+  defaultError: string | null;
 }
 
 function readJson<T>(key: string, fallback: T): T {
@@ -89,6 +97,7 @@ let snap: ProvidersSnapshot = {
   refreshing: false,
   error: null,
   checkedAt: null,
+  defaultError: null,
 };
 const listeners = new Set<() => void>();
 
@@ -184,6 +193,21 @@ export function setProviderChoice(next: EngineChoice): void {
   if (next.model) writeJson(KEY_PREFERRED, preferred);
 }
 
+/**
+ * The Settings "Default for new chats": use it now and save it in the worker, which applies it to Loqman's
+ * missions, delegation and new agents. "mock" (test mode) is never saved: the worker would refuse it.
+ */
+export async function saveDefaultProvider(next: EngineChoice): Promise<void> {
+  setProviderChoice(next);
+  if (next.engine === 'mock' || !next.model) return;
+  try {
+    await preferencesSetDefault(next.engine, next.model);
+    patch({ defaultError: null });
+  } catch (e) {
+    patch({ defaultError: e instanceof Error ? e.message : String(e) });
+  }
+}
+
 /** Switch provider; the model becomes that provider's preferred one (or its first). The last request wins. */
 export async function selectProviderEngine(engine: string): Promise<void> {
   const ticket = ++choiceSeq;
@@ -238,6 +262,18 @@ async function reconcileChoice(): Promise<void> {
   }
 }
 
+/** The worker's saved default replaces a remembered choice, once, if it is usable and still offers its model. */
+async function applyWorkerDefault(pref: DefaultPreference | null): Promise<void> {
+  if (!pref?.engine || !pref.model_id) return;
+  if (snap.selectable.some((e) => e.id === 'mock')) return; // test mode keeps "mock" preferred
+  const entry = snap.selectable.find((e) => e.id === pref.engine);
+  if (!entry || !isUsable(entry)) return;
+  const ticket = choiceSeq;
+  const models = await loadProviderModels(pref.engine);
+  if (ticket !== choiceSeq || !models.some((m) => m.id === pref.model_id)) return;
+  setProviderChoice({ engine: pref.engine, model: pref.model_id });
+}
+
 /** Fold a fresh engines.check discovery into the shared status, so Settings, the Composer and the dialogs agree with it. */
 export function applyEngineCheck(engineId: string, discovery: EngineCheckResult['discovery']): void {
   if (!discovery) return;
@@ -253,6 +289,7 @@ export function applyEngineCheck(engineId: string, discovery: EngineCheckResult[
 // ---- loading ------------------------------------------------------------------------
 
 let loadRequest: Promise<void> | null = null;
+let workerDefaultRead = false;
 
 /** Load statuses and capabilities. `force` makes the worker re-probe instead of using its ~30 s cache. */
 export function refreshProviders(force = false): Promise<void> {
@@ -260,12 +297,20 @@ export function refreshProviders(force = false): Promise<void> {
   patch({ refreshing: true });
   loadRequest = (async () => {
     let failure: string | null = null;
-    const [caps, statuses] = await Promise.all([
+    const [caps, statuses, pref] = await Promise.all([
       engineCapabilities().catch(() => null),
       engineStatuses(force).catch((e: unknown) => {
         failure = e instanceof Error ? e.message : String(e);
         return null;
       }),
+      workerDefaultRead
+        ? Promise.resolve(null)
+        : preferencesGet()
+            .then((p) => {
+              workerDefaultRead = true;
+              return p;
+            })
+            .catch(() => null),
     ]);
     const known = statuses ?? snap.statuses.flatMap((e) => (e.status ? [e.status] : []));
     const capMap = caps ?? Object.fromEntries(snap.selectable.map((e) => [e.id, e.caps]));
@@ -286,6 +331,7 @@ export function refreshProviders(force = false): Promise<void> {
       error: failure,
       checkedAt: statuses ? (stamps.sort().at(-1) ?? new Date().toISOString()) : snap.checkedAt,
     });
+    await applyWorkerDefault(pref);
     // Account changes and empty first answers must not stick: an explicit Refresh reloads every list that was loaded.
     if (force) await Promise.all(Object.keys(snap.models).map((id) => loadProviderModels(id, true)));
     await reconcileChoice();

@@ -10,7 +10,6 @@ import {
   draftContent,
   createDraft,
   followRun,
-  freeModels,
   getRun,
   importLegacyCeo,
   isTerminal,
@@ -416,11 +415,9 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           clearDraft();
           setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'running', error: null } }));
           try {
-            const free = await freeModels().catch(() => [] as EngineModel[]);
-            const model = free.find((m) => m.id === engine.model)?.id ?? free[0]?.id ?? engine.model;
             // The worker stores both sides of the exchange in this chat (the question before generating, the
             // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
-            const answer = await askCeo(prompt, model, ticket, conversationId);
+            const answer = await askCeo(prompt, engine.engine, engine.model, ticket, conversationId);
             if (answer.agents_created.length) onAgentsChanged?.();
           } catch (e) {
             setError(messageOf(e));

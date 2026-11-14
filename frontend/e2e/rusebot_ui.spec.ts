@@ -629,6 +629,7 @@ test.describe('team, contracts and settings', () => {
     expect(delegated).toHaveLength(1);
     expect(delegated[0].params.agent_profile_id).toBe(profileId);
     expect(delegated[0].params.instructions).toBe(task);
+    expect(delegated[0].params.model_id).toBeUndefined(); // the worker resolves engine and model
     expect(sent.some((c) => c.method === 'missions.create')).toBe(false);
   });
 
@@ -845,6 +846,8 @@ async function stubProviders(
     if (req.method === 'engines.open_setup') return reply({ launched: false, reason: 'stubbed' });
     if (req.method === 'engines.test')
       return reply({ engine_id: params.engine_id, model_id: 'm1', ok: true, duration_ms: 1200, reply_preview: 'OK', error_code: null, error_message: null });
+    if (req.method === 'preferences.get') return reply({ engine: null, model_id: null });
+    if (req.method === 'preferences.set_default') return reply({ engine: params.engine, model_id: params.model_id });
     if (req.method === 'usage.summary')
       return reply({
         by_engine: [
@@ -1518,5 +1521,79 @@ test.describe('review fixes: durable Loqman exchange, unbound agent chats, paged
     slow = true;
     await page.waitForTimeout(11000);
     expect(maxInflight).toBe(1);
+  });
+});
+
+test.describe('routing: the worker default decides, Loqman sends the chosen engine and model', () => {
+  const READY_AND_UNVERIFIED: StubEngine[] = [
+    { engine_id: 'ready-e', title: 'Alpha', vendor: 'Vendor A', state: 'ready' },
+    { engine_id: 'unverified-e', title: 'Gamma', vendor: 'Vendor G', state: 'unverified' },
+  ];
+  const CEO_REPLY = { reply: 'ok from the stub', actions_proposed: [], agents_created: [], iterations: 1, fast: true };
+
+  test('Loqman asks with the Composer engine and model and never lists free models', async ({ page }) => {
+    const asked: Array<Record<string, unknown>> = [];
+    const calls = await stubProviders(page, READY_AND_UNVERIFIED, {
+      'engines.capabilities': capsWithoutMock(READY_AND_UNVERIFIED),
+      'ceo.ask': (params) => {
+        asked.push(params);
+        return CEO_REPLY;
+      },
+    });
+    await openBare(page);
+    const box = page.getByRole('textbox', { name: 'Message Loqman' });
+    await box.fill(`routing-${uid()}`);
+    await expect(page.getByRole('button', { name: 'Send' })).toBeEnabled();
+    await box.press('Enter');
+    await expect.poll(() => asked.length, { timeout: 20000 }).toBe(1);
+    expect(asked[0]).toMatchObject({ engine: 'ready-e', model_id: 'm1' });
+    expect(calls.some((c) => c.method === 'models.free')).toBe(false);
+  });
+
+  test('a default chosen in Settings is saved in the worker and restored from it on the next start', async ({ page }) => {
+    let saved: { engine: string | null; model_id: string | null } = { engine: null, model_id: null };
+    const calls = await stubProviders(page, READY_AND_UNVERIFIED, {
+      'engines.capabilities': capsWithoutMock(READY_AND_UNVERIFIED),
+      'preferences.get': () => saved,
+      'preferences.set_default': (params) => {
+        saved = { engine: String(params.engine), model_id: String(params.model_id) };
+        return saved;
+      },
+    });
+    let dialog = await openAiSettings(page, true);
+    await dialog.locator('#ai-default-engine').selectOption('unverified-e');
+    await expect(dialog.locator('#ai-default-model')).toBeEnabled();
+    await dialog.locator('#ai-default-model').selectOption('m2');
+    await expect.poll(() => saved).toEqual({ engine: 'unverified-e', model_id: 'm2' });
+    expect(calls.filter((c) => c.method === 'preferences.set_default').at(-1)?.params).toEqual({ engine: 'unverified-e', model_id: 'm2' });
+    // The browser cache is gone: only the worker still knows the default.
+    await page.evaluate(() => {
+      localStorage.removeItem('agentos.rusebot.engine.v1');
+      localStorage.removeItem('agentos.rusebot.preferredModels.v1');
+    });
+    await page.reload();
+    await expect(page.locator('[data-rusebot-shell]')).toBeVisible();
+    await openDrawerIfNarrow(page);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    dialog = page.getByRole('dialog');
+    await dialog.locator('[data-settings-page=ai]').click();
+    await expect(dialog.locator('#ai-default-engine')).toHaveValue('unverified-e');
+    await expect(dialog.locator('#ai-default-model')).toHaveValue('m2');
+  });
+
+  test('the worker default wins over a stale remembered choice, and a failed save is shown', async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('agentos.rusebot.engine.v1', JSON.stringify({ engine: 'ready-e', model: 'm1' })));
+    await stubProviders(page, READY_AND_UNVERIFIED, {
+      'engines.capabilities': capsWithoutMock(READY_AND_UNVERIFIED),
+      'preferences.get': () => ({ engine: 'unverified-e', model_id: 'm2' }),
+      'preferences.set_default': () => {
+        throw new Error('disk is full');
+      },
+    });
+    const dialog = await openAiSettings(page, true);
+    await expect(dialog.locator('#ai-default-engine')).toHaveValue('unverified-e');
+    await expect(dialog.locator('#ai-default-model')).toHaveValue('m2');
+    await dialog.locator('#ai-default-model').selectOption('m1');
+    await expect(dialog.getByRole('alert').filter({ hasText: 'Could not save the default' })).toBeVisible();
   });
 });

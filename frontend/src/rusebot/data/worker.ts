@@ -292,6 +292,15 @@ export const engineModels = (engineId: string) =>
 export const engineCheck = (engineId: string) => call<EngineCheckResult>('engines.check', { engine_id: engineId });
 export const freeModels = () => call<{ models: EngineModel[] }>('models.free').then((r) => r.models);
 
+/** The worker-side default engine and model (what Loqman, missions and delegation use unless told otherwise). */
+export interface DefaultPreference {
+  engine: string | null;
+  model_id: string | null;
+}
+export const preferencesGet = () => call<DefaultPreference>('preferences.get');
+export const preferencesSetDefault = (engine: string, modelId: string) =>
+  call<DefaultPreference>('preferences.set_default', { engine, model_id: modelId });
+
 export const listProfiles = () => call<{ profiles: Profile[] }>('profiles.list').then((r) => r.profiles);
 const MISSION_ACTIVE = ['queued', 'planning', 'running'];
 /** Missions end as succeeded, partially_succeeded, failed or cancelled; anything else is still moving. */
@@ -354,15 +363,14 @@ export const createMission = (objective: string, title: string, employeeRoles: s
     request_key: `ui-${crypto.randomUUID()}`,
   });
 
-/** Run one assignment under exactly this agent's profile (no CEO planning). */
-export const delegateToAgent = (profile: Profile, task: string, modelId: string) =>
+/** Run one assignment under exactly this agent's profile (no CEO planning). The worker resolves engine and model. */
+export const delegateToAgent = (profile: Profile, task: string) =>
   call<Mission>('missions.delegate', {
     conversation_id: `team-panel:${profile.id}`,
     employee_role: profile.role_type,
     agent_profile_id: profile.id,
     title: task.slice(0, 80),
     instructions: task,
-    model_id: modelId,
   });
 
 export const updateProfileInstructions = (profileId: string, instructions: string) =>
@@ -392,10 +400,12 @@ export interface CeoAnswer {
   fast: boolean;
 }
 
-/** `conversationId` makes the worker remember only that chat; without it Loqman uses the company-wide log. */
-export const askCeo = (question: string, modelId: string, requestId: string, conversationId?: string) =>
+/** `conversationId` makes the worker remember only that chat; without it Loqman uses the company-wide log.
+ *  `engine` and `modelId` are the chat's current choice: Loqman runs on exactly that engine. */
+export const askCeo = (question: string, engine: string, modelId: string, requestId: string, conversationId?: string) =>
   call<CeoAnswer>('ceo.ask', {
     question,
+    engine,
     model_id: modelId,
     request_id: requestId,
     ...(conversationId ? { conversation_id: conversationId } : {}),

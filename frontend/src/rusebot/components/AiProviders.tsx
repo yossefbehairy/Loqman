@@ -11,7 +11,7 @@ import { RefreshCw } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { usageSummary, type UsageByEngine } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
-import { refreshProviders, setProviderChoice, useProviders } from '../state/useProviders';
+import { refreshProviders, saveDefaultProvider, useProviders } from '../state/useProviders';
 import { STATE_ORDER } from '../state/providerText';
 import { ProviderPicker } from './ai/ProviderPicker';
 import { ProviderRow } from './ai/ProviderRow';
@@ -74,9 +74,14 @@ export function AiProviders() {
       <div className="rounded-xl bg-card p-4" data-providers-default>
         <div className="text-[14px] font-medium text-ink">Default for new chats</div>
         <p className="mb-3 mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-          Used by the chat box and as the starting point for new agents. You can still change it per chat.
+          Used by the chat box, by Loqman, for missions and as the starting point for new agents. You can still change it per chat.
         </p>
-        <ProviderPicker idPrefix="ai-default" value={s.choice} onChange={setProviderChoice} />
+        <ProviderPicker idPrefix="ai-default" value={s.choice} onChange={(next) => void saveDefaultProvider(next)} />
+        {s.defaultError && (
+          <p role="alert" className="mt-2 text-[12px] text-danger">
+            Could not save the default. {s.defaultError}
+          </p>
+        )}
       </div>
 
       <div className="flex min-w-0 flex-col gap-3">

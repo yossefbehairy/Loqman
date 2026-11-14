@@ -174,14 +174,12 @@ export function AgentPanel({
   profile,
   onClose,
   onChat,
-  defaultModel,
   onChanged,
 }: {
   agent: Agent;
   profile: Profile | null;
   onClose: () => void;
   onChat: () => void;
-  defaultModel: string;
   onChanged: () => void;
 }) {
   const [task, setTask] = useState('');
@@ -195,10 +193,8 @@ export function AgentPanel({
     setNote(null);
     try {
       if (!profile) throw new Error('This agent has no profile to run the work under.');
-      // A profile bound to an engine must use that engine's model, never the global pick.
-      const model = profile.default_model_id || (profile.engine ? '' : defaultModel);
-      if (!model) throw new Error('Pick a model for this agent in Settings before delegating.');
-      const mission = await delegateToAgent(profile, task.trim(), model);
+      // The worker resolves the engine and model: the agent's own engine, else the default chosen in Settings.
+      const mission = await delegateToAgent(profile, task.trim());
       setNote({ kind: 'ok', text: `Delegated. Mission ${mission.status}.` });
       setTask('');
       onChanged();
@@ -346,7 +342,6 @@ export interface TeamViewProps {
   agents: Agent[];
   profiles: Profile[];
   missions: Mission[];
-  defaultModel: string;
   onOpenChat: (agent: Agent) => void;
   onChanged: () => void;
   /** Re-read only the mission list (cheap); used while missions are active. */
@@ -482,7 +477,6 @@ export function TeamView(props: TeamViewProps) {
             key={agent.id}
             agent={agent}
             profile={profile}
-            defaultModel={props.defaultModel}
             onClose={() => setSelected(null)}
             onChat={() => props.onOpenChat(agent)}
             onChanged={props.onChanged}

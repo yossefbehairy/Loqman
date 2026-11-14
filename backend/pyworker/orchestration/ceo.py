@@ -20,10 +20,12 @@ from typing import Any, Dict, List, Optional
 
 from backend.pyworker.appsettings import settings
 from backend.pyworker.core import missions as mission_repo
+from backend.pyworker.core import preferences as prefs_mod
 from backend.pyworker.core import profiles as profile_repo
 from backend.pyworker.core.conversation_runs import MissionRunCancelled
 from backend.pyworker.db.core import Database, ts
 from backend.pyworker.engine.events import event_hub
+from backend.pyworker.orchestration import routing
 from backend.pyworker.orchestration.planner import (
     build_planning_prompt,
     build_synthesis_prompt,
@@ -198,16 +200,10 @@ _ENGINE_PROVIDERS = ENGINE_PROVIDERS  # legacy name
 
 
 def _default_runtime_identity() -> tuple:
-    """The configured default engine and provider labels for ledger/runs."""
-    return {
-        "real": ("opencode", "opencode"),
-        "mock": ("mock", "mock"),
-        "claude": ("claude-code", "anthropic"),
-        "codex": ("codex", "openai"),
-        # RUNTIME_MODE=agy selects the separate experimental print adapter; the
-        # canonical Antigravity ACP adapter is selected explicitly by engine id.
-        "agy": ("agy-legacy-cli", "antigravity"),
-    }.get(settings.RUNTIME_MODE, ("opencode", "opencode"))
+    """The default engine and provider labels for ledger/runs: the engine the default runtime really is
+    (the saved default in real mode, mock in mock mode; RUNTIME_MODE=agy is the separate experimental print
+    adapter, the canonical Antigravity ACP adapter is selected by engine id)."""
+    return prefs_mod.default_identity()
 
 
 class EngineSelectionError(Exception):
@@ -269,6 +265,33 @@ async def _select_task_runtime(profile, default_runtime, factory, cache, model_i
     return rt, ENGINE_PROVIDERS[engine], engine
 
 
+async def _route_task(profile, default_runtime, factory, cache, model_id, variant, fallback_model_id):
+    """Return (runtime, provider_id, engine_label, model_id, variant) for one worker task.
+
+    A profile with an explicit engine is unchanged (`_select_task_runtime`). A profile without one follows
+    the default engine: its stored model is used only if that engine offers it, otherwise `fallback_model_id`
+    (the default model) is used. A stored variant the default engine's model does not support is dropped."""
+    explicit = ((profile.get("engine") if profile else None) or "").strip()
+    if explicit:
+        rt, provider, engine = await _select_task_runtime(profile, default_runtime, factory, cache, model_id, variant)
+        return rt, provider, engine, model_id, variant
+    engine, provider = _default_runtime_identity()
+    chosen = await routing.usable_model(default_runtime, engine, model_id, fallback_model_id)
+    if chosen != model_id:
+        variant = None
+    if routing.is_strict(engine) and chosen:
+        try:
+            catalog = await default_runtime.list_available_models(free_only=prefs_mod.free_only(engine))
+        except Exception as exc:
+            raise EngineSelectionError(f"Engine '{engine}' model catalog failed: {safe_error_message(exc)}") from exc
+        entry = next((m for m in catalog if m.id == chosen), None)
+        if entry is None:
+            raise EngineSelectionError(f"Model '{chosen}' is not offered by engine '{engine}'.")
+        if variant not in (None, "", "default") and variant not in (entry.variants or []):
+            variant = None  # a stored variant of an agent without an engine is a hint, not a requirement
+    return default_runtime, provider, None, chosen, variant
+
+
 async def _execute_single_task(
     db: Database,
     runtime,
@@ -318,7 +341,8 @@ async def _execute_single_task(
                 profile = p
                 break
     instructions = (profile["instructions"] if profile else t["instructions"]) or t["instructions"]
-    model_id = t["model_id"] or (profile["default_model_id"] if profile else None) or settings.DEFAULT_MODEL_ID
+    fallback_model = mission["model_id"] or prefs_mod.default_model_id()
+    model_id = t["model_id"] or (profile["default_model_id"] if profile else None) or fallback_model
     variant = t["variant"] or (profile["default_variant_id"] if profile else None)
 
     context_parts = [t["input_context"] or ""]
@@ -348,9 +372,9 @@ async def _execute_single_task(
         return parsed
 
     try:
-        task_runtime, task_provider, task_engine = await _select_task_runtime(
+        task_runtime, task_provider, task_engine, model_id, variant = await _route_task(
             profile, runtime, engine_runtime_factory or _default_engine_runtime_factory,
-            engine_cache if engine_cache is not None else {}, model_id, variant)
+            engine_cache if engine_cache is not None else {}, model_id, variant, fallback_model)
     except EngineSelectionError as exc:
         msg = f"Engine selection failed: {str(exc)[:300]}"
         if not transition_task(db, task_id, ("queued", "running"), status="failed", error_message=msg,
@@ -459,7 +483,7 @@ async def run_mission_background(mission_id: str, db: Database, runtime, manager
         try:
             roles = sorted({(p["role_type"] or "").lower() for p in profile_repo.list_all(db) if p["role_type"]})
             plan_prompt = build_planning_prompt(mission["objective"], roles)
-            plan_model = mission["model_id"] or settings.DEFAULT_MODEL_ID
+            plan_model = mission["model_id"] or prefs_mod.default_model_id()
             plan_req = ExecuteAgentTask(
                 prompt=plan_prompt[: settings.MISSION_MAX_PROMPT_CHARS], model_id=plan_model,
                 provider_id=stage_provider, variant=mission["variant"],
@@ -505,7 +529,7 @@ async def run_mission_background(mission_id: str, db: Database, runtime, manager
                 db, mission_id=mission_id, task_key=pt.key, employee_role=pt.employee_role, title=pt.title,
                 instructions=pt.instructions, input_context=mission["objective"], depends_on=pt.depends_on,
                 agent_profile_id=prof["id"] if prof else None,
-                model_id=(prof["default_model_id"] if prof else None) or mission["model_id"] or settings.DEFAULT_MODEL_ID,
+                model_id=(prof["default_model_id"] if prof else None) or mission["model_id"] or prefs_mod.default_model_id(),
                 variant=(prof["default_variant_id"] if prof else None) or mission["variant"]))
         await _broadcast(mission_id, "mission.tasks.created", {"tasks": [c["task_key"] for c in created]})
 
@@ -543,7 +567,7 @@ async def run_mission_background(mission_id: str, db: Database, runtime, manager
                                 "output_excerpt": excerpt})
             syn_req = ExecuteAgentTask(
                 prompt=build_synthesis_prompt(mission["objective"], results)[: settings.MISSION_MAX_PROMPT_CHARS],
-                model_id=mission["model_id"] or settings.DEFAULT_MODEL_ID, provider_id=stage_provider,
+                model_id=mission["model_id"] or prefs_mod.default_model_id(), provider_id=stage_provider,
                 variant=mission["variant"], session_title=f"mission-{mission_id[:8]}-synthesis",
                 timeout=settings.MISSION_TASK_TIMEOUT)
             syn_res, _ = await manager.run_mission_task(

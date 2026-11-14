@@ -23,6 +23,8 @@ class Context:
     get_runtime: Callable[[], Any]
     # Factory for explicit engines (profile.engine / engine endpoints).
     engine_factory: Callable[[str], Any]
+    # Worker-side default engine/model (preferences.json next to the database).
+    preferences: Optional[Any] = None
     # Open event streams (set by the server; None in pure in-process use).
     streams: Optional[Any] = None
     # Fire-and-forget work (mission/workflow runners) so shutdown can drain it.

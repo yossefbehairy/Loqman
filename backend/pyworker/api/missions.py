@@ -16,9 +16,11 @@ from typing import Any, Dict, List, Optional
 
 from backend.pyworker.appsettings import settings
 from backend.pyworker.core import missions as mission_repo
+from backend.pyworker.core import preferences as prefs_mod
 from backend.pyworker.core import profiles as profile_repo
 from backend.pyworker.db.core import Database, ts
 from backend.pyworker.errors import api_error
+from backend.pyworker.orchestration import routing
 from backend.pyworker.orchestration.ceo import (
     ENGINE_PROVIDERS,
     MISSION_NON_TERMINAL,
@@ -69,25 +71,11 @@ def _out(db: Database, mission: Dict[str, Any]) -> Dict[str, Any]:
     return mission_repo.mission_out(mission, mission_repo.tasks_for(db, mission["id"]))
 
 
-def _variant_ok(entry, variant: Optional[str], strict: bool) -> bool:
-    if not variant or (strict and variant == "default"):
-        return True
-    if entry.variants:
-        return variant in entry.variants
-    return not strict  # strict (account engines): no exposed variants -> none supported
-
-
-async def _catalog(rt: Any, free_only: bool, label: str):
-    try:
-        return await rt.list_available_models(free_only=free_only)
-    except Exception:
-        raise api_error(502, f"{label} runtime unreachable.")
-
-
 async def preflight_model(ctx, runtime, model_id: str, variant: Optional[str], *, profile: Any = None):
     """Provider-aware model/variant validation BEFORE any DB write (catalog
     listing only, never a model call). Returns (runtime, provider_id,
-    engine_label_or_None, catalog_entry)."""
+    engine_label_or_None, catalog_entry). A profile with an explicit engine is checked on that engine; anything
+    else on the default engine. "Free only" is the engine's own policy."""
     engine = ((profile.get("engine") if profile else None) or "").strip() or None
     if engine is not None:
         if engine not in ENGINE_PROVIDERS:
@@ -95,7 +83,7 @@ async def preflight_model(ctx, runtime, model_id: str, variant: Optional[str], *
         if engine == "mock":
             if settings.RUNTIME_MODE != "mock":
                 raise api_error(400, "Engine 'mock' is only available in explicit mock mode.")
-            rt, free_only = runtime, True
+            rt = runtime
         else:
             try:
                 rt = ctx.engine_factory(engine)
@@ -103,25 +91,12 @@ async def preflight_model(ctx, runtime, model_id: str, variant: Optional[str], *
                 raise api_error(400, str(exc)[:300])
             except Exception:
                 raise api_error(503, f"Engine '{engine}' is unavailable.")
-            free_only = engine == "opencode"
-        strict = engine not in ("opencode", "mock")
-        label, provider = engine, ENGINE_PROVIDERS[engine]
+        label, provider, checked = engine, ENGINE_PROVIDERS[engine], engine
     else:
-        mode = settings.RUNTIME_MODE
-        rt, free_only, strict = runtime, mode in ("real", "mock"), mode not in ("real", "mock")
-        label, provider = None, _default_runtime_identity()[1]
-    models = await _catalog(rt, free_only, "OpenCode" if free_only else (engine or settings.RUNTIME_MODE))
-    entry = next((m for m in models if m.id == model_id), None)
-    if entry is None:
-        if free_only:
-            raise api_error(400, f"Model '{model_id}' is not verified as free and active. "
-                                 f"Available free models include: {[m.id for m in models[:20]]}")
-        raise api_error(400, f"Model '{model_id}' is not offered by "
-                             f"{'engine ' + repr(engine) if engine else 'the configured runtime'}; "
-                             f"available models include: {[m.id for m in models[:20]]}")
-    if not _variant_ok(entry, variant, strict):
-        raise api_error(400, f"Variant '{variant}' is not supported by model '{model_id}'. "
-                             f"Supported: {entry.variants}")
+        checked = prefs_mod.default_engine_id()
+        rt, label, provider = runtime, None, _default_runtime_identity()[1]
+    models = await routing.load_catalog(rt, checked)
+    entry = routing.check_model(models, checked, model_id, variant)
     return rt, provider, label, entry
 
 
@@ -159,7 +134,7 @@ async def _run_explicit_delegation(ctx, mission_id: str, task_id: str, profile_i
             f"Input/context: {task['input_context'] or '(none supplied)'}\n"
             f"Expected deliverable: {task['expected_output'] or '(use a clear, useful format)'}\n"
             "Complete the assignment and return the actual deliverable directly.")
-        model_id = task["model_id"] or settings.DEFAULT_MODEL_ID
+        model_id = task["model_id"] or prefs_mod.default_model_id()
         task_runtime, provider_id, engine = resolved or await _select_task_runtime(
             profile, runtime, ctx.engine_factory or _default_engine_runtime_factory, {}, model_id,
             task["variant"])
@@ -275,7 +250,7 @@ async def missions_create(ctx, params):
     if not objective:
         raise api_error(400, "Objective must not be empty.")
     roles = [r.strip().lower() for r in roles_in if r.strip()] or ["planner", "reviewer"]
-    model_id = model_id_in or settings.DEFAULT_MODEL_ID
+    model_id = model_id_in or prefs_mod.default_model_id()
     runtime = ctx.get_runtime()
     _, _, _, target = await preflight_model(ctx, runtime, model_id, variant)
 
@@ -316,8 +291,8 @@ async def missions_create(ctx, params):
 @method("missions.delegate")
 async def missions_delegate(ctx, params):
     """Create and execute exactly one user-selected employee assignment; skip CEO planning."""
-    check_keys(params, {"conversation_id", "employee_role", "title", "instructions", "model_id"},
-               ("agent_profile_id", "input_context", "expected_output", "variant"))
+    check_keys(params, {"conversation_id", "employee_role", "title", "instructions"},
+               ("agent_profile_id", "input_context", "expected_output", "variant", "model_id"))
     conversation_id = req_str(params, "conversation_id", 1, 128)
     employee_role = req_str(params, "employee_role", 1, 64)
     agent_profile_id = opt_str(params, "agent_profile_id", 0, 128)
@@ -325,7 +300,7 @@ async def missions_delegate(ctx, params):
     instructions = req_str(params, "instructions", 1, 8000)
     input_context = opt_str(params, "input_context", 0, 12000)
     expected_output = opt_str(params, "expected_output", 0, 2000)
-    model_id = req_str(params, "model_id", 1, 128)
+    model_in = opt_str(params, "model_id", 1, 128)
     variant = opt_str(params, "variant", 0, 64)
     db = ctx.db
     profile = None
@@ -340,6 +315,16 @@ async def missions_delegate(ctx, params):
     if not profile:
         raise api_error(404, "Selected employee role was not found.")
     runtime = ctx.get_runtime()
+    model_id = model_in
+    if not model_id:
+        # No model named: the worker resolves it. An agent bound to an engine uses its own model; any other
+        # agent uses its stored model when the default engine offers it, else the default model.
+        stored = profile.get("default_model_id")
+        if (profile.get("engine") or "").strip():
+            model_id = stored or prefs_mod.default_model_id()
+        else:
+            model_id = await routing.usable_model(runtime, prefs_mod.default_engine_id(), stored,
+                                                  prefs_mod.default_model_id())
     resolved_rt, resolved_provider, resolved_engine, _ = await preflight_model(
         ctx, runtime, model_id, variant, profile=profile)
     objective = instructions.strip()
