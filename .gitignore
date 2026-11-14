@@ -77,3 +77,8 @@ Thumbs.db
 *.sw?
 *.log
 logs/
+
+# Database backups (never commit)
+*.bak
+*.db.*.bak
+agentos.db.*
