@@ -147,6 +147,17 @@ cwd) with only the new message (`resume_prompt`, no replayed history). A session
 the full history prompt with a `session_rebuilt` notice (generation + 1). Timeouts, EOF or any error after submission
 are never replayed. CEO and mission scopes get `--no-session-persistence` and a throwaway cwd.
 
+R-C hardening: "before submission" is proven only when the process exited before the user frame was written (a short
+`resume_gate_s` wait on resume turns observes a fast refusal; no write goes to a dead process). Once the frame was
+written and flushed a missing-session refusal fails the turn (`session_missing`), marks the session `invalid` and the
+NEXT turn starts fresh; the prompt is never sent twice. The refusal pattern matches only "no conversation found" or
+"session ... not found / does not exist". The stdout hand-off queue is bounded (`MAX_QUEUE_ITEMS`); overflow fails the
+turn with `output_limit` like the byte cap. Every stdin line (user frame, control responses) is written and flushed
+under one lock. Every `control_request` is answered: `can_use_tool` is denied, any other subtype gets an error
+response, whatever the id type. A CLI that does not advertise `--permission-prompts` is refused before launch
+(`unsupported_capability`). `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` reach the child only when the runtime was built
+with `allow_api_key_env=True` (the registry passes the legacy runtime's setting through); no other secret is added.
+
 Child environment (S5): explicit allowlist (`claude_child_env`: PATH, SYSTEMROOT, WINDIR, COMSPEC, PATHEXT, TEMP/TMP,
 USERPROFILE, HOME*, APPDATA, LOCALAPPDATA, PROGRAMDATA, PROGRAMFILES*, OS, NUMBER_OF_PROCESSORS,
 PROCESSOR_ARCHITECTURE, LANG/LC_*, CLAUDE_CONFIG_DIR, CLAUDE_CODE_GIT_BASH_PATH, certificate paths, proxies without

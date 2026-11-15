@@ -12,7 +12,10 @@ turn launches ``--session-id <uuid>`` (binding known before the prompt is submit
 ``--resume <id>``. CEO and mission scopes use ``--no-session-persistence`` (fresh, isolated per call). If a resume is
 refused by Claude *before* it initialises (proven: no ``system/init`` frame and an explicit missing-session message),
 the stored session is marked invalid and ONE fresh session is started with the caller's full (history-seeded) prompt and
-a ``session_rebuilt`` notice. Any other failure, including timeout or EOF after submission, is never replayed.
+a ``session_rebuilt`` notice. "Before submission" is proven only when the process died/refused before the user frame was
+written (a short gate on resume turns waits for an early exit; no write to a dead process). Once the frame was written and
+flushed it is never replayed: a refusal then fails the turn, marks the session invalid, and the NEXT turn starts fresh.
+Any other failure, including timeout or EOF after submission, is never replayed.
 
 Interrupt: the stream-json input channel has no established graceful interrupt (RuseBot also kills), so ``interrupt``
 terminates the owned process tree and settles the turn as cancelled; the bound is the supervisor's own kill bound
@@ -61,14 +64,16 @@ PREVIEW_CHARS = 400
 STDERR_TAIL_BYTES = 8192
 MCP_ALLOWED_TOOLS = "mcp__agentos_workspace__*"
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\[\]]{0,63}$")
-_REFUSED_RE = re.compile(r"no conversation found|session[^.\n]{0,60}(not found|does not exist|no longer exists|invalid)", re.I)
+_REFUSED_RE = re.compile(r"no conversation found|session[^.\n]{0,60}(not found|does not exist)", re.I)
+MAX_QUEUE_ITEMS = 512      # stdout chunks buffered between the reader thread and the parser (S-6)
+_API_KEY_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")  # same names ClaudeCodeRuntime strips (S-8)
 _SECRET_KEY_RE = re.compile(r"token|secret|password|passwd|api[_-]?key|authorization|credential", re.I)
 
 # Flags the driver relies on; every one must be advertised by `claude --help` or the driver refuses to start.
 REQUIRED_FLAGS = ("--print", "--input-format", "--output-format", "--verbose", "--include-partial-messages",
                   "--tools", "--strict-mcp-config", "--model", "--setting-sources", "--disable-slash-commands",
                   "--no-session-persistence", "--resume", "--session-id", "--mcp-config", "--allowedTools")
-OPTIONAL_FLAGS = ("--permission-prompts",)
+OPTIONAL_FLAGS = ("--permission-prompts",)  # probed like the rest, but a turn needs it: without it prompts may block (S-10)
 
 # -- S5: explicit child environment ---------------------------------------------------------------------------------
 # Claude's login lives in the user profile (credentials file / keychain), not in the environment, so nothing secret is
@@ -186,6 +191,10 @@ class _Cancelled(Exception):
     pass
 
 
+def _new_queue() -> asyncio.Queue:
+    return asyncio.Queue(maxsize=MAX_QUEUE_ITEMS)
+
+
 @dataclass
 class _Item:
     id: str
@@ -207,7 +216,10 @@ class _Turn:
     started: bool = False
     cancelled: bool = False
     stop: Optional[asyncio.Task] = None
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue = field(default_factory=_new_queue)
+    queue_overflow: bool = False
+    init_hint: bool = False
+    stdin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     proc: Optional[SupervisedProcess] = None
     # per-attempt state
     stderr: bytearray = field(default_factory=bytearray)
@@ -261,7 +273,8 @@ class ClaudeStreamDriver:
     def __init__(self, cli_cmd=None, *, runtime_key: str = "default", sessions: Optional[SessionRepository] = None,
                  resume_prompt: Optional[str] = None, resume_check: Optional[Callable[[dict], bool]] = None,
                  cwd_root: Optional[str] = None, env: Optional[dict] = None, extra_env: Optional[dict] = None,
-                 interrupt_grace_s: float = 3.0, exit_grace_s: float = 2.0, cache_flags: bool = True):
+                 interrupt_grace_s: float = 3.0, exit_grace_s: float = 2.0, cache_flags: bool = True,
+                 resume_gate_s: float = 0.5, allow_api_key_env: bool = False):
         if isinstance(cli_cmd, str):
             cli_cmd = [cli_cmd]
         self._cmd = list(cli_cmd) if cli_cmd else default_cli_cmd()
@@ -273,13 +286,21 @@ class ClaudeStreamDriver:
         self._env_source, self._extra_env = env, extra_env
         self.interrupt_grace_s, self.exit_grace_s = interrupt_grace_s, exit_grace_s
         self._cache_flags = cache_flags
+        self.resume_gate_s = resume_gate_s
+        self._allow_api_key_env = allow_api_key_env
         self._turns: dict = {}
         self._issues: list = []
         self._health_rt = None
 
     # -- environment / flags ------------------------------------------------------------------------------------------
     def _env(self) -> dict:
-        return claude_child_env(self._env_source, self._extra_env)
+        env = claude_child_env(self._env_source, self._extra_env)
+        if self._allow_api_key_env:  # explicit opt-in to API-key billing, same decision as ClaudeCodeRuntime._env
+            source = os.environ if self._env_source is None else self._env_source
+            for key in _API_KEY_ENV:
+                if key in source:
+                    env[key] = source[key]
+        return env
 
     def _namespace(self) -> str:
         return "claude:" + (self._env().get("CLAUDE_CONFIG_DIR") or "default")
@@ -443,10 +464,10 @@ class ClaudeStreamDriver:
             if not self._cmd:
                 raise _failure("cli_missing", "Claude Code CLI not found on PATH.", "launch", "not-submitted")
             flags = await self._flags()
-            missing = [f for f in REQUIRED_FLAGS if f not in flags]
+            missing = [f for f in (*REQUIRED_FLAGS, *OPTIONAL_FLAGS) if f not in flags]
             if missing:
                 raise _failure("unsupported_capability", "Installed Claude CLI does not advertise the flags required for "
-                               "streaming tool-less mode; refusing to run.", "launch", "not-submitted")
+                               "streaming tool-less mode (including --permission-prompts); refusing to run.", "launch", "not-submitted")
             plan = self._plan(s, flags)
             outcome = await self._attempt(s, plan, flags)
             if outcome == "resume_refused":
@@ -507,7 +528,8 @@ class ClaudeStreamDriver:
 
     def _reset_attempt(self, s: _Turn):
         s.stderr = bytearray()
-        s.queue = asyncio.Queue()
+        s.queue = _new_queue()
+        s.queue_overflow = s.init_hint = False
         s.session_id, s.saw_init, s.submitted, s.output_seen = None, False, False, False
         s.result, s.api_error, s.items, s.blocks, s.msg_id = None, None, [], {}, None
         s.tools, s.final_ids, s.text_chars = {}, [], 0
@@ -542,7 +564,7 @@ class ClaudeStreamDriver:
             queue = s.queue
             proc = await _StreamProcess.launch(
                 argv, cwd=cwd, env=self._env(),
-                on_out=lambda d: queue.put_nowait(("eof",) if d is None else ("out", d)),
+                on_out=lambda d: self._enqueue(s, queue, ("eof",) if d is None else ("out", d)),
                 on_err=lambda d: self._stderr(s, d))
             s.proc = proc
             exited = None
@@ -553,20 +575,53 @@ class ClaudeStreamDriver:
                     s.session_id = plan["new_id"]
                     self._save_session(s, plan, "unverified", None)
                 exited = asyncio.ensure_future(asyncio.to_thread(proc.proc.wait))
-                exited.add_done_callback(lambda _f: queue.put_nowait(("exit",)))
+                exited.add_done_callback(lambda _f: self._enqueue(s, queue, ("exit",)))
+                if plan["resume_id"]:
+                    await self._resume_gate(s, queue, proc)
                 frame = {"type": "user", "message": {"role": "user", "content": plan["prompt"]}}
-                try:
-                    await asyncio.to_thread(proc.proc.stdin.write, (json.dumps(frame, ensure_ascii=False) + "\n").encode("utf-8"))
-                    await asyncio.to_thread(proc.proc.stdin.flush)
-                    s.submitted = True
-                except (BrokenPipeError, OSError, ValueError):
-                    s.submitted = False  # the reader below reports why the process died
+                # A process that is already gone cannot have consumed the prompt: do not write, so a refusal is provably
+                # pre-submission. Otherwise ``submitted`` flips only after write AND flush succeeded.
+                if proc.proc.poll() is None:
+                    s.submitted = await self._write_line(s, proc, json.dumps(frame, ensure_ascii=False))
                 await self._read(s, queue, proc)
                 return await self._finish(s, plan, proc)
             finally:
                 if exited is not None:
                     exited.cancel()
                 await self._release(s, proc, graceful=s.result is not None)
+
+    def _enqueue(self, s: _Turn, queue: asyncio.Queue, item):
+        """Bounded hand-off from the reader thread. Overflow drops the chunk and fails the turn (see ``_read``)."""
+        if item[0] == "out" and b'"init"' in item[1]:
+            s.init_hint = True  # the CLI already started its session: stop waiting at the resume gate
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            s.queue_overflow = True
+
+    async def _resume_gate(self, s: _Turn, queue: asyncio.Queue, proc):
+        """On a resume turn, give a CLI that refuses a missing session a moment to exit BEFORE we submit the prompt.
+        Ends on process exit, a system/init sighting, cancellation or ``resume_gate_s``."""
+        loop = asyncio.get_running_loop()
+        end = loop.time() + max(0.0, self.resume_gate_s)
+        while loop.time() < end and not s.cancelled and not s.init_hint and proc.proc.poll() is None:
+            await asyncio.sleep(0.02)
+
+    async def _write_line(self, s: _Turn, proc, text: str) -> bool:
+        """One whole line (write + flush) under one lock, so frames and control responses never interleave."""
+        data = (text + "\n").encode("utf-8")
+        stdin = proc.proc.stdin
+
+        def write():
+            stdin.write(data)
+            stdin.flush()
+
+        async with s.stdin_lock:
+            try:
+                await asyncio.to_thread(write)
+                return True
+            except (BrokenPipeError, OSError, ValueError):
+                return False
 
     async def _read(self, s: _Turn, queue: asyncio.Queue, proc):
         loop = asyncio.get_running_loop()
@@ -575,6 +630,8 @@ class ClaudeStreamDriver:
         while s.result is None:
             if s.cancelled:
                 raise _Cancelled()
+            if s.queue_overflow:
+                raise _failure("output_limit", "Engine output exceeded the allowed buffer limit.", "running", "output-seen")
             remaining = s.deadline - loop.time()
             if exit_seen_at is not None:
                 remaining = min(remaining, max(0.0, exit_seen_at + self.exit_grace_s - loop.time()))
@@ -587,6 +644,8 @@ class ClaudeStreamDriver:
                 item = await asyncio.wait_for(queue.get(), remaining)
             except asyncio.TimeoutError:
                 continue
+            if s.queue_overflow:
+                raise _failure("output_limit", "Engine output exceeded the allowed buffer limit.", "running", "output-seen")
             kind = item[0]
             if kind == "cancel":
                 raise _Cancelled()
@@ -627,12 +686,22 @@ class ClaudeStreamDriver:
             s.stderr += data
             del s.stderr[:-STDERR_TAIL_BYTES]
 
+    def _refused(self, s: _Turn, plan: dict):
+        """A missing-session refusal. Only before submission may the caller rebuild; after it the prompt may already have
+        run (tools included), so it is never replayed: invalidate the session and fail clearly."""
+        if not s.submitted:
+            return
+        self._invalidate(s, plan)
+        raise _failure("runtime_error", "Claude Code lost the session after the message was submitted; the message was not "
+                       "replayed. The next message starts a new session.", "running", "unknown", False, "session_missing")
+
     async def _finish(self, s: _Turn, plan: dict, proc) -> str:
         stderr = bytes(s.stderr).decode("utf-8", "replace")
         result = s.result
         if result is None:
             # EOF/exit with no result frame.
             if plan["resume_id"] and not s.saw_init and _REFUSED_RE.search(stderr + (s.api_error or "")):
+                self._refused(s, plan)
                 return "resume_refused"
             category, message, retryable = classify_text(stderr + (s.api_error or ""))
             if category == "runtime_error":
@@ -642,6 +711,7 @@ class ClaudeStreamDriver:
         text = result.get("result") if isinstance(result.get("result"), str) else ""
         if result.get("is_error"):
             if plan["resume_id"] and not s.saw_init and _REFUSED_RE.search(text + stderr):
+                self._refused(s, plan)
                 return "resume_refused"
             category, message, retryable = classify_text(text + " " + (s.api_error or "") + " " + stderr)
             raise _failure(category, message, "running", "output-seen" if s.output_seen else "submitted", retryable,
@@ -726,19 +796,17 @@ class ClaudeStreamDriver:
             s.result = o
 
     async def _control(self, s: _Turn, o: dict):
+        """Answer EVERY control_request so the CLI never waits: can_use_tool is denied, anything else gets an error."""
         req = o.get("request") if isinstance(o.get("request"), dict) else {}
         request_id = o.get("request_id")
-        if req.get("subtype") != "can_use_tool" or not isinstance(request_id, str):
-            return
-        response = {"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {
-            "behavior": "deny", "message": "AgentOS does not grant interactive permissions."}}}
-        await self._send(s, "runtime.notice", {"code": "permission_denied", "message": "A tool permission request was denied."})
+        if req.get("subtype") == "can_use_tool":
+            body = {"subtype": "success", "request_id": request_id, "response": {
+                "behavior": "deny", "message": "AgentOS does not grant interactive permissions."}}
+            await self._send(s, "runtime.notice", {"code": "permission_denied", "message": "A tool permission request was denied."})
+        else:
+            body = {"subtype": "error", "request_id": request_id, "error": "AgentOS does not support this control request."}
         if s.proc is not None:
-            try:
-                await asyncio.to_thread(s.proc.proc.stdin.write, (json.dumps(response) + "\n").encode("utf-8"))
-                await asyncio.to_thread(s.proc.proc.stdin.flush)
-            except (BrokenPipeError, OSError, ValueError):
-                pass
+            await self._write_line(s, s.proc, json.dumps({"type": "control_response", "response": body}))
 
     def _check_text_budget(self, s: _Turn, extra: int):
         s.text_chars += extra
@@ -855,7 +923,7 @@ class ClaudeStreamDriver:
 
     # -- interrupt / lifecycle ------------------------------------------------------------------------------------------
     async def _stop(self, s: _Turn):
-        s.queue.put_nowait(("cancel",))
+        self._enqueue(s, s.queue, ("cancel",))
         if s.task is not None and not s.task.done():
             done, _ = await asyncio.wait({s.task}, timeout=self.interrupt_grace_s + 10.0)
             if not done:
@@ -898,7 +966,7 @@ class ClaudeStreamDriver:
     def _runtime(self):
         if self._health_rt is None:
             from .claude_runtime import ClaudeCodeRuntime
-            self._health_rt = ClaudeCodeRuntime(self._cmd)
+            self._health_rt = ClaudeCodeRuntime(self._cmd, self._allow_api_key_env)
         return self._health_rt
 
     async def check_health(self) -> RuntimeHealth:

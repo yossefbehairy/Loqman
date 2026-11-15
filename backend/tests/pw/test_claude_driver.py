@@ -35,7 +35,8 @@ FAKE = textwrap.dedent(r'''
              "--model --setting-sources --disable-slash-commands --no-session-persistence --resume --session-id "
              "--mcp-config --allowedTools --permission-prompts").split()
     if "--help" in args:
-        flags = [f for f in FLAGS if not (MODE == "old_help" and f == "--setting-sources")]
+        flags = [f for f in FLAGS if not (MODE == "old_help" and f == "--setting-sources")
+                 and not (MODE == "no_prompts" and f == "--permission-prompts")]
         print("Usage: claude [options]\n" + "\n".join("  " + f + "   description" for f in flags)); sys.exit(0)
 
     def log(**kw):
@@ -61,6 +62,10 @@ FAKE = textwrap.dedent(r'''
         if MODE == "resume_result_error":
             emit({"type": "result", "subtype": "error_during_execution", "is_error": True,
                   "result": "No conversation found with session ID: " + resume}); sys.exit(0)
+        if MODE == "refuse_after_read":
+            frame = json.loads(sys.stdin.readline())
+            log(event="prompt", prompt=frame["message"]["content"], frame_keys=sorted(frame))
+            sys.stderr.write("No conversation found with session ID: " + resume); sys.exit(1)
         if MODE == "resume_auth":
             sys.stderr.write("Not logged in - run /login"); sys.exit(1)
         sys.stderr.write("No conversation found with session ID: " + resume); sys.exit(1)
@@ -110,6 +115,19 @@ FAKE = textwrap.dedent(r'''
               "delta": {"type": "text_delta", "text": "NESTED-IGNORED"}}})
         text_message("msg_2", "done:" + prompt)
         result("done:" + prompt)
+    elif MODE == "ctl":
+        emit({"type": "control_request", "request_id": 7, "request": {"subtype": "hook_callback"}})
+        emit({"type": "control_request", "request_id": "m1", "request": {"subtype": "mcp_message"}})
+        emit({"type": "control_request", "request_id": 9, "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {}}})
+        for _ in range(3):
+            log(event="control_response", answer=json.loads(sys.stdin.readline()))
+        text_message("msg_1", "ctl-ok")
+        result("ctl-ok")
+    elif MODE == "flood":
+        for i in range(400):
+            emit({"type": "stream_event", "event": {"type": "message_start", "message": {"id": "m%d" % i}}})
+            time.sleep(0.002)
+        result("late")
     elif MODE == "perm":
         emit({"type": "control_request", "request_id": "r1", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {}}})
         answer = json.loads(sys.stdin.readline())
@@ -156,6 +174,7 @@ class Rig:
         sessions = SessionRepository(db) if db is not None else None
         kw.setdefault("exit_grace_s", 0.3)
         kw.setdefault("interrupt_grace_s", 1.0)
+        kw.setdefault("resume_gate_s", 0.05)
         return ClaudeStreamDriver([sys.executable, str(self.script)], sessions=sessions, cwd_root=self.cwd_root,
                                   extra_env={"FAKE_MODE": mode}, cache_flags=False, **kw)
 
@@ -287,7 +306,7 @@ async def test_unknown_session_before_prompt_marks_invalid_and_rebuilds_once(rig
                               protocol="claude-stream-json", namespace="claude:default", native_session_id="gone",
                               generation=1, state="ready", model_id="sonnet", cwd=os.path.join(rig.cwd_root, "conversation"),
                               last_turn_id="prev")
-    result, events, err = await run_turn(rig.driver(mode, db=db, resume_prompt="INCREMENTAL"), turn_id="r2", run_id="r2",
+    result, events, err = await run_turn(rig.driver(mode, db=db, resume_prompt="INCREMENTAL", resume_gate_s=10.0), turn_id="r2", run_id="r2",
                                          scope_kind="conversation", scope_id="c1", prompt="FULL-WITH-HISTORY")
     assert err is None and result.text == "echo:FULL-WITH-HISTORY"  # explicit rebuild from the seeded transcript
     launches = rig.log("launch")
@@ -505,3 +524,116 @@ async def test_conversation_runs_use_native_session_without_replaying_history(ri
     done3 = await wait_status(api, third["id"], "succeeded", timeout=30)
     assert "Previous conversation (JSON)" in done3["assistant_content"] and "--session-id" in rig.log("launch")[2]["args"]
     assert SessionRepository(api.db).get("conversation", cid, "claude-code")["generation"] == 2
+
+
+def _seed_session(rig, db, sid="gone"):
+    SessionRepository(db).put(scope_kind="conversation", scope_id="c1", engine="claude-code", runtime_key="default",
+                              protocol="claude-stream-json", namespace="claude:default", native_session_id=sid,
+                              generation=1, state="ready", model_id="sonnet", cwd=os.path.join(rig.cwd_root, "conversation"),
+                              last_turn_id="prev")
+
+
+@pytest.mark.asyncio
+async def test_s2_refusal_after_the_prompt_was_read_is_never_replayed(rig, db):
+    _seed_session(rig, db)
+    result, events, err = await run_turn(rig.driver("refuse_after_read", db=db, resume_prompt="INCREMENTAL"), turn_id="r2",
+                                         run_id="r2", scope_kind="conversation", scope_id="c1", prompt="FULL")
+    assert err is not None and result is None
+    assert len(rig.log("launch")) == 1 and len(rig.log("prompt")) == 1  # exactly one prompt ever reached the CLI
+    assert rig.log("prompt")[0]["prompt"] == "INCREMENTAL"
+    assert not any(e.type == "runtime.notice" and e.data["code"] == "session_rebuilt" for e in events)
+    assert types(events)[-2:] == ["runtime.error", "turn.completed"] and events[-1].data["status"] == "failed"
+    assert SessionRepository(db).get("conversation", "c1", "claude-code")["state"] == "invalid"
+    # the NEXT turn starts a fresh session instead of resuming the dead one
+    second, ev2, err2 = await run_turn(rig.driver("ok", db=db), turn_id="r3", run_id="r3", scope_kind="conversation",
+                                       scope_id="c1", prompt="NEXT")
+    assert err2 is None and second.text == "echo:NEXT"
+    assert "--session-id" in rig.log("launch")[1]["args"] and "--resume" not in rig.log("launch")[1]["args"]
+
+
+def test_s2_refusal_pattern_matches_only_an_explicit_missing_session():
+    assert cd._REFUSED_RE.search("No conversation found with session ID: abc")
+    assert cd._REFUSED_RE.search("Session abc does not exist")
+    assert not cd._REFUSED_RE.search("session token invalid, please log in")
+    assert not cd._REFUSED_RE.search("your session is invalid")
+
+
+@pytest.mark.asyncio
+async def test_s6_stdout_queue_is_bounded_and_overflow_fails_the_turn(rig, monkeypatch):
+    monkeypatch.setattr(cd, "MAX_QUEUE_ITEMS", 4)
+    driver = rig.driver("flood")
+    real_line = driver._line
+
+    async def slow_line(s, raw):
+        await asyncio.sleep(0.05)
+        await real_line(s, raw)
+
+    monkeypatch.setattr(driver, "_line", slow_line)
+    result, events, err = await run_turn(driver)
+    assert err is not None and err.failure.category == "output_limit"
+    assert types(events).count("turn.completed") == 1
+    assert not pid_alive(rig.log("launch")[0]["pid"])
+
+
+@pytest.mark.asyncio
+async def test_s7_stdin_writes_are_serialised_across_the_whole_line(rig):
+    order = []
+
+    class Stdin:
+        def write(self, data):
+            order.append("w")
+            time.sleep(0.05)
+
+        def flush(self):
+            order.append("f")
+
+    class P:
+        class proc:
+            stdin = Stdin()
+
+    async def emit(e):
+        pass
+
+    driver = rig.driver()
+    s = cd._Turn(turn(), emit)
+    s.proc = P()
+    reqs = [{"type": "control_request", "request_id": f"id{i}", "request": {"subtype": "can_use_tool"}} for i in range(2)]
+    await asyncio.gather(*(driver._control(s, r) for r in reqs))
+    assert order == ["w", "f", "w", "f"]
+
+
+@pytest.mark.asyncio
+async def test_s8_api_key_env_only_with_explicit_opt_in(rig, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AGENTOS_LOCAL_TOKEN", "FAKE_SECRET", "OPENAI_API_KEY"):
+        monkeypatch.setenv(name, "v")
+    result, events, err = await run_turn(rig.driver(allow_api_key_env=True))
+    assert err is None
+    assert sorted(rig.log("launch")[0]["secrets"]) == ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+    assert "OPENAI_API_KEY" not in rig.log("launch")[0]["env"]
+    assert rig.driver()._env().get("ANTHROPIC_API_KEY") is None  # default stays closed
+
+
+def test_s8_registry_reuses_the_runtimes_opt_in(monkeypatch):
+    from backend.pyworker.runtime.claude_runtime import ClaudeCodeRuntime
+    monkeypatch.setattr(cd, "default_cli_cmd", lambda: None)
+    monkeypatch.delenv(engine_registry.CLAUDE_DRIVER_ENV, raising=False)
+    on = engine_registry.create_turn_driver("claude-code", ClaudeCodeRuntime(["x"], allow_api_key_env=True))
+    off = engine_registry.create_turn_driver("claude-code", ClaudeCodeRuntime(["x"]))
+    assert on._allow_api_key_env is True and off._allow_api_key_env is False
+
+
+@pytest.mark.asyncio
+async def test_s10_every_control_request_gets_an_answer_whatever_its_subtype_or_id_type(rig):
+    result, events, err = await run_turn(rig.driver("ctl"))
+    assert err is None and result.text == "ctl-ok"
+    answers = {a["answer"]["response"]["request_id"]: a["answer"]["response"] for a in rig.log("control_response")}
+    assert set(answers) == {7, "m1", 9}
+    assert answers[7]["subtype"] == "error" and answers["m1"]["subtype"] == "error"
+    assert answers[9]["subtype"] == "success" and answers[9]["response"]["behavior"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_s10_missing_permission_prompts_flag_refuses_before_launch(rig):
+    result, events, err = await run_turn(rig.driver("no_prompts"))
+    assert err.failure.category == "unsupported_capability" and err.failure.acceptance == "not-submitted"
+    assert rig.log("launch") == []

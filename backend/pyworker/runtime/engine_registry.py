@@ -56,7 +56,8 @@ def create_turn_driver(engine_id: str, runtime: AgentRuntime, *, legacy_task=Non
             from backend.pyworker.runtime.sessions import SessionRepository
             sessions = SessionRepository(db)
             resume_check = conversation_resume_check(db, conversation_id, run_id)
-        return ClaudeStreamDriver(sessions=sessions, resume_prompt=resume_prompt, resume_check=resume_check)
+        return ClaudeStreamDriver(sessions=sessions, resume_prompt=resume_prompt, resume_check=resume_check,
+                                  allow_api_key_env=bool(getattr(runtime, "_allow_api_key_env", False)))
     if engine_id == "codex" and codex_driver_enabled():
         from backend.pyworker.runtime.codex_driver import CodexAppServerDriver, conversation_resume_check
         sessions = resume_check = None
