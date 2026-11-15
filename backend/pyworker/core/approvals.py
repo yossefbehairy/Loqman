@@ -18,6 +18,7 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from backend.pyworker.db.core import Database, iso, new_id, ts, utcnow
+from backend.pyworker.runtime.providers import PROVIDERS
 
 ACTIVE_RUN_STATUSES = ("queued", "running")
 DECISIONS = {"approve": "approved", "deny": "denied"}
@@ -26,7 +27,7 @@ MAX_TTL_SECONDS = 3600
 
 APPROVAL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
     engine: {"tool_approvals": False, "reason": "adapter cannot request approvals; runs with its fixed policy"}
-    for engine in ("opencode", "claude-code", "codex", "agy")
+    for engine in (p.engine_id for p in PROVIDERS)
 }
 APPROVAL_CAPABILITIES["claude-code"] = {
     "tool_approvals": True, "scope": "workspace_write",

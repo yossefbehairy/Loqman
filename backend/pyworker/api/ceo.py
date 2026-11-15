@@ -129,6 +129,8 @@ async def ceo_ask(ctx, params):
         raise api_error(400, f"Unsupported engine '{engine_in[:64]}'.")
     if engine_in == "mock" and settings.RUNTIME_MODE != "mock":
         raise api_error(400, "Engine 'mock' is only available in explicit mock mode.")
+    if settings.RUNTIME_MODE == "mock" and engine_in not in (None, "mock"):
+        raise api_error(400, "Real engines are unavailable in mock mode.")
     engine = engine_in or default_engine
     if engine == default_engine:
         runtime = ctx.get_runtime()
@@ -149,14 +151,17 @@ async def ceo_ask(ctx, params):
     fast_variant = variant
     if is_fast and fast_variant is None and engine in routing.OPENCODE_STYLE:
         fast_variant = "low" if (target.variants and "low" in target.variants) else None
-    if progress_id:
+    action_ids: List[str] = []
+    active_id = progress_id or new_id()
+    if active_id:
         now_iso = datetime.now(timezone.utc).isoformat()
-        ctx.ask_progress[progress_id] = {
+        ctx.ask_progress[active_id] = {
             "stage": "fast" if is_fast else "starting", "detail": "", "iteration": 1 if is_fast else 0,
-            "started_at": now_iso, "updated_at": now_iso, "done": False}
+            "started_at": now_iso, "updated_at": now_iso, "done": False, "action_ids": action_ids}
         if len(ctx.ask_progress) > _ASK_PROGRESS_LIMIT:
             for stale in list(ctx.ask_progress)[:-_ASK_PROGRESS_LIMIT]:
-                ctx.ask_progress.pop(stale, None)
+                if ctx.ask_progress[stale].get("done"):
+                    ctx.ask_progress.pop(stale, None)
 
     def _report(stage: str, detail: str, iteration: int) -> None:
         if progress_id:
@@ -196,34 +201,36 @@ async def ceo_ask(ctx, params):
             result = await run_ceo_ask(question=question, model_id=model_id, provider_id=provider_id,
                                        variant=variant, runtime=runtime, db=db,
                                        progress=_report if progress_id else None, history=history,
-                                       thread_id=conversation_id, engine=engine)
+                                       thread_id=conversation_id, engine=engine, action_ids=action_ids)
     except Exception:
+        ctx.ask_progress[active_id]["action_ids"] = []
         if stored_user:
             # Nothing was answered: take the question back so the restored draft can be re-sent without a duplicate.
             db.execute("DELETE FROM conversation_messages WHERE conversation_id=? AND client_message_id=?",
                        (conversation_id, user_key))
-        if progress_id:
-            _progress_write(ctx, progress_id, "error", "CEO ask failed.", done=True)
+        _progress_write(ctx, active_id, "error", "CEO ask failed.", done=True)
         raise api_error(502, "CEO ask failed.")
     if not conversation_id:
         db.insert("ceo_messages", {"id": "g" + uuid.uuid4().hex, "seq": next_seq + 1, "role": "assistant",
                                    "content": result["reply"][:record_cap], "fast": 1 if is_fast else 0,
                                    "created_at": ts()})
-    if progress_id:
-        _progress_write(ctx, progress_id, "done", "", result["iterations"], done=True)
     # The CEO may create agents and teams on its own: no approval step for those two kinds.
     # Agents and teams it creates are stamped with the engine and model of this ask (explicit values).
     stamp = {"engine": None if engine == "mock" else engine, "model_id": model_id,
              "valid": None if engine == "mock" else {m.id for m in models}}
     created_agents: List[Dict[str, Any]] = []
     remaining: List[Dict[str, Any]] = []
-    for action in result["actions_proposed"]:
-        if action["kind"] in ("new_profile", "new_team"):
-            outcome = _decide(ctx, action["id"], True, "Created by the CEO", True, stamp)
-            if outcome["status"] == "approved":
-                created_agents.extend(outcome["created_profiles"])
-                continue
-        remaining.append(action)
+    try:
+        for action in result["actions_proposed"]:
+            if action["kind"] in ("new_profile", "new_team"):
+                outcome = _decide(ctx, action["id"], True, "Created by the CEO", True, stamp)
+                if outcome["status"] == "approved":
+                    created_agents.extend(outcome["created_profiles"])
+                    continue
+            remaining.append(action)
+    finally:
+        ctx.ask_progress[active_id]["action_ids"] = []
+        _progress_write(ctx, active_id, "done", "", result["iterations"], done=True)
     if conversation_id:
         made = [p["name"] for p in created_agents]
         label = "Agent created" if len(made) == 1 else "Agents created"
@@ -258,6 +265,8 @@ async def ceo_actions(ctx, params):
     if status not in ("pending", "approved", "denied", "failed"):
         raise api_error(400, "Unknown action status.")
     rows = ctx.db.all("SELECT * FROM pending_actions WHERE status=? ORDER BY created_at DESC", (status,))
+    hidden = {aid for record in ctx.ask_progress.values() for aid in record.get("action_ids", [])}
+    rows = [a for a in rows if not (a["id"] in hidden and a["kind"] in ("new_profile", "new_team"))]
     return {"actions": [_action_out(a) for a in rows]}
 
 

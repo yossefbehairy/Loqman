@@ -182,10 +182,10 @@ class Fixed(MockRuntime):
 
 
 @pytest.mark.asyncio
-async def test_engine_test_success_uses_fixed_prompt_and_first_model(make_app):
+async def test_engine_test_success_uses_fixed_prompt_and_fallback_model(make_app):
     rt = Fixed("  OK\n" + "x" * 200)
     out = await Api(make_app(runtime_factory=lambda e: rt, mode="real"))("engines.test", engine_id="codex")
-    first = (await rt.list_available_models(free_only=False))[0]
+    first = (await rt.list_available_models(free_only=False))[-1]
     assert out["ok"] is True and out["model_id"] == first.id and out["engine_id"] == "codex"
     assert "\n" not in out["reply_preview"] and len(out["reply_preview"]) == 80
     assert out["error_code"] is None and out["error_message"] is None and out["duration_ms"] >= 0
@@ -343,7 +343,8 @@ async def test_verified_free_only_engine_test_never_picks_or_accepts_a_paid_mode
     rt = Catalog()
     api = Api(make_app(runtime_factory=lambda e: rt, mode="real"))
     out = await api("engines.test", engine_id="opencode")
-    assert out["ok"] and out["model_id"] == "free-1" and rt.tasks[0].model_id == "free-1"
+    # Without a model the test picks a free one (which free one is a cost preference, not a rule).
+    assert out["ok"] and out["model_id"] in {"free-1", "free-2"} and rt.tasks[0].model_id == out["model_id"]
     bad = await api("engines.test", engine_id="opencode", model_id="paid-1")
     assert bad["ok"] is False and bad["error_code"] == "model_unavailable" and len(rt.tasks) == 1
     ok = await api("engines.test", engine_id="opencode", model_id="free-2")

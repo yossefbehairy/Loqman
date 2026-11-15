@@ -218,6 +218,8 @@ async def _select_task_runtime(profile, default_runtime, factory, cache, model_i
         return default_runtime, _default_runtime_identity()[1], None
     if ledger_provider(engine) is None:
         raise EngineSelectionError(f"Unsupported engine '{engine}'.")
+    if settings.RUNTIME_MODE == "mock" and engine != "mock":
+        raise EngineSelectionError("Real engines are unavailable in mock mode.")
     if engine == "mock":
         if settings.RUNTIME_MODE != "mock":
             raise EngineSelectionError("Engine 'mock' is only available in explicit mock mode.")
@@ -245,7 +247,7 @@ async def _select_task_runtime(profile, default_runtime, factory, cache, model_i
     return rt, ledger_provider(engine), engine
 
 
-async def _route_task(profile, default_runtime, factory, cache, model_id, variant, fallback_model_id):
+async def _route_task(profile, default_runtime, factory, cache, model_id, variant, fallback_model_id, identity=None):
     """Return (runtime, provider_id, engine_label, model_id, variant) for one worker task.
 
     A profile with an explicit engine is unchanged (`_select_task_runtime`). A profile without one follows
@@ -255,7 +257,7 @@ async def _route_task(profile, default_runtime, factory, cache, model_id, varian
     if explicit:
         rt, provider, engine = await _select_task_runtime(profile, default_runtime, factory, cache, model_id, variant)
         return rt, provider, engine, model_id, variant
-    engine, provider = _default_runtime_identity()
+    engine, provider = identity or _default_runtime_identity()
     chosen = await routing.usable_model(default_runtime, engine, model_id, fallback_model_id)
     if chosen != model_id:
         variant = None
@@ -282,8 +284,9 @@ async def _execute_single_task(
     engine_runtime_factory,
     engine_cache: Optional[Dict[str, Any]],
     manager,
+    identity,
 ) -> None:
-    default_engine_label, _ = _default_runtime_identity()
+    default_engine_label, _ = identity
     t = db.one("SELECT * FROM mission_tasks WHERE id=?", (task["id"],))
     if not t:
         return
@@ -354,7 +357,7 @@ async def _execute_single_task(
     try:
         task_runtime, task_provider, task_engine, model_id, variant = await _route_task(
             profile, runtime, engine_runtime_factory or create_engine_runtime,
-            engine_cache if engine_cache is not None else {}, model_id, variant, fallback_model)
+            engine_cache if engine_cache is not None else {}, model_id, variant, fallback_model, identity)
     except EngineSelectionError as exc:
         msg = f"Engine selection failed: {str(exc)[:300]}"
         if not transition_task(db, task_id, ("queued", "running"), status="failed", error_message=msg,
@@ -439,14 +442,14 @@ def _status_of(db: Database, mission_id: str) -> Dict[str, Any]:
 
 
 async def run_mission_background(mission_id: str, db: Database, runtime, manager,
-                                 engine_runtime_factory=None) -> Dict[str, Any]:
+                                 engine_runtime_factory=None, identity=None) -> Dict[str, Any]:
     """Background worker: planning -> dispatch -> synthesis. Never fabricates success.
 
     Worker attempts, planning and synthesis all run through the persisted run
     manager (kinds mission_task / mission_planner / mission_synthesis)."""
     rt = runtime
     _mission_managers[mission_id] = manager
-    stage_engine, stage_provider = _default_runtime_identity()
+    stage_engine, stage_provider = identity or _default_runtime_identity()
     try:
         mission = mission_repo.get(db, mission_id)
         if not mission:
@@ -521,7 +524,7 @@ async def run_mission_background(mission_id: str, db: Database, runtime, manager
                 break
             await asyncio.gather(*[
                 _execute_single_task(db, rt, mission, t, dep_outputs, sem, engine_runtime_factory,
-                                     engine_cache, manager)
+                                     engine_cache, manager, (stage_engine, stage_provider))
                 for t in level])
 
         mission = mission_repo.get(db, mission_id)

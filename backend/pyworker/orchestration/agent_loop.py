@@ -41,7 +41,8 @@ _ORG_CONTEXT = (
     "You may create agents and teams whenever the user needs them: call propose_new_profile "
     "(one agent) or propose_new_team (several) with a clear name and full working instructions. "
     "Those two requests are applied immediately, with no approval step. "
-    "Always write the name Loqman exactly in English, even inside an Arabic reply.\n"
+    "Always write the name Loqman exactly in English, even inside an Arabic reply. "
+    "Answer in the language of the user's latest message, matching its dialect.\n"
 )
 
 
@@ -143,6 +144,7 @@ async def run_ceo_ask(
     thread_id: Optional[str] = None,
     *,
     engine: str,
+    action_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run the bounded tool loop. Returns {reply, actions_proposed, iterations}."""
     if runtime is None or db is None:
@@ -154,7 +156,7 @@ async def run_ceo_ask(
     system = build_loop_system_prompt(question, history)
     transcript: List[str] = []
     used_write_calls: set = set()
-    own_actions: List[str] = []  # proposals THIS request recorded (never diffed from the shared table)
+    own_actions: List[str] = action_ids if action_ids is not None else []
     observations: List[str] = []
     iterations = 0
 

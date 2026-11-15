@@ -106,6 +106,14 @@ thread and the binding is checked again before returning the result.
 
 Engine notes: all four engines are defined once in `runtime/providers.py`. `engines.status` takes optional `force` (discovery is cached 30 s per app) and adds `state` (`ready`/`needs_login`/`unverified`/`not_installed`/`error`), `title`, `vendor`, `checked_at`. `engines.setup` adds `state`, `install`, `login`, `docs_url`. `engines.test` runs one fixed-prompt generation (60 s limit; it accepts no prompt). `engines.open_setup` (`step`: `install`/`login`) opens a Windows terminal with the catalog command. `usage.summary` also returns `by_engine`.
 
+- `ceo.ask`: mock mode rejects explicit real engines.
+- `ceo.actions`: hides an active ask's agent and team proposals until auto-application finishes.
+- `missions.create`: captures the default engine identity for the mission run; interrupted missions fail on restart.
+- `missions.delegate`: mock mode rejects profiles with real engines.
+- `runs.start_turn`: mock mode accepts only the mock engine.
+- `engines.test`: mock mode blocks generation; otherwise an omitted model selects a low-cost preference or the last catalog entry.
+- `approvals.capabilities`: engine IDs come from the provider registry.
+
 ## Data
 Opens the existing `agentos.db` and upgrades to schema v17, backs it up
 before upgrades, refuses non-AgentOS sqlite files and newer schemas. Unfinished runs become `interrupted` (never

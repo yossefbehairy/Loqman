@@ -243,11 +243,16 @@ async def engines_test(ctx, params):
         return out
 
     provider_id = engine_id
+    if settings.RUNTIME_MODE == "mock":
+        return fail("mock_mode", "Engine generation tests are unavailable in mock mode.")
     try:
         runtime = ctx.engine_factory(engine_id)
         free_only = _free_only(engine_id)
         models = await asyncio.wait_for(runtime.list_available_models(free_only=free_only), ENGINE_TEST_TIMEOUT_SECONDS)
-        chosen = next((m for m in models if m.id == model_id), None) if model_id else (models[0] if models else None)
+        chosen = next((m for m in models if m.id == model_id), None) if model_id else None
+        if not model_id and models:
+            patterns = get_provider(engine_id).test_model_patterns
+            chosen = next((m for pattern in patterns for m in models if pattern in m.id.lower()), models[-1])
         if free_only and model_id and chosen is None:
             return fail("model_unavailable", _TEST_ERRORS["model_unavailable"])
         if chosen is not None:

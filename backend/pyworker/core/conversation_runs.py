@@ -320,6 +320,8 @@ class ConversationRunManager:
             raise UnsupportedEngine(engine)
         if engine == "mock" and settings.RUNTIME_MODE != "mock":
             raise UnsupportedEngine(engine)
+        if settings.RUNTIME_MODE == "mock" and engine != "mock":
+            raise UnsupportedEngine(engine)
         db = self._db
         wanted_refs = [tuple(r) if isinstance(r, (tuple, list)) else (r.source_id, r.skill_id)
                        for r in (skills or [])]

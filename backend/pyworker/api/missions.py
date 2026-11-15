@@ -78,6 +78,8 @@ async def preflight_model(ctx, runtime, model_id: str, variant: Optional[str], *
     else on the default engine. "Free only" is the engine's own policy."""
     engine = ((profile.get("engine") if profile else None) or "").strip() or None
     if engine is not None:
+        if settings.RUNTIME_MODE == "mock" and engine != "mock":
+            raise api_error(400, "Real engines are unavailable in mock mode.")
         if ledger_provider(engine) is None:
             raise api_error(400, f"Unsupported engine '{engine}'.")
         if engine == "mock":
@@ -100,10 +102,10 @@ async def preflight_model(ctx, runtime, model_id: str, variant: Optional[str], *
     return rt, provider, label, entry
 
 
-async def _run_mission_task(ctx, mission_id: str, runtime) -> None:
+async def _run_mission_task(ctx, mission_id: str, runtime, identity) -> None:
     try:
         await run_mission_background(mission_id, ctx.db, runtime, ctx.runs,
-                                     engine_runtime_factory=ctx.engine_factory)
+                                     engine_runtime_factory=ctx.engine_factory, identity=identity)
     except Exception:
         logger.exception("mission %s runner crashed", mission_id)
 
@@ -252,6 +254,7 @@ async def missions_create(ctx, params):
     roles = [r.strip().lower() for r in roles_in if r.strip()] or ["planner", "reviewer"]
     model_id = model_id_in or prefs_mod.default_model_id()
     runtime = ctx.get_runtime()
+    identity = _default_runtime_identity()
     _, _, _, target = await preflight_model(ctx, runtime, model_id, variant)
 
     if is_greeting_objective(objective):
@@ -284,7 +287,7 @@ async def missions_create(ctx, params):
             raise
         return _out(db, existing)
     # Real background worker (no fake success: status stays queued/planning/running).
-    ctx.spawn(_run_mission_task(ctx, mission["id"], runtime), "mission-run")
+    ctx.spawn(_run_mission_task(ctx, mission["id"], runtime, identity), "mission-run")
     return mission_repo.mission_out(mission, [])
 
 

@@ -28,7 +28,7 @@ async def active_run(api, rt):
 @pytest.mark.asyncio
 async def test_capabilities_match_enforced_workspace_approvals(api):
     caps = await api("approvals.capabilities")
-    assert set(caps) == {"opencode", "claude-code", "codex", "agy"}
+    assert set(caps) == {"opencode", "claude-code", "codex", "antigravity"}
     assert caps["claude-code"]["tool_approvals"] is True
     assert caps["claude-code"]["scope"] == "workspace_write"
     assert all(not c["tool_approvals"] for name, c in caps.items() if name != "claude-code")
