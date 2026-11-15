@@ -46,6 +46,16 @@ def codex_driver_enabled(env=None) -> bool:
     return value.strip().lower() in ("appserver", "app-server", "1", "on", "true")
 
 
+ANTIGRAVITY_DRIVER_ENV = "AGENTOS_ANTIGRAVITY_DRIVER"
+
+
+def antigravity_driver_enabled(env=None) -> bool:
+    """Feature flag for the native Antigravity ACP driver. Default OFF; ``AGENTOS_ANTIGRAVITY_DRIVER=acp`` enables it."""
+    import os
+    value = (os.environ if env is None else env).get(ANTIGRAVITY_DRIVER_ENV, "")
+    return value.strip().lower() in ("acp", "1", "on", "true")
+
+
 def create_turn_driver(engine_id: str, runtime: AgentRuntime, *, legacy_task=None, db=None, conversation_id=None,
                        run_id=None, resume_prompt=None, enabled=None):
     """The ONE place that chooses a turn driver. Claude streaming only when enabled; otherwise the whole-result wrapper."""
@@ -66,5 +76,14 @@ def create_turn_driver(engine_id: str, runtime: AgentRuntime, *, legacy_task=Non
             sessions = SessionRepository(db)
             resume_check = conversation_resume_check(db, conversation_id, run_id)
         return CodexAppServerDriver(sessions=sessions, resume_prompt=resume_prompt, resume_check=resume_check)
+    if engine_id == "antigravity" and antigravity_driver_enabled():
+        from backend.pyworker.runtime.antigravity_driver import AntigravityAcpDriver, conversation_resume_check
+        sessions = resume_check = None
+        if db is not None and conversation_id:
+            from backend.pyworker.runtime.sessions import SessionRepository
+            sessions = SessionRepository(db)
+            resume_check = conversation_resume_check(db, conversation_id, run_id)
+        return AntigravityAcpDriver(sessions=sessions, resume_prompt=resume_prompt, resume_check=resume_check,
+                                    allow_api_key_env=bool(getattr(runtime, "_allow_api_key_env", False)))
     from backend.pyworker.runtime.execute_driver import ExecuteTaskDriver
     return ExecuteTaskDriver(runtime, engine_id, legacy_task=legacy_task)

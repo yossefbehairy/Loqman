@@ -186,6 +186,25 @@ turn; a refused `thread/resume` (missing thread, before submission) is rebuilt o
 tree after `interrupt_grace_s`. Prompts over 24000 chars are refused (the legacy adapter truncated). Tests:
 `backend/tests/pw/test_codex_driver.py` (fake app-server only).
 
+### Antigravity ACP driver (P7a)
+
+`runtime/acp_transport.py` is the shared, engine-agnostic ACP JSON-RPC connection (newline-delimited framing with bounded
+lines/stream/queue, request/response correlation with a bounded pending table, server requests, `session/update`
+routing by `sessionId`, replay (`_meta.isReplay`) dropped, non-JSON stdout lines tolerated as bounded diagnostics, one
+stdin write lock). `runtime/antigravity_driver.py` is the `TurnDriver` for engine `antigravity` on top of it. OFF by
+default: set `AGENTOS_ANTIGRAVITY_DRIVER=acp` to route Antigravity runs through it (anything else keeps
+`agy_acp_runtime`). Launch, plan-mode requirement, model verification, deny-all permission policy (every
+`session/request_permission` answered `cancelled` with a `permission_denied` notice; NEW: a tool whose permission was
+denied that still reports `completed` fails the turn), environment allowlist and `GEMINI_API_KEY`/`GOOGLE_API_KEY`
+opt-in are the legacy adapter's: `agy acp --stdio --sandbox --include-default-customizations=false`. Resume is probed
+from `initialize.agentCapabilities` (`sessionCapabilities.resume` -> `session/resume`, else `loadSession` ->
+`session/load`, else none): conversation scopes persist the session id in `runtime_sessions` (protocol
+`acp-antigravity`) and send only the incremental prompt on a successful resume; unsupported or explicitly missing
+sessions start a new session in the same process with the full prompt and a notice, never after the prompt was written.
+CEO/mission/workflow scopes stay isolated. Interrupt sends the `session/cancel` notification, then kills the tree after
+`interrupt_grace_s`. Prompts over 200000 chars are refused (the legacy adapter truncated). Tests:
+`backend/tests/pw/test_acp_transport.py`, `backend/tests/pw/test_antigravity_driver.py` (fake ACP agent only).
+
 ## Run
 ```powershell
 backend\.venv\Scripts\python.exe -m backend.pyworker --data-dir C:\path\userData      # <dir>\agentos.db (desktop)
