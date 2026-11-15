@@ -113,6 +113,51 @@ schema independently of the current definitions. `test_schema_compat.py` now
 expects version 18. Supervisor tests launch only `sys.executable -c` programs;
 Windows job, grandchild, worker-death and taskkill tests are Windows-only.
 
+## P5 Claude stream-json driver (feature flag)
+
+`runtime/claude_driver.py` is a native `TurnDriver` for engine `claude-code`. It is OFF by default; set
+`AGENTOS_CLAUDE_DRIVER=stream` in the worker's environment (before it starts) to route Claude conversation and
+mission runs through it. Routing lives only in `engine_registry.create_turn_driver`; when off, `ExecuteTaskDriver`
+wraps `ClaudeCodeRuntime` exactly as before. CEO/Loqman calls still use the wrapper in P5.
+
+Launch (one supervised process per turn, prompt written as one stream-json user frame on stdin):
+
+```
+claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages
+       --model <id> --tools "" --strict-mcp-config --setting-sources project --disable-slash-commands
+       [--permission-prompts none] (--session-id <uuid> | --resume <id> | --no-session-persistence)
+```
+
+With scoped tools: `--tools ToolSearch --mcp-config <per-turn temp file> --allowedTools mcp__agentos_workspace__*`
+(identical policy to the legacy adapter). Required flags are probed from `claude --help`; a missing one refuses to
+start (`unsupported_capability`, nothing launched). Permission requests are never approved: any `can_use_tool`
+control request is answered with deny.
+
+Mapping: `system/init` -> `session.started`; `text_delta`/`thinking_delta` -> `content.delta`; assistant text ->
+`item.completed` (text before a tool call is `phase=commentary`, the text after the last tool is the final reply);
+`tool_use`/`tool_result`/`tool_progress` -> `item.started/updated/completed` (bounded, key-redacted previews);
+`result` -> one `usage` event then the single `turn.completed`. Nested (`parent_tool_use_id`) frames, replayed user
+frames and task-notification results are ignored.
+
+Sessions: only conversation scopes persist. First turn uses `--session-id` (binding written to `runtime_sessions`
+before the prompt is submitted); later turns use `--resume` from a stable AgentOS-owned cwd (Claude stores sessions per
+cwd) with only the new message (`resume_prompt`, no replayed history). A session is resumed only when its
+`last_turn_id` is the conversation's latest succeeded run. If Claude refuses the resume before initialising (no
+`system/init` plus an explicit missing-session message) the row is marked `invalid` and ONE fresh session starts from
+the full history prompt with a `session_rebuilt` notice (generation + 1). Timeouts, EOF or any error after submission
+are never replayed. CEO and mission scopes get `--no-session-persistence` and a throwaway cwd.
+
+Child environment (S5): explicit allowlist (`claude_child_env`: PATH, SYSTEMROOT, WINDIR, COMSPEC, PATHEXT, TEMP/TMP,
+USERPROFILE, HOME*, APPDATA, LOCALAPPDATA, PROGRAMDATA, PROGRAMFILES*, OS, NUMBER_OF_PROCESSORS,
+PROCESSOR_ARCHITECTURE, LANG/LC_*, CLAUDE_CONFIG_DIR, CLAUDE_CODE_GIT_BASH_PATH, certificate paths, proxies without
+embedded credentials). No API keys or tokens. The legacy `ClaudeCodeRuntime` uses the same allowlist and now adds
+`--setting-sources project` when the CLI advertises it. `--bare` is not used (it disables OAuth login) and
+`--safe-mode` is not used (it would disable the scoped MCP server).
+
+Interrupt: the stream-json input has no established graceful interrupt, so `interrupt` kills the owned tree (Job
+Object) and settles one cancelled terminal; `exit_grace_s` bounds the wait for a clean exit after `result`
+(a CLI that ignores stdin close is killed). Tests: `backend/tests/pw/test_claude_driver.py` (fake CLI only).
+
 ## Run
 ```powershell
 backend\.venv\Scripts\python.exe -m backend.pyworker --data-dir C:\path\userData      # <dir>\agentos.db (desktop)

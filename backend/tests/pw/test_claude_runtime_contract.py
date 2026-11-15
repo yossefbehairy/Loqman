@@ -65,12 +65,12 @@ def fake(tmp_path, monkeypatch):
     script = tmp_path / "fake_claude.py"
     script.write_text(FAKE, encoding="utf-8")
     log = tmp_path / "log.json"
-    monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-stripped")
 
     def make(mode="ok", **kw):
-        monkeypatch.setenv("FAKE_MODE", mode)
-        return ClaudeCodeRuntime(cli_cmd=[sys.executable, str(script)], **kw)
+        # S5: the child environment is an allowlist, so the fake's control variables are passed explicitly.
+        return ClaudeCodeRuntime(cli_cmd=[sys.executable, str(script)],
+                                 extra_env={"FAKE_MODE": mode, "FAKE_LOG": str(log)}, **kw)
 
     make.log = lambda: json.loads(log.read_text(encoding="utf-8"))
     return make

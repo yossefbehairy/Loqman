@@ -14,7 +14,9 @@ What one task does
 Explicit limitations (do not oversell this adapter)
   * NOT a sandbox. `--tools ""` disables Claude's BUILT-IN tools and
     `--strict-mcp-config` (with no --mcp-config) ignores configured MCP
-    servers, but the user's own Claude settings/hooks/memory still load, and
+    servers; user settings/hooks are skipped via `--setting-sources project`
+    when the CLI advertises it (memory may still load), the child environment
+    is an explicit allowlist, and
     the empty cwd is a convenience, not an access boundary. No approval flow
     and no workspace restriction are offered.
   * Fail closed: before the first run the adapter reads `claude --help` and
@@ -135,25 +137,31 @@ def parse_result(stdout: str) -> Dict[str, Any]:
 
 
 class ClaudeCodeRuntime:
-    def __init__(self, cli_cmd: Optional[CmdSpec] = None, allow_api_key_env: bool = False):
-        """cli_cmd: executable path or argv prefix (tests pass [python, fake.py])."""
+    def __init__(self, cli_cmd: Optional[CmdSpec] = None, allow_api_key_env: bool = False,
+                 extra_env: Optional[Dict[str, str]] = None):
+        """cli_cmd: executable path or argv prefix (tests pass [python, fake.py]). ``extra_env`` adds reviewed
+        variables to the allowlisted child environment."""
         if cli_cmd is None:
             cli_cmd = shutil.which("claude") or None
         if isinstance(cli_cmd, str):
             cli_cmd = [cli_cmd]
         self._cmd: Optional[List[str]] = list(cli_cmd) if cli_cmd else None
         self._allow_api_key_env = allow_api_key_env
+        self._extra_env = dict(extra_env or {})
+        self._help_text = ""
         self._flags_ok: Optional[bool] = None
         self._inflight: Dict[str, asyncio.subprocess.Process] = {}
         self._cancelled: set = set()
 
     # -- helpers -----------------------------------------------------------
     def _env(self) -> Dict[str, str]:
-        env = dict(os.environ)
-        env.pop("AGENTOS_LOCAL_TOKEN", None)
-        if not self._allow_api_key_env:
+        # S5: explicit allowlist (no tokens/keys); Claude's login lives in the user profile, not the environment.
+        from backend.pyworker.runtime.claude_driver import claude_child_env
+        env = claude_child_env(extra=self._extra_env)
+        if self._allow_api_key_env:  # explicit opt-in to API-key billing
             for k in _STRIPPED_ENV:
-                env.pop(k, None)
+                if k in os.environ:
+                    env[k] = os.environ[k]
         return env
 
     def _probe_sync(self, args: Sequence[str]) -> Optional[subprocess.CompletedProcess]:
@@ -177,6 +185,7 @@ class ClaudeCodeRuntime:
         if self._flags_ok is None:
             res = await self._probe(["--help"])
             text = ((res.stdout or "") + (res.stderr or "")) if res else ""
+            self._help_text = text
             self._flags_ok = bool(text) and all(f in text for f in REQUIRED_FLAGS)
             if not self._flags_ok:
                 logger.warning("Installed claude CLI does not advertise all required flags.")
@@ -256,6 +265,8 @@ class ClaudeCodeRuntime:
         prompt = task.prompt[:MAX_PROMPT_CHARS]
         argv = [*self._cmd, "-p", "--output-format", "json", "--tools", "",
                 "--strict-mcp-config", "--no-session-persistence", "--model", model]
+        if "--setting-sources" in self._help_text:  # S5: do not load the user's settings/hooks when the CLI can avoid it
+            argv += ["--setting-sources", "project"]
         key = task.session_title or f"task-{time.time_ns()}"
         if key in self._inflight:
             raise RuntimeErrorBase("A Claude task with this session_title is already running.")
@@ -271,7 +282,8 @@ class ClaudeCodeRuntime:
                 with open(config_path, "w", encoding="utf-8") as config_file:
                     json.dump({"mcpServers": task.mcp_servers}, config_file)
                 argv += ["--mcp-config", config_path, "--allowedTools", "mcp__agentos_workspace__*",
-                         "--setting-sources", "project", "--disable-slash-commands"]
+                         *([] if "--setting-sources" in argv else ["--setting-sources", "project"]),
+                         "--disable-slash-commands"]
                 argv[argv.index("--tools") + 1] = "ToolSearch"
             try:
                 kwargs: Dict[str, Any] = {}

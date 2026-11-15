@@ -40,8 +40,7 @@ from backend.pyworker.core import run_inputs, run_skills
 from backend.pyworker.core.approvals import expire_for_run as expire_approvals_for_run
 from backend.pyworker.db.core import Database, iso, new_id, ts
 from backend.pyworker.runtime.base import ExecuteAgentTask
-from backend.pyworker.runtime.execute_driver import ExecuteTaskDriver
-from backend.pyworker.runtime.engine_registry import create_engine_runtime
+from backend.pyworker.runtime.engine_registry import create_engine_runtime, create_turn_driver
 from backend.pyworker.runtime.errors import safe_error_message
 from backend.pyworker.runtime.providers import ledger_provider
 from backend.pyworker.runtime.ledger import (
@@ -137,6 +136,7 @@ class ConversationRunManager:
         self._computer_owner = None
         self._run_drivers = {}
         self._driver_terminals = {}
+        self._incremental = {}  # run_id -> prompt for a resumed native session (no replayed history)
 
     # -- helpers -------------------------------------------------------------
     def _runtime(self, engine_id: str):
@@ -357,6 +357,7 @@ class ConversationRunManager:
             return prepared["snap"]
         run_id = prepared["run_id"]
         self._publish([prepared["event"]])
+        self._incremental[run_id] = prepared.get("incremental_prompt")
         task = asyncio.get_running_loop().create_task(
             self._execute(run_id, prepared["engine"], prepared["model_id"], prepared["prompt"],
                           prepared["timeout"], prepared["variant"]), name=self._key(run_id))
@@ -462,6 +463,7 @@ class ConversationRunManager:
             if selected:
                 history = json.dumps(selected, ensure_ascii=False)
                 prompt_for_engine = f"Previous conversation (JSON):\n{history}\n\nCurrent user message:\n{prompt}"
+        incremental_prompt = f"{skill_block}\n\n{run_skills.USER_LABEL}{prompt}" if skill_block else prompt
         if skill_block:
             if prompt_for_engine == prompt:
                 prompt_for_engine = f"{run_skills.USER_LABEL}{prompt}"
@@ -494,7 +496,8 @@ class ConversationRunManager:
             raise ActiveRunExists(conversation_id)
         snap = self.get_run(run_id)
         return {"schedule": True, "snap": snap, "event": queued_event, "run_id": run_id, "engine": engine,
-                "model_id": model_id, "prompt": prompt_for_engine, "timeout": timeout, "variant": variant}
+                "model_id": model_id, "prompt": prompt_for_engine, "timeout": timeout, "variant": variant,
+                "incremental_prompt": incremental_prompt}
 
     # -- cancel --------------------------------------------------------------
     def _cancel_db(self, run_id: str):
@@ -579,10 +582,12 @@ class ConversationRunManager:
                                         agent_id=settings.CHAT_AGENT_ID if engine == "opencode" else None,
                                         session_title=self._key(run_id))
                 runtime = self._runtime(engine)
-                driver = self._run_drivers[run_id] = ExecuteTaskDriver(runtime, engine, legacy_task=task)
+                conversation_id = self._db.scalar("SELECT conversation_id FROM conversation_runs WHERE id=?", (run_id,))
+                driver = self._run_drivers[run_id] = create_turn_driver(
+                    engine, runtime, legacy_task=task, db=self._db, conversation_id=conversation_id, run_id=run_id,
+                    resume_prompt=self._incremental.get(run_id))
                 call_options = {"driver": driver, "emit": self._driver_event, "engine": engine,
-                    "scope_kind": "conversation", "scope_id": self._db.scalar(
-                        "SELECT conversation_id FROM conversation_runs WHERE id=?", (run_id,))}
+                    "scope_kind": "conversation", "scope_id": conversation_id}
                 try:
                     config = self._db.scalar("SELECT tool_config_json FROM conversation_runs WHERE id=?", (run_id,))
                     if config:
@@ -628,6 +633,7 @@ class ConversationRunManager:
         finally:
             self._run_drivers.pop(run_id, None)
             self._driver_terminals.pop(run_id, None)
+            self._incremental.pop(run_id, None)
 
     def _transition_db(self, run_id: str, from_status: str, to_status: str,
                        **values: Any) -> Optional[Dict[str, Any]]:
@@ -778,8 +784,8 @@ class ConversationRunManager:
             raise MissionRunCancelled(run_id)
         req = ExecuteAgentTask(prompt=prompt, model_id=model_id, provider_id=provider_id, variant=variant,
                                session_title=session_title, timeout=timeout)
-        driver = self._run_drivers[run_id] = ExecuteTaskDriver(runtime, self._db.scalar(
-            "SELECT engine FROM conversation_runs WHERE id=?", (run_id,)), legacy_task=req)
+        driver = self._run_drivers[run_id] = create_turn_driver(self._db.scalar(
+            "SELECT engine FROM conversation_runs WHERE id=?", (run_id,)), runtime, legacy_task=req)
         try:
             result = await asyncio.wait_for(
                 run_agent_task(runtime, req, kind=ledger_kind, run_id=run_id, driver=driver,
