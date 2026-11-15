@@ -481,11 +481,8 @@ class AgyAcpRuntime:
 
     # -- process plumbing ----------------------------------------------------
     def _env(self) -> Dict[str, str]:
-        env = dict(os.environ)
-        for k in _STRIPPED_ENV:
-            if k == "AGENTOS_LOCAL_TOKEN" or not self._allow_api_key_env:
-                env.pop(k, None)
-        return env
+        from backend.pyworker.runtime.child_env import child_env
+        return child_env([k for k in _STRIPPED_ENV if k != "AGENTOS_LOCAL_TOKEN"] if self._allow_api_key_env else ())
 
     @staticmethod
     def _kill_tree_sync(pid: int) -> None:

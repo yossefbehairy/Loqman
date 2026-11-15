@@ -180,12 +180,8 @@ class CodexCliRuntime:
 
     # -- helpers -----------------------------------------------------------
     def _env(self) -> Dict[str, str]:
-        env = dict(os.environ)
-        env.pop("AGENTOS_LOCAL_TOKEN", None)
-        if not self._allow_api_key_env:
-            for k in _STRIPPED_ENV:
-                env.pop(k, None)
-        return env
+        from backend.pyworker.runtime.child_env import child_env
+        return child_env(_STRIPPED_ENV if self._allow_api_key_env else ())
 
     def _probe_sync(self, args: Sequence[str]) -> Optional[subprocess.CompletedProcess]:
         if not self._cmd:

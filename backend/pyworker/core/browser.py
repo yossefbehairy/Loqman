@@ -4,7 +4,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import ipaddress
 import os
+import socket
 import secrets
 import shutil
 import struct
@@ -18,6 +20,18 @@ from urllib.request import urlopen
 
 class BrowserError(Exception):
     pass
+
+
+def _check_public_url(url):
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError()
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(item[4][0].split("%")[0]).is_global for item in addresses):
+            raise ValueError()
+    except (ValueError, OSError):
+        raise BrowserError("Browser URL must resolve only to public addresses.") from None
 
 
 class Cdp:
@@ -113,7 +127,8 @@ class BrowserSession:
         kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
         self.process = await asyncio.create_subprocess_exec(
             executable, "--headless=new", "--no-first-run", "--no-default-browser-check",
-            "--remote-debugging-port=0", f"--user-data-dir={self.profile.name}", "about:blank",
+            # CDP currently uses WebSockets, so local processes can still connect.
+            "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", f"--user-data-dir={self.profile.name}", "about:blank",
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL, **kwargs)
         active_port = Path(self.profile.name) / "DevToolsActivePort"
@@ -174,6 +189,7 @@ class BrowserSession:
             url = args.get("url")
             if not isinstance(url, str) or len(url) > 4096 or urlsplit(url).scheme not in ("http", "https"):
                 raise BrowserError("Browser URL must use http or https.")
+            await asyncio.to_thread(_check_public_url, url)
             navigation = await self.cdp.call("Page.navigate", {"url": url})
             if navigation.get("errorText"):
                 raise BrowserError("Browser navigation failed.")

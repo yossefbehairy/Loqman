@@ -47,6 +47,28 @@ def propose(db, run_id, root, path, content):
     return db.one("SELECT * FROM workspace_writes WHERE id=?", (key,))
 
 
+def _dir_identity(root):
+    info = os.stat(root)
+    return info.st_dev, info.st_ino
+
+
+def _require_same_dir(root, identity):
+    try:
+        if _dir_identity(root) != identity or fs._norm(fs.canonical_workspace_dir(root)) != fs._norm(root):
+            raise WriteConflict("Workspace directory changed during publication.")
+    except (OSError, fs.WorkspaceFsError):
+        raise WriteConflict("Workspace directory changed during publication.") from None
+
+
+def _remove_created(target, temp_stat):
+    """Remove the destination only if it is the very file this call linked."""
+    try:
+        if os.path.samestat(temp_stat, os.lstat(target)):
+            os.unlink(target)
+    except OSError:
+        pass
+
+
 def apply(db, proposal):
     target = target_path(proposal["root"], proposal["path"])
     data = proposal["content"].encode("utf-8")
@@ -59,7 +81,9 @@ def apply(db, proposal):
         raise WriteConflict("Proposal is not approved.")
     if os.path.lexists(target):
         raise WriteConflict("A file appeared at this path after the proposal.")
-    fd, temporary = tempfile.mkstemp(prefix=".agentos-report-", dir=proposal["root"])
+    # A crash may leave a temp file, but never inside the workspace.
+    fd, temporary = tempfile.mkstemp(prefix="agentos-report-", dir=os.path.dirname(proposal["root"]))
+    temp_stat = os.fstat(fd)
     try:
         with os.fdopen(fd, "wb") as output:
             output.write(data)
@@ -71,10 +95,26 @@ def apply(db, proposal):
             if not changed:
                 raise WriteConflict("Proposal state changed.")
         target_path(proposal["root"], proposal["path"])
-        os.link(temporary, target)
-        real, _ = fs.resolve_in_workspace(proposal["root"], proposal["path"])
-        if digest(fs.read_limited(real, proposal["root"])) != proposal["content_sha256"]:
-            raise WriteConflict("Published file did not pass verification.")
+        # The workspace directory could be swapped for a junction/symlink between the
+        # checks above and the link below, so pin its identity (volume + file id) and
+        # re-check it immediately before and after creating the destination.
+        identity = _dir_identity(proposal["root"])
+        _require_same_dir(proposal["root"], identity)
+        os.link(temporary, target, follow_symlinks=False)
+        try:
+            _require_same_dir(proposal["root"], identity)
+            target_path(proposal["root"], proposal["path"])
+            if not os.path.samestat(temp_stat, os.lstat(target)):
+                raise WriteConflict("Published file is not the one that was created.")
+            os.unlink(temporary)
+            real, _ = fs.resolve_in_workspace(proposal["root"], proposal["path"])
+            if digest(fs.read_limited(real, proposal["root"])) != proposal["content_sha256"]:
+                raise WriteConflict("Published file did not pass verification.")
+        except BaseException:
+            _remove_created(target, temp_stat)
+            raise
+        # Verified. From here on a failure to record it must NOT remove the report:
+        # recover() finds the published, hash-matching file and marks it applied.
         db.update("workspace_writes", {"status": "applied", "finished_at": ts()},
                   "id=? AND status='publishing'", (proposal["id"],))
     finally:
@@ -93,9 +133,4 @@ def recover(db):
         except (fs.WorkspaceFsError, OSError):
             pass
         db.update("workspace_writes", {"status": status, "finished_at": ts()}, "id=?", (proposal["id"],))
-        temporary = proposal["temporary_path"]
-        if temporary and os.path.dirname(temporary) == proposal["root"] and os.path.basename(temporary).startswith(".agentos-report-"):
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+        # Persisted paths are untrusted; recovery never deletes them.

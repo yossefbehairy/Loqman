@@ -10,6 +10,8 @@ import textwrap
 
 import pytest
 
+from backend.pyworker.runtime import child_env
+
 from backend.pyworker.runtime.base import ExecuteAgentTask
 from backend.pyworker.runtime import codex_runtime as cx
 from backend.pyworker.runtime.codex_runtime import CodexCliRuntime, RuntimeUnsupported
@@ -71,6 +73,8 @@ def fake(tmp_path, monkeypatch):
     script.write_text(FAKE, encoding="utf-8")
     log = tmp_path / "log.json"
     monkeypatch.setenv("FAKE_LOG", str(log))
+    # The child env is an allowlist (S2); let only the fake CLI's own control vars through.
+    monkeypatch.setattr(child_env, "_NAMES", child_env._NAMES | {"FAKE_LOG", "FAKE_MODE", "PYTHONUTF8"})
     monkeypatch.setenv("OPENAI_API_KEY", "sk-should-be-stripped")
 
     def make(mode="ok", **kw):

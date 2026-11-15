@@ -112,7 +112,7 @@ def _safe_id(skill_id: str) -> None:
 
 def _source_root(source_path: str) -> str:
     try:
-        root = os.path.realpath(source_path, strict=True)
+        root = validate_source_dir(source_path)
     except (OSError, ValueError):
         raise WorkspaceFsError(404, "skill source directory is no longer available")
     if _norm(root) != _norm(source_path):
@@ -159,6 +159,8 @@ def _read_file(real: str, root: str, limit: int) -> tuple[bytes, os.stat_result]
     try:
         with open(real, "rb") as fh:
             opened = os.fstat(fh.fileno())
+            if opened.st_nlink > 1:
+                raise WorkspaceFsError(403, "hard-linked files are not allowed")
             if not stat.S_ISREG(opened.st_mode):
                 raise WorkspaceFsError(422, "SKILL.md is not a regular file")
             if _is_reparse(os.lstat(real)) or not os.path.samestat(opened, os.stat(real)):
