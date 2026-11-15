@@ -335,9 +335,10 @@ async def runs_steer(ctx, params):
 @method("runs.events")
 async def runs_events(ctx, params):
     """Persisted lifecycle events after ``after_id`` (the pull form of the SSE stream)."""
-    check_keys(params, {"run_id"}, ("after_id",))
+    check_keys(params, {"run_id"}, ("after_id", "event_format"))
+    event_format = req_enum(params, "event_format", ("legacy", "normalised-v1")) if "event_format" in params else "legacy"
     try:
-        events = ctx.runs.list_events(req_str(params, "run_id", 1, 64), opt_int(params, "after_id", 0, 0, 2**62))
+        events = ctx.runs.list_events(req_str(params, "run_id", 1, 64), opt_int(params, "after_id", 0, 0, 2**62), event_format)
     except RunNotFound:
         raise api_error(404, "Run not found")
     return {"events": events}

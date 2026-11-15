@@ -4,6 +4,115 @@
 stdin/stdout. Standard library only (asyncio, subprocess, sqlite3, dataclasses): it replaces
 FastAPI / SQLAlchemy / Pydantic / httpx. The legacy `backend/app` has been removed.
 
+## P4 turn boundary (schema 18)
+
+`runtime/driver.py` defines the immutable turn/session/policy/event/failure types
+and `TurnDriver` protocol. `ExecuteTaskDriver` schedules existing `AgentRuntime`
+calls, emits ordered admission, authoritative assistant/reasoning items, known
+turn usage and one terminal. It never simulates streaming or advertises native
+resume. Interruption flags the turn before awaiting the original adapter's
+`abort_task(session_title)`, then cancels and joins execution; late results cannot
+settle success. Terminal tombstones are bounded to 256 entries per wrapper.
+
+`collect_turn` uses that same event callback for persistence and collection. It
+replaces provisional item buffers with authoritative snapshots, selects final
+assistant text by terminal item IDs, keeps reasoning separate, replaces turn
+usage snapshots, and bounds characters, items and event count. Cancellation and
+external timeouts shield interruption and scope cleanup before propagating.
+`run_agent_task` now calls the wrapper and collector; its ledger remains the only
+usage writer. The existing conversation, mission and CEO callers therefore use
+the new boundary while retaining full prompts, adapter arguments, validation,
+output truncation and application cancellation guards. Compatibility calls use
+an 8 Mi-character collection ceiling (matching the existing bounded subprocess
+budget); direct `StartTurn` calls default to 20,000 characters. Legacy adapter
+timeouts and caller deadlines retain ownership of timeout policy.
+
+`runtime/sessions.py` supplies transactional upsert/get/delete of current native
+bindings. Production code does not adopt these bindings in P4. In particular,
+`opencode_conversations` is retained without backfill or new writes.
+
+Both `runs.events` and `stream.open` accept `event_format: "legacy" |
+"normalised-v1"`, defaulting to `legacy`. Runtime rows store
+`{run_id,status:"running",event:<DriverEvent>}` with `type="runtime"` and a
+deduplicated `driver_event_id`. Legacy projection suppresses those rows; its
+existing lifecycle payload construction and pipe envelope are unchanged.
+SQLite IDs remain replay cursors and can now contain gaps for legacy clients.
+Projection advances the internal cursor even across entirely suppressed pages.
+Opted-in clients receive the enclosed event name and envelope plus all lifecycle
+events. Driver completion is staged until the lifecycle transaction, which writes
+the runtime terminal before the lifecycle terminal and atomically writes the
+assistant message on success. Cancellation is persisted first; subsequent driver
+completion is only a cleanup acknowledgement. Existing bounded subscribers,
+replay and restart interruption remain in place.
+
+`runtime/supervisor.py` is a shared launcher for P5-P7; existing adapters have not
+been switched. It launches argv arrays with `shell=False`, hides Windows windows,
+drains both pipes concurrently with a shared byte ceiling, and awaits exit and
+reader joins. A ctypes Job Object uses `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`;
+explicit cleanup terminates the job and polls its active-process count to zero
+before closing the handle, with a five-second deadline.
+**Assignment is immediately after `Popen`, not suspended launch**: stdlib `Popen`
+does not expose the initial thread handle, so a descendant can escape in that
+short interval. Once assigned, descendants belong to the job even after root
+exit or worker death. Job setup failures return ownership issues and use bounded
+`taskkill /T /F` fallback while the root is identifiable. Fallback cannot promise
+worker-crash cleanup. Windows pipe readers use `PeekNamedPipe` before bounded
+reads so cleanup can join them even if an unowned writer retains a pipe.
+
+The existing migration recognizer accepts the new additive columns before
+writing anything, takes its normal online `.pre-v18-*.bak` before upgrades, and
+creates missing columns/indexes idempotently. Fresh and upgraded databases use
+the following exact new DDL (migration indexes use `IF NOT EXISTS`):
+
+```sql
+CREATE TABLE runtime_sessions (
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('conversation','ceo','mission_attempt','workflow')),
+    scope_id TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    runtime_key TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    native_session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'unverified' CHECK (state IN ('unverified','ready','invalid')),
+    model_id TEXT NOT NULL,
+    provider_id TEXT,
+    variant TEXT,
+    agent_id TEXT,
+    cwd TEXT,
+    config_fingerprint TEXT,
+    last_turn_id TEXT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    PRIMARY KEY (scope_kind, scope_id, engine, runtime_key)
+);
+CREATE UNIQUE INDEX uq_runtime_sessions_native ON runtime_sessions
+    (engine, runtime_key, namespace, protocol, native_session_id);
+ALTER TABLE conversation_runs ADD COLUMN runtime_key TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE conversation_runs ADD COLUMN driver_protocol TEXT;
+ALTER TABLE conversation_runs ADD COLUMN native_session_id TEXT;
+ALTER TABLE conversation_runs ADD COLUMN native_turn_id TEXT;
+ALTER TABLE conversation_runs ADD COLUMN session_generation INTEGER;
+ALTER TABLE conversation_run_events ADD COLUMN driver_event_id TEXT;
+CREATE UNIQUE INDEX uq_run_driver_event ON conversation_run_events
+    (run_id, driver_event_id) WHERE driver_event_id IS NOT NULL;
+ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT 'workspace';
+ALTER TABLE approvals ADD COLUMN runtime_request_id TEXT;
+ALTER TABLE approvals ADD COLUMN request_type TEXT;
+ALTER TABLE approvals ADD COLUMN request_json TEXT;
+ALTER TABLE approvals ADD COLUMN response_json TEXT;
+ALTER TABLE approvals ADD COLUMN delivery_status TEXT;
+CREATE UNIQUE INDEX uq_approval_runtime_request ON approvals
+    (run_id, runtime_request_id) WHERE runtime_request_id IS NOT NULL;
+PRAGMA user_version = 18;
+```
+
+P4 tests are in `backend/tests/pw/test_driver.py`, `test_driver_persistence.py`,
+and `test_supervisor.py`; `fixtures/schema_v17.py` preserves the committed v17
+schema independently of the current definitions. `test_schema_compat.py` now
+expects version 18. Supervisor tests launch only `sys.executable -c` programs;
+Windows job, grandchild, worker-death and taskkill tests are Windows-only.
+
 ## Run
 ```powershell
 backend\.venv\Scripts\python.exe -m backend.pyworker --data-dir C:\path\userData      # <dir>\agentos.db (desktop)

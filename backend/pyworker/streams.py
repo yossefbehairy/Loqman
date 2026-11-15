@@ -37,12 +37,14 @@ class StreamRegistry:
     def count(self) -> int:
         return len(self._streams)
 
-    def open(self, topic: str, key: str, last_event_id: int = 0) -> str:
+    def open(self, topic: str, key: str, last_event_id: int = 0, event_format: str = "legacy") -> str:
+        if event_format not in {"legacy", "normalised-v1"}:
+            raise ValueError("Unknown event format")
         if len(self._streams) >= self._max:
             raise TooManyRuns("Too many event streams")
         sid = uuid.uuid4().hex
         pump = {"run": self._pump_run, "mission": self._pump_mission}[topic]
-        task = asyncio.get_running_loop().create_task(self._guard(sid, pump, key, last_event_id),
+        task = asyncio.get_running_loop().create_task(self._guard(sid, pump, key, last_event_id, event_format),
                                                       name=f"stream-{topic}-{sid[:8]}")
         self._streams[sid] = task
         task.add_done_callback(lambda _t, s=sid: self._streams.pop(s, None))
@@ -63,10 +65,13 @@ class StreamRegistry:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _guard(self, sid: str, pump, key: str, last: int) -> None:
+    async def _guard(self, sid: str, pump, key: str, last: int, event_format: str) -> None:
         reason = "complete"
         try:
-            await pump(sid, key, last)
+            if pump == self._pump_run:
+                await pump(sid, key, last, event_format)
+            else:
+                await pump(sid, key, last)
         except asyncio.CancelledError:
             reason = "closed"
             raise
@@ -82,9 +87,9 @@ class StreamRegistry:
     def _msg(self, sid: str, event: str, data: Any, id_: Optional[int] = None) -> Dict[str, Any]:
         return {"type": "stream", "stream_id": sid, "event": event, "id": id_, "data": data}
 
-    async def _pump_run(self, sid: str, run_id: str, last: int) -> None:
+    async def _pump_run(self, sid: str, run_id: str, last: int, event_format: str = "legacy") -> None:
         try:
-            async for ev in self._ctx.runs.iter_events(run_id, last):
+            async for ev in self._ctx.runs.iter_events(run_id, last, event_format):
                 if ev is None:
                     continue  # heartbeat: not needed on a pipe
                 await self._emit(self._msg(sid, ev["type"], ev["data"], ev["id"]))
