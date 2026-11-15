@@ -106,9 +106,11 @@ async def run_agent_task(
     run_id: Optional[str] = None,
     *, driver=None, emit=None, engine=None, scope_kind=None, scope_id=None,
     max_output_chars=8 * 1024 * 1024,
+    usage_recorder=None, is_cancelled=None,
 ) -> AgentResult:
-    """Execute one model task and record its usage."""
+    """Execute once; a durable owner may defer the sole usage write to settlement."""
     t0 = time.monotonic()
+    record = usage_recorder or _record_event
     logical_id = run_id or new_id()
     engine = engine or next((e for e, p in ENGINE_LEDGER_PROVIDERS.items() if p == task.provider_id), "legacy")
     driver = driver or ExecuteTaskDriver(runtime, engine, legacy_task=task)
@@ -121,11 +123,11 @@ async def run_agent_task(
         timeout_s=task.timeout, max_output_chars=max_output_chars,
     )
     try:
-        result = await collect_turn(driver, turn, emit)
+        result = await collect_turn(driver, turn, emit, is_cancelled=is_cancelled)
     except (asyncio.CancelledError, Exception) as exc:  # noqa: B014
         state = driver._turns.get(logical_id) if isinstance(driver, ExecuteTaskDriver) else None
         recorded_error = state.error if state is not None and state.error is not None else exc
-        _record_event(task, kind, None, int((time.monotonic() - t0) * 1000), False, recorded_error, run_id)
+        record(task, kind, None, int((time.monotonic() - t0) * 1000), False, recorded_error, run_id)
         raise
-    _record_event(task, kind, result, int((time.monotonic() - t0) * 1000), True, None, run_id)
+    record(task, kind, result, int((time.monotonic() - t0) * 1000), True, None, run_id)
     return result

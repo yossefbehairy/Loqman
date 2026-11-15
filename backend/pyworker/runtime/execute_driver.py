@@ -21,6 +21,8 @@ class _Turn:
     request: ExecuteAgentTask
     task: asyncio.Task | None = None
     stop: asyncio.Task | None = None
+    abort: asyncio.Task | None = None
+    cleanup_deadline: float | None = None
     cancelled: bool = False
     abandoned: bool = False
     terminal: bool = False
@@ -33,12 +35,17 @@ class ExecuteTaskDriver:
     capabilities = DriverCapabilities(False, False, False, False, "none", "relaunch", False)
 
     def __init__(self, runtime: AgentRuntime, engine: str = "legacy", runtime_key: str = "default",
-                 *, legacy_task: ExecuteAgentTask | None = None, cancel_grace_s: float = 1.0):
+                 *, legacy_task: ExecuteAgentTask | None = None, cancel_grace_s: float = 15.0):
         self.cancel_grace_s = cancel_grace_s  # bound on waiting for an engine that ignores cancellation
         self.runtime, self.engine, self.runtime_key = runtime, engine, runtime_key
         self._legacy_task = legacy_task
         self._turns: dict[str, _Turn] = {}
         self._issues: list[CleanupIssue] = []
+        self._cleanup_expired = asyncio.Event()
+
+    def expire_cleanup(self):
+        """Application shutdown reached its deadline; release pending joins."""
+        self._cleanup_expired.set()
 
     async def start_turn(self, turn: StartTurn, emit: Emit) -> TurnRef:
         if not all((turn.turn_id, turn.run_id, turn.scope_id, turn.model_id, turn.cwd)) or turn.timeout_s <= 0 or turn.max_output_chars < 1:
@@ -56,7 +63,9 @@ class ExecuteTaskDriver:
         # Keep a bounded terminal tombstone window, never evict active ownership.
         if len(self._turns) >= 256:
             for key, state in list(self._turns.items()):
-                if state.terminal and (state.task is None or state.task.done()):
+                if (state.terminal and (state.task is None or state.task.done())
+                        and (state.abort is None or state.abort.done())
+                        and (state.stop is None or state.stop.done())):
                     del self._turns[key]
                     break
             else:
@@ -153,31 +162,60 @@ class ExecuteTaskDriver:
                     "duration_ms": int((time.monotonic() - t0) * 1000), "final_item_ids": []})
 
     async def _join(self, s):
-        """Wait for the wrapped task, but only for the grace period; abandon it if it ignores cancel."""
-        if s.task is None or s.task.done():
+        """Retain both execution and abort ownership through the kill budget.
+
+        Legacy Windows kills allow 10s for taskkill and 5s for confirmed exit.
+        Repeated close/interrupt calls share one budget; shutdown can shorten it.
+        """
+        pending = {t for t in (s.task, s.abort) if t is not None and not t.done()}
+        if not pending:
             return
-        await asyncio.wait({s.task}, timeout=self.cancel_grace_s)
-        if not s.task.done() and not s.abandoned:
+        loop = asyncio.get_running_loop()
+        if s.cleanup_deadline is None:
+            s.cleanup_deadline = loop.time() + self.cancel_grace_s
+        expiry = asyncio.create_task(self._cleanup_expired.wait())
+        try:
+            while pending and not self._cleanup_expired.is_set():
+                finished, _ = await asyncio.wait(pending | {expiry},
+                    timeout=max(0, s.cleanup_deadline - loop.time()), return_when=asyncio.FIRST_COMPLETED)
+                pending -= finished
+                if not finished or expiry in finished:
+                    break
+        finally:
+            expiry.cancel()
+            await asyncio.gather(expiry, return_exceptions=True)
+        if pending and not s.abandoned:
             s.abandoned = True  # late results are dropped: s.cancelled is set and s.terminal gates _send
             self._issues.append(CleanupIssue(s.turn.turn_id, None, "Engine ignored cancellation; task abandoned."))
             self._issues[:] = self._issues[-256:]
 
     async def _stop(self, s):
+        async def abort():
+            try:
+                await self.runtime.abort_task(s.request.session_title)
+            except Exception:
+                self._issues.append(CleanupIssue(s.turn.turn_id, None, "Legacy abort failed."))
+                self._issues[:] = self._issues[-256:]
+
+        s.abort = asyncio.create_task(abort())
         try:
-            await asyncio.wait_for(self.runtime.abort_task(s.request.session_title), self.cancel_grace_s)
-        except Exception:
-            self._issues.append(CleanupIssue(s.turn.turn_id, None, "Legacy abort failed or timed out."))
-            self._issues[:] = self._issues[-256:]
+            # Give protocol abort a brief head start, but never cancel its kill.
+            expiry = asyncio.create_task(self._cleanup_expired.wait())
+            try:
+                await asyncio.wait({s.abort, expiry}, timeout=min(1.0, self.cancel_grace_s),
+                                   return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                expiry.cancel()
+                await asyncio.gather(expiry, return_exceptions=True)
         finally:
             if s.task is not None and not s.task.done():
                 s.task.cancel()
-            if s.task is not None:
-                await self._join(s)
             # A task cancelled before its first instruction has no finally block.
             if not s.terminal:
                 await self._started(s)
                 await self._send(s, "turn.completed", {"status": "cancelled", "stop_reason": "cancelled",
                     "duration_ms": 0, "final_item_ids": []})
+            await self._join(s)
 
     async def interrupt(self, turn_id):
         s = self._turns.get(turn_id)

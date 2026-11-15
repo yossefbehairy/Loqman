@@ -8,7 +8,8 @@ from .base import AgentResult
 from .driver import EVENT_TYPES, DriverFailure, DriverTurnError, Emit, StartTurn, TurnDriver
 
 
-async def collect_turn(driver: TurnDriver, turn: StartTurn, emit: Emit | None = None) -> AgentResult:
+async def collect_turn(driver: TurnDriver, turn: StartTurn, emit: Emit | None = None,
+                       *, is_cancelled=None) -> AgentResult:
     done = asyncio.get_running_loop().create_future()
     items: dict[str, dict] = {}
     usage = {}
@@ -126,5 +127,10 @@ async def collect_turn(driver: TurnDriver, turn: StartTurn, emit: Emit | None = 
         await cleaning
         if done.done() and not done.cancelled():
             done.exception()  # consume a terminal exception if admission/cancellation won
+        if cancelled_during_cleanup and done.done() and not done.cancelled() and done.exception() is None:
+            # Cleanup cancellation cannot discard an already collected answer.
+            # The durable manager's cancellation gate still wins over that answer.
+            if is_cancelled is None or not is_cancelled():
+                return done.result()
         if cancelled_during_cleanup:
             raise asyncio.CancelledError
