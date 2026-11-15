@@ -106,10 +106,11 @@ def main(exe, timeout):
                 raise RuntimeError(f"{method} failed: {reply!r}")
             return reply["result"]
 
-        if call("health").get("status") != "ok":
+        health = call("health")
+        if health.get("status") != "ok":
             raise RuntimeError("health is not ok")
-        if not call("app.info").get("version"):
-            raise RuntimeError("app.info has no version")
+        if not health.get("version"):
+            raise RuntimeError("health has no version")
         if not call("engines.status").get("engines"):
             raise RuntimeError("engines.status has no engines")
         if "mock" not in call("engines.capabilities"):

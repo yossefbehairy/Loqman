@@ -2,6 +2,8 @@
 
 SCHEMA_VERSION = 17
 
+# Tables workflows, workflow_executions, node_executions, execution_events and opencode_conversations are retained
+# for existing databases and no longer written (the code that used them was removed).
 TABLES = {
     'agent_profiles': 'CREATE TABLE agent_profiles (\n\tid VARCHAR(64) NOT NULL, \n\tname VARCHAR(255) NOT NULL, \n\trole_type VARCHAR(64) NOT NULL, \n\tdescription TEXT, \n\tinstructions TEXT NOT NULL, \n\tinput_schema_json TEXT, \n\toutput_schema_json TEXT, \n\tdefault_model_id VARCHAR(128) NOT NULL, \n\tdefault_variant_id VARCHAR(64), \n\ttask_depth VARCHAR(32) NOT NULL, \n\tsettings_json TEXT, \n\tengine VARCHAR(32), \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)',
     'ceo_messages': 'CREATE TABLE ceo_messages (\n\tid VARCHAR(36) NOT NULL, \n\tseq INTEGER NOT NULL, \n\trole VARCHAR(16) NOT NULL, \n\tcontent TEXT NOT NULL, \n\tfast BOOLEAN NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)',

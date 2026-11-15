@@ -17,7 +17,7 @@ from .appsettings import Settings, configure, settings as shared_settings
 from .context import Context
 from .core import profiles as profile_repo
 from .core.approvals import ApprovalManager
-from .core.conversation_runs import ConversationRunManager, default_runtime_factory
+from .core.conversation_runs import ConversationRunManager
 from .core.deliverables import DeliverableManager
 from .core.lifecycle import run_startup_crash_recovery
 from .core import preferences as prefs_mod
@@ -28,7 +28,7 @@ from .runtime import get_runtime as default_get_runtime
 from .runtime import ledger
 
 from .api.registry import METHODS
-from .api import chat, ceo, convo, missions, org, preferences, streams, system  # noqa: F401  (register handlers)
+from .api import ceo, convo, missions, org, preferences, streams, system  # noqa: F401  (register handlers)
 
 log = logging.getLogger("agentos.app")
 
@@ -85,8 +85,8 @@ class Application:
             if runtime_factory is not None:
                 engine_factory = run_factory = runtime_factory
             else:
-                from .orchestration.ceo import _default_engine_runtime_factory
-                engine_factory, run_factory = _default_engine_runtime_factory, default_runtime_factory
+                from .runtime.engine_registry import create_engine_runtime
+                engine_factory = run_factory = create_engine_runtime
             runs = ConversationRunManager(db, runtime_factory=run_factory, **run_manager_kwargs)
             interrupted = runs.recover_interrupted()
             ledger.bind(db)

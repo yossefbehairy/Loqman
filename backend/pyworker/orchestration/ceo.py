@@ -32,8 +32,10 @@ from backend.pyworker.orchestration.planner import (
     parse_and_validate_plan,
 )
 from backend.pyworker.runtime.base import ExecuteAgentTask
+from backend.pyworker.runtime.engine_registry import create_engine_runtime
 from backend.pyworker.runtime.errors import safe_error_message
 from backend.pyworker.runtime.ledger import KIND_MISSION_PLANNER, KIND_MISSION_SYNTHESIS
+from backend.pyworker.runtime.providers import ledger_provider
 
 logger = logging.getLogger("agentos.missions")
 
@@ -194,36 +196,14 @@ async def _finalize_mission_cancelled(db: Database, mission_id: str) -> Dict[str
     return {"status": "cancelled"}
 
 
-ENGINE_PROVIDERS = {"opencode": "opencode", "claude-code": "anthropic", "codex": "openai",
-                    "antigravity": "antigravity", "mock": "mock"}
-_ENGINE_PROVIDERS = ENGINE_PROVIDERS  # legacy name
-
-
 def _default_runtime_identity() -> tuple:
     """The default engine and provider labels for ledger/runs: the engine the default runtime really is
-    (the saved default in real mode, mock in mock mode; RUNTIME_MODE=agy is the separate experimental print
-    adapter, the canonical Antigravity ACP adapter is selected by engine id)."""
+    (the saved default in real mode, mock in mock mode)."""
     return prefs_mod.default_identity()
 
 
 class EngineSelectionError(Exception):
     """A profile's engine preference cannot be honoured. Never silently falls back."""
-
-
-def _default_engine_runtime_factory(engine_id: str):
-    if engine_id == "opencode":
-        from backend.pyworker.runtime.opencode_runtime import RealOpenCodeRuntime
-        return RealOpenCodeRuntime()
-    if engine_id == "claude-code":
-        from backend.pyworker.runtime.claude_runtime import ClaudeCodeRuntime
-        return ClaudeCodeRuntime()
-    if engine_id == "codex":
-        from backend.pyworker.runtime.codex_runtime import CodexCliRuntime
-        return CodexCliRuntime()
-    if engine_id == "antigravity":
-        from backend.pyworker.runtime.agy_acp_runtime import AgyAcpRuntime
-        return AgyAcpRuntime()
-    raise EngineSelectionError(f"Unsupported engine '{engine_id}'.")
 
 
 async def _select_task_runtime(profile, default_runtime, factory, cache, model_id, variant):
@@ -236,12 +216,12 @@ async def _select_task_runtime(profile, default_runtime, factory, cache, model_i
     engine = ((profile.get("engine") if profile else None) or "").strip() or None
     if engine is None:
         return default_runtime, _default_runtime_identity()[1], None
-    if engine not in ENGINE_PROVIDERS:
+    if ledger_provider(engine) is None:
         raise EngineSelectionError(f"Unsupported engine '{engine}'.")
     if engine == "mock":
         if settings.RUNTIME_MODE != "mock":
             raise EngineSelectionError("Engine 'mock' is only available in explicit mock mode.")
-        return default_runtime, ENGINE_PROVIDERS[engine], engine
+        return default_runtime, ledger_provider(engine), engine
     rt = cache.get(engine)
     if rt is None:
         try:
@@ -262,7 +242,7 @@ async def _select_task_runtime(profile, default_runtime, factory, cache, model_i
         if variant not in (None, "", "default") and variant not in (entry.variants or []):
             raise EngineSelectionError(
                 f"Variant '{variant}' is not supported by engine '{engine}' for model '{model_id}'.")
-    return rt, ENGINE_PROVIDERS[engine], engine
+    return rt, ledger_provider(engine), engine
 
 
 async def _route_task(profile, default_runtime, factory, cache, model_id, variant, fallback_model_id):
@@ -373,7 +353,7 @@ async def _execute_single_task(
 
     try:
         task_runtime, task_provider, task_engine, model_id, variant = await _route_task(
-            profile, runtime, engine_runtime_factory or _default_engine_runtime_factory,
+            profile, runtime, engine_runtime_factory or create_engine_runtime,
             engine_cache if engine_cache is not None else {}, model_id, variant, fallback_model)
     except EngineSelectionError as exc:
         msg = f"Engine selection failed: {str(exc)[:300]}"

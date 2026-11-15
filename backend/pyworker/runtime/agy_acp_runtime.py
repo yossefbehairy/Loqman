@@ -1,8 +1,8 @@
 """
 AgyAcpRuntime: an AgentRuntime adapter over the Antigravity CLI's Agent Client
 Protocol (ACP) server: `agy acp --stdio`. NOT Gemini CLI, NOT `agy -p`
-(that is agy_runtime.AgyCliRuntime). Nothing imports this module until a
-caller wires it in.
+(the retired print-mode adapter). Created through
+``engine_registry.create_engine_runtime("antigravity")``.
 
 One task = one `agy acp` process = one ACP session
   argv : agy acp --stdio --sandbox --include-default-customizations=false
@@ -581,7 +581,7 @@ class AgyAcpRuntime:
                              default_model_status="unverified", models_count=len(models),
                              free_models_count=0)
 
-    async def list_available_models(self, free_only: bool = True) -> List[ModelCatalogEntry]:
+    async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]:
         """Models offered by session/new; never 'free' (billing unknown)."""
         if free_only or not self._cmd:
             return []

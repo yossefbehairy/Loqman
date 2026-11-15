@@ -16,7 +16,7 @@ import { Composer } from './Composer';
 import { ApprovalCard } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
 import { stripContract, type ChatState, type EngineState } from '../state/useChat';
-import type { Agent } from '../../types/agentos';
+import type { Agent } from '../types';
 import { useKeepDecided } from '../state/useKeepDecided';
 import type { Conversation } from '../data/worker';
 import { parseWorkerTime } from '../data/time';

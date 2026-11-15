@@ -77,7 +77,7 @@ def fake(tmp_path, monkeypatch):
 
 
 def task(**kw):
-    base = dict(prompt="ping", model_id="sonnet", session_title="t1", timeout=30)
+    base = dict(prompt="ping", model_id="sonnet", provider_id="anthropic", session_title="t1", timeout=30)
     base.update(kw)
     return ExecuteAgentTask(**base)
 
@@ -213,7 +213,6 @@ def test_factory_selection_and_default(monkeypatch):
     monkeypatch.setattr(rtpkg, "_runtime_instance", None)
     monkeypatch.setattr(rtpkg.settings, "RUNTIME_MODE", "real")
     assert isinstance(rtpkg.get_runtime(), RealOpenCodeRuntime)   # default untouched
-    monkeypatch.setattr(rtpkg, "_runtime_instance", None)
-    monkeypatch.setattr(rtpkg.settings, "RUNTIME_MODE", "claude")
-    assert isinstance(rtpkg.get_runtime(), ClaudeCodeRuntime)
+    monkeypatch.setattr(rtpkg, "_engine_instances", {})
+    assert isinstance(rtpkg.get_runtime("claude-code"), ClaudeCodeRuntime)   # chosen by engine id, not by RUNTIME_MODE
     monkeypatch.setattr(rtpkg, "_runtime_instance", None)

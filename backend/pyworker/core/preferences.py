@@ -22,16 +22,12 @@ import threading
 from typing import Any, Dict, Optional, Tuple
 
 from backend.pyworker.appsettings import settings
-from backend.pyworker.runtime.providers import PROVIDERS, get_provider
+from backend.pyworker.runtime.providers import PROVIDERS, engine_title, get_provider, ledger_provider
 
 FILE_NAME = "preferences.json"
 ENGINE_IDS = tuple(p.engine_id for p in PROVIDERS)
 # Ids such as "deepseek-v4.1-flash-free", "claude-opus-4-5", "gpt-5.1-codex", "opus[1m]", "org/model:tag".
 MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,127}$")
-
-# RUNTIME_MODE values other than real/mock pin the default runtime to one adapter.
-_MODE_ENGINE = {"claude": "claude-code", "codex": "codex", "agy": "agy-legacy-cli"}
-_MODE_PROVIDER = {"claude": "anthropic", "codex": "openai", "agy": "antigravity"}
 
 
 def valid_model_id(model_id: Any) -> bool:
@@ -111,20 +107,17 @@ def current() -> Optional[Preferences]:
 
 
 def preferred() -> Tuple[Optional[str], Optional[str]]:
-    """The saved default as (engine, model_id); (None, None) when unset or when the mode pins the runtime."""
+    """The saved default as (engine, model_id); (None, None) when unset or in mock mode."""
     if settings.RUNTIME_MODE != "real" or _bound is None:
         return None, None
     return _bound.get_default()
 
 
 def default_engine_id() -> str:
-    """The engine the default runtime belongs to: mock in mock mode, the pinned adapter in claude/codex/agy
-    mode, otherwise the saved preference (OpenCode when nothing is saved)."""
-    mode = settings.RUNTIME_MODE
-    if mode == "mock":
+    """The engine the default runtime belongs to: mock in mock mode, otherwise the saved
+    preference (OpenCode when nothing is saved)."""
+    if settings.RUNTIME_MODE == "mock":
         return "mock"
-    if mode in _MODE_ENGINE:
-        return _MODE_ENGINE[mode]
     return preferred()[0] or "opencode"
 
 
@@ -133,25 +126,10 @@ def default_model_id() -> str:
     return preferred()[1] or settings.DEFAULT_MODEL_ID
 
 
-def provider_label(engine: str) -> str:
-    """Usage-ledger provider id for an engine."""
-    if engine == "mock":
-        return "mock"
-    p = get_provider(engine)
-    if p is not None:
-        return p.provider_ids[0]
-    return next((v for k, v in _MODE_PROVIDER.items() if _MODE_ENGINE[k] == engine), "opencode")
-
-
 def default_identity() -> Tuple[str, str]:
     """(engine label, ledger provider) of the default runtime."""
     engine = default_engine_id()
-    return engine, provider_label(engine)
-
-
-def engine_title(engine: str) -> str:
-    p = get_provider(engine)
-    return p.title if p is not None else engine
+    return engine, ledger_provider(engine) or engine
 
 
 def free_only(engine: str) -> bool:

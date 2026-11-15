@@ -4,6 +4,7 @@ const path = require('node:path');
 
 async function saveBackup({ call, dialog, fs, documentsPath }) {
   const backup = await call('backup.create', {});
+  let result;
   let failure;
   try {
     const choice = await dialog.showSaveDialog({
@@ -11,20 +12,25 @@ async function saveBackup({ call, dialog, fs, documentsPath }) {
       defaultPath: path.join(documentsPath, path.basename(backup.name)),
       filters: [{ name: 'SQLite database', extensions: ['db'] }],
     });
-    if (choice.canceled || !choice.filePath) return { saved: false, cancelled: true };
-    await fs.copyFile(backup.path, choice.filePath);
-    return { saved: true, path: choice.filePath, size: backup.size };
+    if (choice.canceled || !choice.filePath) {
+      result = { saved: false, cancelled: true };
+    } else {
+      await fs.copyFile(backup.path, choice.filePath);
+      result = { saved: true, path: choice.filePath, size: backup.size };
+    }
   } catch (error) {
     failure = error;
-    throw error;
-  } finally {
-    try {
-      await call('backup.cleanup', { path: backup.path });
-    } catch (error) {
-      // Preserve a copy/dialog failure if cleanup also fails.
-      if (!failure) throw error;
-    }
   }
+  // Always clean up; a dialog or copy failure wins over a cleanup failure.
+  let cleanupError;
+  try {
+    await call('backup.cleanup', { path: backup.path });
+  } catch (error) {
+    cleanupError = error;
+  }
+  if (failure) throw failure;
+  if (cleanupError) throw cleanupError;
+  return result;
 }
 
 module.exports = { saveBackup };

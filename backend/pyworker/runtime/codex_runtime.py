@@ -2,8 +2,8 @@
 CodexCliRuntime: a deliberately BOUNDED AgentRuntime adapter over the local
 OpenAI Codex CLI (`codex exec`), its documented non-interactive mode.
 
-Selected only with RUNTIME_MODE=codex. The default (RUNTIME_MODE=real) stays
-OpenCode; nothing here is imported unless Codex is selected.
+Created through ``engine_registry.create_engine_runtime("codex")``; nothing
+here is imported unless Codex is selected.
 
 What one task does (argv inspected from `codex exec --help`, v0.167.0)
   codex exec --json --ephemeral --sandbox read-only --skip-git-repo-check
@@ -282,7 +282,7 @@ class CodexCliRuntime:
         return RuntimeHealth(status=status, service_url=None, default_model_status="unverified",
                              models_count=count, free_models_count=0)
 
-    async def list_available_models(self, free_only: bool = True) -> List[ModelCatalogEntry]:
+    async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]:
         """Visible models from the local Codex catalog, 'unverified' and never
         free (free_only=True therefore returns [])."""
         if free_only:

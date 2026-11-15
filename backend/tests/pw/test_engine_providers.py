@@ -385,3 +385,56 @@ async def test_an_older_slow_probe_cannot_replace_a_newer_forced_result(api, mon
     assert forced["engines"][0]["install_state"] == "installed"
     later = await api("engines.status")  # served from the cache
     assert later["engines"][0]["install_state"] == "installed" and len(calls) == 2
+
+
+# -- P2: one engine table, one factory, retired runtime modes ---------------------------------------
+
+def test_ledger_provider_table_is_derived_from_the_catalog():
+    from backend.pyworker.runtime.providers import ENGINE_LEDGER_PROVIDERS, PROVIDERS, ledger_provider
+
+    assert ENGINE_LEDGER_PROVIDERS == {"opencode": "opencode", "claude-code": "anthropic", "codex": "openai",
+                                       "antigravity": "antigravity", "mock": "mock"}
+    assert all(ledger_provider(p.engine_id) == p.provider_ids[0] for p in PROVIDERS)
+    assert ledger_provider("gemini") is None
+
+
+def test_one_factory_builds_every_engine_runtime():
+    from backend.pyworker.runtime.engine_registry import ENGINE_IDS, create_engine_runtime
+    from backend.pyworker.runtime.mock_runtime import MockRuntime
+
+    for engine in ENGINE_IDS:
+        assert create_engine_runtime(engine) is not None
+    assert isinstance(create_engine_runtime("mock"), MockRuntime)
+    with pytest.raises(ValueError):
+        create_engine_runtime("gemini")
+
+
+@pytest.mark.parametrize("mode", ["claude", "codex", "agy"])
+def test_retired_runtime_modes_fail_with_a_clear_message(mode):
+    from backend.pyworker.appsettings import load_settings
+
+    with pytest.raises(ValueError) as err:
+        load_settings(env={"RUNTIME_MODE": mode}, dotenv_path=None)
+    assert f"RUNTIME_MODE={mode}" in str(err.value) and "default provider in Settings" in str(err.value)
+    assert load_settings(env={"RUNTIME_MODE": "mock"}, dotenv_path=None).RUNTIME_MODE == "mock"
+
+
+def test_retired_runtime_mode_exits_cleanly_without_a_traceback(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "RUNTIME_MODE": "claude"}
+    proc = subprocess.run([sys.executable, "-m", "backend.pyworker", "--db", str(tmp_path / "a.db")],
+                          input=b"", capture_output=True, env=env, timeout=60)
+    err = proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 2 and "default provider in Settings" in err and "Traceback" not in err
+
+
+def test_task_provider_id_and_free_only_have_no_silent_defaults():
+    import inspect
+    from backend.pyworker.runtime.base import AgentRuntime, ExecuteAgentTask
+
+    with pytest.raises(TypeError):
+        ExecuteAgentTask(prompt="x", model_id="m")
+    assert inspect.signature(AgentRuntime.list_available_models).parameters["free_only"].default is inspect.Parameter.empty

@@ -1,4 +1,4 @@
-"""health, runtime/model catalog, engines, usage ledger and backup methods."""
+"""health, model catalog, engines, usage ledger and backup methods."""
 
 from __future__ import annotations
 
@@ -28,12 +28,6 @@ def _model_out(m) -> Dict[str, Any]:
             "output_cost": m.cost.output, "variants": m.variants, "is_free": m.is_free, "status": m.status}
 
 
-@method("app.info")
-async def app_info(ctx, params):
-    check_keys(params)
-    return {"app": settings.APP_NAME, "version": settings.APP_VERSION, "status": "online"}
-
-
 @method("health")
 async def health(ctx, params):
     check_keys(params)
@@ -41,22 +35,8 @@ async def health(ctx, params):
     return {"status": "ok", "app_name": settings.APP_NAME, "version": settings.APP_VERSION}
 
 
-@method("runtime.health")
-async def runtime_health(ctx, params):
-    check_keys(params)
-    h = await ctx.get_runtime().check_health()
-    return h.to_dict()
-
-
 @method("models.free")
 async def models_free(ctx, params):
-    check_keys(params)
-    models = await ctx.get_runtime().list_available_models(free_only=True)
-    return {"models": [_model_out(m) for m in models]}
-
-
-@method("models.refresh")
-async def models_refresh(ctx, params):
     check_keys(params)
     models = await ctx.get_runtime().list_available_models(free_only=True)
     return {"models": [_model_out(m) for m in models]}

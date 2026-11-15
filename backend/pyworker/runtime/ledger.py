@@ -21,13 +21,11 @@ from backend.pyworker.runtime.base import AgentResult, AgentRuntime, ExecuteAgen
 logger = logging.getLogger("agentos.usage")
 
 # Stable, queryable kind labels.
-KIND_CHAT_CONSULT = "chat_consult"
 KIND_CEO_ASK = "ceo_ask"
 KIND_CEO_ASK_FAST = "ceo_ask_fast"
 KIND_MISSION_PLANNER = "mission_planner"
 KIND_MISSION_DELEGATE = "mission_delegate"
 KIND_MISSION_SYNTHESIS = "mission_synthesis"
-KIND_WORKFLOW_NODE = "workflow_node"
 KIND_GREETING = "greeting_reply"
 
 _db: Optional[Database] = None
@@ -80,7 +78,7 @@ def _record_event(
             "kind": kind,
             "agent_id": task.agent_id or (settings.WORK_AGENT_ID if task.provider_id == "opencode" else "unassigned"),
             "model_id": getattr(result, "model_id", None) or task.model_id,
-            "provider_id": task.provider_id or "opencode",
+            "provider_id": task.provider_id or "unknown",
             "variant_id": getattr(result, "variant_id", None),
             "session_id": getattr(result, "session_id", None),
             "duration_ms": duration_ms,

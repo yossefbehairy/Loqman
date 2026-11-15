@@ -9,7 +9,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, FileText, MessageCircle, Send, Trash2, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { Agent, Team } from '../../types/agentos';
+import type { Agent, Team } from '../types';
 import { CEO_PROFILE_ID, isMissionTerminal, delegateToAgent, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
 

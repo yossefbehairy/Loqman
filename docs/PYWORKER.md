@@ -9,7 +9,7 @@ FastAPI / SQLAlchemy / Pydantic / httpx. The legacy `backend/app` has been remov
 backend\.venv\Scripts\python.exe -m backend.pyworker --data-dir C:\path\userData      # <dir>\agentos.db (desktop)
 backend\.venv\Scripts\python.exe -m backend.pyworker --db C:\path\file.db --runtime-mode mock
 ```
-Flags: `--data-dir` or `--db`, `--runtime-mode real|mock|claude|codex|agy`, `--max-message-bytes`,
+Flags: `--data-dir` or `--db`, `--runtime-mode real|mock` (`RUNTIME_MODE=claude|codex|agy` was removed: choose the default provider in Settings; a leftover value exits with a clear message), `--max-message-bytes`,
 `--shutdown-timeout`, `--log-level`. Other settings come from the same env vars / `.env` as before.
 Offline restore: `python -m backend.pyworker.restore_cli BACKUP TARGET --yes-app-is-stopped`.
 
@@ -20,13 +20,12 @@ stdout = protocol only, stderr = logs; one JSON object per line; the inbound siz
   status (404/409/422...) and `detail` payload.
 - first line `{"type":"ready", protocol, runtime_mode, methods, recovery, interrupted_runs}`; a failed start sends
   `{"type":"fatal"}` and exits 2 (client-safe message, no paths).
-- streams (replace SSE): `stream.open {topic: run|mission|execution, id, last_event_id?}` -> `{stream_id}`, then
+- streams (replace SSE): `stream.open {topic: run|mission, id, last_event_id?}` -> `{stream_id}`, then
   `{"type":"stream","stream_id","event","id","data"}` lines and a final `{"type":"stream_end","stream_id","reason"}`;
   `stream.close`. Run streams replay from SQLite after `last_event_id` (gap-free resume).
-  Mission streams send the current mission/task snapshot, and execution streams send persisted
-  execution events followed by live events. Both close automatically on terminal state.
-  Only run streams accept a positive cursor. Reopening mission/execution starts a fresh snapshot
-  with null event IDs. Clients replace mission state and deduplicate replayed execution messages.
+  Mission streams send the current mission/task snapshot, then live events, and close automatically on
+  terminal state. Only run streams accept a positive cursor. Reopening a mission starts a fresh snapshot
+  with null event IDs; clients replace mission state.
   The Electron and development bridges register stream ownership synchronously on the open response,
   before processing subsequent event lines.
 - Differences from HTTP: no token/CORS/ports; the `X-AgentOS-Confirm` header became param `confirm: true` on
@@ -86,29 +85,23 @@ thread and the binding is checked again before returning the result.
 ## Methods
 | Area | Methods |
 |---|---|
-| `app` | `app.info` |
 | `approvals` | `approvals.capabilities`, `approvals.decide`, `approvals.list` |
 | `artifacts` | `artifacts.content`, `artifacts.get`, `artifacts.list`, `artifacts.register` |
 | `backup` | `backup.cleanup`, `backup.create` |
-| `ceo` | `ceo.actions`, `ceo.approve`, `ceo.ask`, `ceo.ask_progress`, `ceo.deny`, `ceo.history` |
-| `chat` | `chat.consult`, `chat.opencode_proxy`, `chat.session.get`, `chat.session.save` |
+| `ceo` | `ceo.actions`, `ceo.approve`, `ceo.ask`, `ceo.ask_progress`, `ceo.deny` |
 | `conversations` | `conversations.add_message`, `conversations.bind_profile`, `conversations.create`, `conversations.import_ceo`, `conversations.list`, `conversations.messages` |
 | `computer` | `computer.windows` |
 | `deliverables` | `deliverables.content`, `deliverables.create`, `deliverables.decide`, `deliverables.get`, `deliverables.list`, `deliverables.list_all` |
 | `engines` | `engines.capabilities`, `engines.check`, `engines.models`, `engines.open_setup`, `engines.setup`, `engines.status`, `engines.test` |
-| `executions` | `executions.cancel`, `executions.get`, `executions.list`, `executions.messages` |
 | `health` | `health` |
-| `managers` | `managers.consult` |
 | `missions` | `missions.cancel`, `missions.create`, `missions.delegate`, `missions.get`, `missions.list`, `missions.runs` |
-| `models` | `models.free`, `models.refresh` |
+| `models` | `models.free` |
 | `profiles` | `profiles.create`, `profiles.delete`, `profiles.get`, `profiles.list`, `profiles.update` |
 | `runs` | `runs.cancel`, `runs.events`, `runs.get`, `runs.list`, `runs.start_turn`, `runs.write_proposals`, `runs.tool_control`, `runs.steer` |
-| `runtime` | `runtime.health` |
 | `shutdown` | `shutdown` |
 | `skills` | `skills.list`, `skills.read`, `skills.sources.delete`, `skills.sources.list`, `skills.sources.register` |
 | `stream` | `stream.close`, `stream.open` |
 | `usage` | `usage.events`, `usage.summary` |
-| `workflows` | `workflows.create`, `workflows.delete`, `workflows.get`, `workflows.list`, `workflows.run`, `workflows.update`, `workflows.validate` |
 | `workspaces` | `workspaces.create`, `workspaces.get`, `workspaces.list` |
 
 Engine notes: all four engines are defined once in `runtime/providers.py`. `engines.status` takes optional `force` (discovery is cached 30 s per app) and adds `state` (`ready`/`needs_login`/`unverified`/`not_installed`/`error`), `title`, `vendor`, `checked_at`. `engines.setup` adds `state`, `install`, `login`, `docs_url`. `engines.test` runs one fixed-prompt generation (60 s limit; it accepts no prompt). `engines.open_setup` (`step`: `install`/`login`) opens a Windows terminal with the catalog command. `usage.summary` also returns `by_engine`.
@@ -116,7 +109,7 @@ Engine notes: all four engines are defined once in `runtime/providers.py`. `engi
 ## Data
 Opens the existing `agentos.db` and upgrades to schema v17, backs it up
 before upgrades, refuses non-AgentOS sqlite files and newer schemas. Unfinished runs become `interrupted` (never
-re-run); dangling missions/workflows become `failed`.
+re-run); dangling missions become `failed`. The tables of the removed workflow engine and OpenCode session mapping (`workflows`, `workflow_executions`, `node_executions`, `execution_events`, `opencode_conversations`) are kept for existing databases and no longer written; backup and restore carry them.
 
 ## Clients
 - **Electron** (`frontend/electron/{worker-client,main,preload}.cjs`): main spawns the worker, waits for `ready`, exposes

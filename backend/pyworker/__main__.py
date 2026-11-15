@@ -18,6 +18,13 @@ def main(argv: list[str] | None = None) -> int:
         from .mcp_proxy import main as proxy_main
         return proxy_main()
     settings = parse_args(sys.argv[1:] if argv is None else argv)
+    from .appsettings import load_settings
+
+    try:  # a retired RUNTIME_MODE (env or .env) gets a clear message instead of a stack trace
+        load_settings(AGENTOS_DATA_DIR=settings.data_dir, RUNTIME_MODE=settings.runtime_mode)
+    except ValueError as exc:
+        sys.stderr.write(f"agentos worker: {exc}\n")
+        return 2
     proto_out = sys.stdout.buffer
     proto_in = sys.stdin.buffer
     sys.stdout = sys.stderr

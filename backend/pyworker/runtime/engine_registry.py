@@ -1,12 +1,16 @@
-"""Canonical engine lookup shared by setup/catalog APIs."""
+"""The one engine-id -> runtime factory (``create_engine_runtime``). Ids, titles and ledger provider ids live in
+``providers.py``."""
 from backend.pyworker.runtime.base import AgentRuntime
-from backend.pyworker.runtime.providers import PROVIDERS
+from backend.pyworker.runtime.providers import MOCK_ENGINE_ID, PROVIDERS
 
 
 ENGINE_IDS = tuple(p.engine_id for p in PROVIDERS)
 
 
 def create_engine_runtime(engine_id: str) -> AgentRuntime:
+    if engine_id == MOCK_ENGINE_ID:
+        from backend.pyworker.runtime.mock_runtime import MockRuntime
+        return MockRuntime()
     if engine_id == "opencode":
         from backend.pyworker.runtime.opencode_runtime import RealOpenCodeRuntime
         return RealOpenCodeRuntime()

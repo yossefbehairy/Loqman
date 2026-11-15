@@ -32,7 +32,7 @@ import {
 } from '../data/worker';
 import type { StreamHandle } from '../../api/transport';
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
-import type { Agent } from '../../types/agentos';
+import type { Agent } from '../types';
 import {
   loadProviderModels,
   selectProviderEngine,

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { CEO_PROFILE_ID, listProfiles, type Profile } from '../data/worker';
-import type { Agent, ModelReasoning, Team } from '../../types/agentos';
+import type { Agent, ModelReasoning, Team } from '../types';
 
 export interface Company {
   profiles: Profile[];

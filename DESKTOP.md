@@ -116,7 +116,7 @@ Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` 
 |---|---|
 | `--data-dir <path>` | SQLite lives at `<path>\agentos.db` |
 | `--db <file>` | Explicit database file (alternative to `--data-dir`) |
-| `--runtime-mode real\|mock\|claude\|codex\|agy` | Overrides `RUNTIME_MODE` |
+| `--runtime-mode real\|mock` | Overrides `RUNTIME_MODE` |
 
 **Protocol:** JSON Lines on stdin/stdout (`agentos-worker/1`, see `docs/PYWORKER.md`). The first stdout line is `ready`; startup failures send a `fatal` line and exit with code 2. Logs go to stderr only.
 

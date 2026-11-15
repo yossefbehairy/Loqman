@@ -38,7 +38,9 @@ from backend.pyworker.core import run_inputs, run_skills
 from backend.pyworker.core.approvals import expire_for_run as expire_approvals_for_run
 from backend.pyworker.db.core import Database, iso, new_id, ts
 from backend.pyworker.runtime.base import ExecuteAgentTask
+from backend.pyworker.runtime.engine_registry import create_engine_runtime
 from backend.pyworker.runtime.errors import safe_error_message
+from backend.pyworker.runtime.providers import ledger_provider
 from backend.pyworker.runtime.ledger import (
     KIND_MISSION_DELEGATE,
     KIND_MISSION_PLANNER,
@@ -50,8 +52,6 @@ logger = logging.getLogger("agentos.conversation_runs")
 
 ACTIVE_STATUSES = ("queued", "running")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "interrupted")
-ENGINE_PROVIDERS = {"claude-code": "anthropic", "codex": "openai", "opencode": "opencode",
-                    "antigravity": "antigravity", "mock": "mock"}
 INTERRUPTED_ERROR = "Run interrupted by server restart or shutdown; it was not re-executed."
 KIND_CONVERSATION_RUN = "conversation_run"
 KIND_MISSION_TASK = "mission_task"
@@ -104,25 +104,6 @@ class MissionRunCancelled(Exception):
     """A mission worker run lost to a cancel (user, mission, or shutdown)."""
 
 
-def default_runtime_factory(engine_id: str):
-    if engine_id == "mock":
-        from backend.pyworker.runtime.mock_runtime import MockRuntime
-        return MockRuntime()
-    if engine_id == "opencode":
-        from backend.pyworker.runtime.opencode_runtime import RealOpenCodeRuntime
-        return RealOpenCodeRuntime()
-    if engine_id == "claude-code":
-        from backend.pyworker.runtime.claude_runtime import ClaudeCodeRuntime
-        return ClaudeCodeRuntime()
-    if engine_id == "codex":
-        from backend.pyworker.runtime.codex_runtime import CodexCliRuntime
-        return CodexCliRuntime()
-    if engine_id == "antigravity":
-        from backend.pyworker.runtime.agy_acp_runtime import AgyAcpRuntime
-        return AgyAcpRuntime()
-    raise UnsupportedEngine(engine_id)
-
-
 class ConversationRunManager:
     def __init__(
         self,
@@ -140,7 +121,7 @@ class ConversationRunManager:
         self._max_subscribers = max(1, max_subscribers)
         self._heartbeat = heartbeat_seconds
         self._subscribers: Set[_Subscriber] = set()
-        self._runtime_factory = runtime_factory or default_runtime_factory
+        self._runtime_factory = runtime_factory or create_engine_runtime
         self._max_concurrent = max(1, max_concurrent)
         self._max_pending = max(1, max_pending)
         self._abort_grace = abort_grace
@@ -335,7 +316,7 @@ class ConversationRunManager:
                       variant: Optional[str], request_key: Optional[str], skills: Optional[List[Any]],
                       input_files: Optional[List[str]], tool_mode: str = "none",
                       computer_window: Optional[int] = None) -> Dict[str, Any]:
-        if engine not in ENGINE_PROVIDERS:
+        if ledger_provider(engine) is None:
             raise UnsupportedEngine(engine)
         if engine == "mock" and settings.RUNTIME_MODE != "mock":
             raise UnsupportedEngine(engine)
@@ -536,7 +517,7 @@ class ConversationRunManager:
                 if not self._transition(run_id, "queued", "running", started_at=ts()):
                     return  # cancelled while waiting
                 task = ExecuteAgentTask(prompt=prompt, model_id=model_id, variant=variant,
-                                        provider_id=ENGINE_PROVIDERS[engine], timeout=timeout,
+                                        provider_id=ledger_provider(engine), timeout=timeout,
                                         agent_id=settings.CHAT_AGENT_ID if engine == "opencode" else None,
                                         session_title=self._key(run_id))
                 try:

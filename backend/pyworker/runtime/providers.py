@@ -53,6 +53,23 @@ PROVIDERS: Tuple[EngineProvider, ...] = (
 
 _BY_ID = {p.engine_id: p for p in PROVIDERS}
 
+MOCK_ENGINE_ID = "mock"
+# engine id -> the provider id its work is recorded under in usage_events (the first of ``provider_ids``).
+# The mock engine (RUNTIME_MODE=mock only) records as "mock". Every other module imports this table.
+ENGINE_LEDGER_PROVIDERS: Dict[str, str] = {
+    **{p.engine_id: p.provider_ids[0] for p in PROVIDERS}, MOCK_ENGINE_ID: MOCK_ENGINE_ID}
+
 
 def get_provider(engine_id: str) -> Optional[EngineProvider]:
     return _BY_ID.get(engine_id)
+
+
+def engine_title(engine_id: str) -> str:
+    """Display name of an engine (the id itself when the catalog does not know it)."""
+    p = _BY_ID.get(engine_id)
+    return p.title if p is not None else engine_id
+
+
+def ledger_provider(engine_id: str) -> Optional[str]:
+    """Usage-ledger provider id for an engine; None for an unknown engine."""
+    return ENGINE_LEDGER_PROVIDERS.get(engine_id)

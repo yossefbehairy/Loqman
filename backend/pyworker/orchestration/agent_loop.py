@@ -132,7 +132,7 @@ def _emit(progress: Optional[Callable[[str, str, int], None]], stage: str,
 async def run_ceo_ask(
     question: str,
     model_id: str,
-    provider_id: str = "opencode",
+    provider_id: str,
     variant: Optional[str] = None,
     runtime=None,
     db: Optional[Database] = None,
@@ -141,7 +141,8 @@ async def run_ceo_ask(
     progress: Optional[Callable[[str, str, int], None]] = None,
     history: Optional[List[Dict[str, Any]]] = None,
     thread_id: Optional[str] = None,
-    engine: str = "opencode",
+    *,
+    engine: str,
 ) -> Dict[str, Any]:
     """Run the bounded tool loop. Returns {reply, actions_proposed, iterations}."""
     if runtime is None or db is None:
@@ -240,13 +241,14 @@ def _fallback_summary(observations: List[str]) -> str:
 async def run_ceo_fast(
     question: str,
     model_id: str,
-    provider_id: str = "opencode",
+    provider_id: str,
     variant: Optional[str] = None,
     runtime=None,
     timeout: int = 60,
     history: Optional[List[Dict[str, Any]]] = None,
     thread_id: Optional[str] = None,
-    engine: str = "opencode",
+    *,
+    engine: str,
 ) -> Dict[str, Any]:
     """Single-call plain-text path for small talk.
 

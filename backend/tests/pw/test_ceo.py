@@ -92,12 +92,8 @@ async def test_memory_is_backend_owned_and_survives_asks(make_app):
     await api("ceo.ask", question="hello")
     await api("ceo.ask", question="thanks")
     assert "Recent conversation" in rt.prompts[1].prompt and "- User: hello" in rt.prompts[1].prompt
-    hist = (await api("ceo.history"))["messages"]
-    assert [(m["role"], m["fast"]) for m in hist] == [("user", True), ("assistant", True)] * 2
-    assert hist[0]["content"] == "hello" and hist[0]["created_at"]
     seqs = [r["seq"] for r in api.db.all("SELECT seq FROM ceo_messages ORDER BY seq")]
     assert seqs == [1, 2, 3, 4]
-    assert len((await api("ceo.history", limit=2))["messages"]) == 2
 
 
 @pytest.mark.asyncio

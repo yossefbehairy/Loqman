@@ -55,7 +55,7 @@ flowchart LR
 | Desktop | Electron 44, electron-builder (NSIS), PyInstaller one-file worker |
 | AI runtime | Provider adapters for OpenCode, Claude Code, Codex CLI, and Antigravity ACP; deterministic `MockRuntime` for tests |
 
-`RUNTIME_MODE=real` uses OpenCode and its verified free-model policy. `mock` is a deterministic, offline test/demo mode. `claude`, `codex`, and the experimental `agy` mode use the logged-in local CLI account; Antigravity ACP is also available by selecting the `antigravity` engine for a conversation or agent. Account eligibility and billing remain unknown where the CLI cannot verify them, and there is no silent provider fallback.
+`RUNTIME_MODE=real` (default) runs real engines; the default engine and model are a saved preference chosen in Settings (OpenCode until you choose, with its verified free-model policy), and any conversation or agent can pick `claude-code`, `codex`, `antigravity` or `opencode` explicitly using the logged-in local CLI account. `mock` is a deterministic, offline test/demo mode. The old `RUNTIME_MODE=claude|codex|agy` values were removed and exit with a message pointing to Settings. Account eligibility and billing remain unknown where the CLI cannot verify them, and there is no silent provider fallback.
 
 ## CEO control plane
 
@@ -159,7 +159,7 @@ Copy `.env.example` to `.env` in the repository root and adjust what you need:
 | Key | Default | Notes |
 | --- | --- | --- |
 | CLI flags | - | `python -m backend.pyworker` takes `--data-dir` (or `--db`), `--runtime-mode`, `--max-message-bytes`, `--shutdown-timeout`, and `--log-level`. There is no host or port: the worker has no HTTP server. |
-| `RUNTIME_MODE` | `real` | `real` uses OpenCode; `claude` and `codex` use their CLIs; `agy` is an experimental legacy adapter; `mock` is deterministic. Antigravity ACP is selected per engine. |
+| `RUNTIME_MODE` | `real` | `real` or `mock` (deterministic). The default engine is a saved preference (Settings > AI); each engine is selected per conversation or agent. |
 | `OPENCODE_BASE_URL` | `http://127.0.0.1:49100` | The AI runtime lives outside the desktop bundle. |
 | `DEFAULT_MODEL_ID` | `deepseek-v4.1-flash-free` | Revalidated against the selected runtime catalog before a mission starts. |
 | `AGENTOS_DATA_DIR` | - | Folder for `agentos.db`; the database path is derived from it (`apply_data_dir` in `backend/pyworker/appsettings.py`). The dev bridge and Playwright use it. |
@@ -211,7 +211,7 @@ backend/
     api/             # method handlers registered with @method (ceo, chat, convo, missions, org, system, ...)
     core/            # runs, run tools, approvals, deliverables, executions, backups
     db/              # SQLite schema (version 17) and migrations
-    engine/          # executor, state machine, validator, events
+    engine/          # event hub, output validation, output sanitizer
     orchestration/   # CEO loop, CEO tools, planner
     runtime/         # providers.py (engine catalog), OpenCode, Claude Code, Codex, Antigravity, and mock adapters
   tests/             # pytest: worker protocol, lifecycle and streams; pw/ holds unit and contract tests

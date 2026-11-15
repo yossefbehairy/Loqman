@@ -1,5 +1,4 @@
-"""Consultation chat, OpenCode session mapping + SDK proxy rules, models/health,
-usage ledger and backup/restore."""
+"""Models/health, usage ledger and backup/restore."""
 
 import asyncio
 import json
@@ -18,139 +17,6 @@ from .helpers import Api
 MODEL = "muse-spark-1.3-contributor-free"
 
 
-# -- consultation ----------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_consultation_uses_persona_thread_and_records_usage(make_app):
-    seen = []
-
-    class Rec(MockRuntime):
-        async def execute_task(self, task):
-            seen.append(task)
-            return await super().execute_task(task)
-
-    api = Api(make_app(runtime=Rec()))
-    out = await api("chat.consult", manager_id="planner", message="Plan the sprint",
-                    history=[{"role": "user", "content": "earlier"}])
-    assert out["manager_id"] == "planner" and out["suggested_mission"] is None and out["reply"]
-    assert "Sara" in out["manager_name"]
-    task = seen[0]
-    assert task.session_title == "consult-planner" and task.agent_id == "agentos-chat"
-    assert "Plan the sprint" in task.prompt and "- user: earlier" in task.prompt and "no mission talk" in task.prompt
-    ev = (await api("usage.events"))["events"][0]
-    assert ev["kind"] == "chat_consult" and ev["success"] is True
-    # default manager is the CEO; the path form resolves aliases
-    ceo = await api("chat.consult", message="hi")
-    assert ceo["manager_id"] == "general_manager"
-    by_alias = await api("managers.consult", manager_id="dr_sara", message="hi")
-    assert by_alias["manager_id"] == "dr_sara"
-
-
-@pytest.mark.asyncio
-async def test_consultation_errors_and_ad_hoc_agent(api):
-    err = await api.fail("managers.consult", manager_id="ghost", message="hi")
-    assert err.status == 404
-    adhoc = await api("managers.consult", manager_id="ghost", message="hi", agent_name="Zed", agent_role="Tester",
-                      agent_instructions="Be terse", model_id=MODEL, variant="high")
-    assert adhoc["manager_name"] == "Zed" and adhoc["title"] == "Tester"
-    assert (await api.fail("chat.consult", message="")).status == 422
-    assert (await api.fail("chat.consult", message="x", history=[{"role": "user"}])).status == 422
-
-
-@pytest.mark.asyncio
-async def test_consultation_unwraps_json_replies(make_app):
-    class Json(MockRuntime):
-        async def execute_task(self, task):
-            return AgentResult(text='```json\n{"reply": "wrapped"}\n```', model_id=task.model_id)
-
-    api = Api(make_app(runtime=Json()))
-    assert (await api("chat.consult", manager_id="planner", message="x"))["reply"] == "wrapped"
-
-
-# -- OpenCode session mapping ----------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_session_mapping_roundtrip_and_rules(api):
-    assert (await api("chat.session.get", conversation_id="c1"))["session"] is None
-    saved = await api("chat.session.save", conversation_id="c1", session_id="s1", model_id=MODEL,
-                      provider_id="opencode")
-    assert saved["agent_id"] == "agentos-chat"
-    assert (await api("chat.session.get", conversation_id="c1"))["session"]["session_id"] == "s1"
-    again = await api("chat.session.save", conversation_id="c1", session_id="s1", model_id=MODEL,
-                      provider_id="opencode", agent_id="agentos-worker")
-    assert again["agent_id"] == "agentos-worker"
-    # the conversation cannot be re-pointed at another session while the agent is unchanged
-    err = await api.fail("chat.session.save", conversation_id="c1", session_id="other", model_id=MODEL,
-                         provider_id="opencode", agent_id="agentos-worker")
-    assert err.status == 409
-    # the unrestricted legacy agent is never accepted
-    assert (await api.fail("chat.session.save", conversation_id="c2", session_id="s", model_id=MODEL,
-                           provider_id="opencode", agent_id="build")).status == 400
-    assert (await api.fail("chat.session.save", conversation_id="c2", session_id="s", model_id="paid-x",
-                           provider_id="opencode")).status == 400
-    assert (await api.fail("chat.session.save", conversation_id="c2", session_id="s", model_id=MODEL,
-                           provider_id="not-a-free-provider")).status == 400
-
-
-@pytest.mark.asyncio
-async def test_legacy_unsafe_agent_session_is_repointed_not_reused(api):
-    api.db.insert("opencode_conversations", {
-        "conversation_id": "old", "session_id": "unsafe-session", "model_id": MODEL, "provider_id": "opencode",
-        "agent_id": "build", "created_at": "2026-01-01 00:00:00.000000", "updated_at": "2026-01-01 00:00:00.000000"})
-    out = await api("chat.session.save", conversation_id="old", session_id="safe-session", model_id=MODEL,
-                    provider_id="opencode", agent_id="agentos-chat")
-    assert out["session_id"] == "safe-session" and out["agent_id"] == "agentos-chat"
-
-
-class SessionRuntime(MockRuntime):
-    def __init__(self):
-        super().__init__()
-        self.calls, self.fail = [], False
-
-    async def request_api(self, method, path, data=None, timeout=180):
-        if self.fail:
-            raise RuntimeError("OpenCode disconnected: sk-SECRET")
-        self.calls.append((method, path, data))
-        return {"data": {"id": "session-1", "echo": path}}
-
-
-@pytest.mark.asyncio
-async def test_proxy_allows_only_session_routes_and_checks_models(make_app):
-    rt = SessionRuntime()
-    api = Api(make_app(runtime=rt))
-    created = await api("chat.opencode_proxy", method="POST", path="session", body={
-        "title": "t", "agent": "agentos-chat", "model": {"id": MODEL, "providerID": "opencode", "variant": "high"}})
-    assert created["data"]["data"]["id"] == "session-1" and rt.calls[-1][1] == "/api/session"
-    msg = await api("chat.opencode_proxy", method="POST", path="session/abc-1/message", query="x=1", body={
-        "model": {"providerID": "opencode", "modelID": MODEL}, "variant": "high", "parts": []})
-    assert rt.calls[-1][1] == "/api/session/abc-1/message?x=1" and msg["data"]
-    assert (await api("chat.opencode_proxy", method="GET", path="session/abc-1/message"))["data"]
-    for path in ("global/config", "session/a/b/c", "session/../etc", "auth", "file", "session//message"):
-        assert (await api.fail("chat.opencode_proxy", method="GET", path=path)).status == 404, path
-    # a model that is not verified free is refused before any call is made
-    n = len(rt.calls)
-    assert (await api.fail("chat.opencode_proxy", method="POST", path="session",
-                           body={"model": {"id": "paid", "providerID": "opencode"}})).status == 400
-    assert (await api.fail("chat.opencode_proxy", method="POST", path="session",
-                           body={"model": {"id": MODEL, "providerID": "opencode", "variant": "nope"}})).status == 400
-    assert (await api.fail("chat.opencode_proxy", method="POST", path="session/a/message",
-                           body={"model": {"providerID": "opencode", "modelID": "paid"}})).status == 400
-    assert len(rt.calls) == n
-    assert (await api.fail("chat.opencode_proxy", method="DELETE", path="session")).status == 422
-
-
-@pytest.mark.asyncio
-async def test_proxy_failure_is_a_clean_502_without_leaks(make_app):
-    rt = SessionRuntime()
-    rt.fail = True
-    api = Api(make_app(runtime=rt))
-    err = await api.fail("chat.opencode_proxy", method="POST", path="session",
-                         body={"model": {"id": MODEL, "providerID": "opencode"}})
-    assert err.status == 502 and "OpenCode request failed" in err.message and "SECRET" not in json.dumps(err.to_dict())
-    plain = Api(make_app(runtime=MockRuntime()))  # runtime without request_api
-    assert (await plain.fail("chat.opencode_proxy", method="GET", path="session")).status == 502
-
-
 # -- models / health / engines -----------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -158,12 +24,8 @@ async def test_health_models_and_engine_endpoints(api, monkeypatch):
     from backend.pyworker.runtime import engine_discovery as ed
     monkeypatch.setattr(ed, "discover_engines", lambda: [])  # no real CLI probes
     assert (await api("health"))["status"] == "ok"
-    assert (await api("app.info"))["status"] == "online"
-    rh = await api("runtime.health")
-    assert rh["status"] and rh["models_count"] >= rh["free_models_count"] > 0
     free = (await api("models.free"))["models"]
     assert all(m["is_free"] and m["input_cost"] == 0 and m["output_cost"] == 0 for m in free)
-    assert {m["id"] for m in free} == {m["id"] for m in (await api("models.refresh"))["models"]}
     setup = await api("engines.setup", engine_id="codex")
     assert setup["command"] == ["codex", "login"] and setup["credentials_handled_by"] == "official_cli"
     assert (await api("engines.setup", engine_id="antigravity"))["login_method"] == "external_cli"
@@ -197,7 +59,7 @@ async def test_engine_check_and_models_use_the_engine_factory(make_app, monkeypa
 @pytest.mark.asyncio
 async def test_ledger_records_success_failure_cancellation_and_never_breaks(api):
     rt = MockRuntime()
-    task = ExecuteAgentTask(prompt="hello", model_id=MODEL, session_title="t")
+    task = ExecuteAgentTask(prompt="hello", model_id=MODEL, provider_id="opencode", session_title="t")
     res = await ledger.run_agent_task(rt, task, kind="chat_consult", run_id="r1")
     assert res.text
     row = api.db.one("SELECT * FROM usage_events WHERE run_id='r1'")
@@ -337,6 +199,35 @@ def test_restore_roundtrip_and_pre_restore_backup(tmp_path):
     pre_con = sqlite3.connect(pre)
     assert pre_con.execute("SELECT title FROM conversations").fetchone() == ("changed",)
     pre_con.close()
+    backup_mod.cleanup_backup(path)
+
+
+def test_backup_and_restore_keep_rows_of_retired_tables(tmp_path):
+    """Tables of the removed workflow engine / OpenCode session mapping stay in the schema and their rows survive."""
+    from backend.pyworker.db.core import Database
+    from backend.pyworker.db.migrate import init_db
+
+    live = tmp_path / "live.db"
+    db = Database(str(live))
+    init_db(db)
+    now = "2026-01-01 00:00:00.000000"
+    db.insert("workflows", {"id": "w1", "name": "old", "definition_json": "{}", "version": 1,
+                            "created_at": now, "updated_at": now})
+    db.insert("workflow_executions", {"id": "x1", "workflow_id": "w1", "status": "succeeded"})
+    db.insert("opencode_conversations", {"conversation_id": "c", "session_id": "s", "model_id": "m",
+                                         "provider_id": "opencode", "agent_id": "agentos-chat",
+                                         "created_at": now, "updated_at": now})
+    path, _name = backup_mod.create_backup(db)
+    db.execute("DELETE FROM workflows")
+    db.close()
+    backup_mod.restore_database(path, live)
+    con = sqlite3.connect(live)
+    try:
+        assert con.execute("SELECT name FROM workflows").fetchone() == ("old",)
+        assert con.execute("SELECT status FROM workflow_executions").fetchone() == ("succeeded",)
+        assert con.execute("SELECT session_id FROM opencode_conversations").fetchone() == ("s",)
+    finally:
+        con.close()
     backup_mod.cleanup_backup(path)
 
 

@@ -32,29 +32,9 @@ def test_mission_stream_snapshot_then_live_events(worker_factory):
     assert w.err("stream.open", {"topic": "mission", "id": "nope"})["status"] == 404
 
 
-def test_execution_stream_replays_history_and_ends_on_terminal(worker_factory):
+def test_execution_topic_is_gone(worker_factory):
     w = worker_factory()
-    definition = {
-        "nodes": [{"id": "s", "type": "start"},
-                  {"id": "a", "type": "agent", "data": {"role_type": "planner",
-                                                        "model_id": "muse-spark-1.3-contributor-free"}},
-                  {"id": "o", "type": "output"}],
-        "edges": [{"id": "e1", "source": "s", "target": "a"}, {"id": "e2", "source": "a", "target": "o"}]}
-    wf = w.ok("workflows.create", {"name": "wf", "definition_json": json.dumps(definition)})
-    run = w.ok("workflows.run", {"workflow_id": wf["id"], "sync": True})
-    assert run["status"] == "succeeded"
-    sid = w.open_stream("execution", run["execution_id"])
-    # A finished execution replays persisted messages, then closes.
-    deadline = time.monotonic() + 5
-    while len(w.stream_events(sid)) < 3 and time.monotonic() < deadline:
-        time.sleep(0.05)
-    assert [e["event"] for e in w.stream_events(sid)].count("team.message") == 3
-    assert w.wait_stream_end(sid)["reason"] == "complete"
-    assert w.ok("stream.close", {"stream_id": sid})["closed"] is False
-    assert w.ok("executions.messages", {"execution_id": run["execution_id"]})["count"] == 3
-    assert w.wait_stream_event(sid, "execution.finished")["data"]["status"] == "succeeded"
-    assert w.err("stream.open", {"topic": "execution", "id": run["execution_id"],
-                                "last_event_id": 1})["status"] == 422
+    assert w.err("stream.open", {"topic": "execution", "id": "x"})["status"] == 422
 
 
 def test_completed_mission_streams_release_capacity(worker_factory):

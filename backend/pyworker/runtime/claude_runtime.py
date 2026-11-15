@@ -2,8 +2,8 @@
 ClaudeCodeRuntime: a deliberately BOUNDED AgentRuntime adapter over the local
 Claude Code CLI (`claude`), using its official non-interactive print mode.
 
-Selected only with RUNTIME_MODE=claude. The default (RUNTIME_MODE=real) stays
-OpenCode; nothing here is imported unless Claude is selected.
+Created through ``engine_registry.create_engine_runtime("claude-code")``; nothing
+here is imported unless Claude is selected.
 
 What one task does
   claude -p --output-format json --tools "" --strict-mcp-config
@@ -226,7 +226,7 @@ class ClaudeCodeRuntime:
         return RuntimeHealth(status=status, service_url=None, default_model_status="unverified",
                              models_count=models, free_models_count=0)
 
-    async def list_available_models(self, free_only: bool = True) -> List[ModelCatalogEntry]:
+    async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]:
         """Static documented aliases. The CLI cannot list models, so these are
         'unverified' and never free (free_only=True therefore returns [])."""
         if free_only:

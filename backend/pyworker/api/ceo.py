@@ -30,6 +30,7 @@ from backend.pyworker.orchestration.agent_loop import run_ceo_ask, run_ceo_fast
 from backend.pyworker.orchestration.ceo_tools import ALLOWED_CONTRACT_FIELDS
 from backend.pyworker.orchestration import routing
 from backend.pyworker.orchestration.planner import KNOWN_ROLES
+from backend.pyworker.runtime.providers import engine_title, ledger_provider
 from backend.pyworker.validate import check_keys, opt_enum, opt_int, opt_str, req_str
 
 from .registry import method
@@ -139,10 +140,10 @@ async def ceo_ask(ctx, params):
         try:
             runtime = ctx.engine_factory(engine)
         except Exception:
-            raise api_error(503, f"{prefs_mod.engine_title(engine)} is unavailable.")
+            raise api_error(503, f"{engine_title(engine)} is unavailable.")
     models = await routing.load_catalog(runtime, engine)
     target = routing.check_model(models, engine, model_id, variant)
-    provider_id = target.provider_id if engine in routing.OPENCODE_STYLE else prefs_mod.provider_label(engine)
+    provider_id = target.provider_id if engine in routing.OPENCODE_STYLE else ledger_provider(engine)
 
     is_fast = _is_smalltalk(question)
     fast_variant = variant
@@ -241,16 +242,6 @@ async def ceo_ask_progress(ctx, params):
     return {"stage": record["stage"], "detail": record.get("detail", ""), "iteration": record.get("iteration", 0),
             "started_at": record.get("started_at"), "updated_at": record.get("updated_at"),
             "done": record.get("done", False)}
-
-
-@method("ceo.history")
-async def ceo_history(ctx, params):
-    check_keys(params, optional=("limit",))
-    limit = max(1, min(opt_int(params, "limit", 200, 1, 10**6), 500))
-    rows = ctx.db.all("SELECT * FROM ceo_messages ORDER BY seq DESC, id DESC LIMIT ?", (limit,))
-    return {"messages": [{"id": r["id"] or "", "role": r["role"] or "user", "content": r["content"] or "",
-                          "fast": bool(r["fast"]), "created_at": iso(r["created_at"]) or ""}
-                         for r in reversed(rows)]}
 
 
 def _action_out(a: Dict[str, Any], created_profiles=None, team_name=None) -> Dict[str, Any]:

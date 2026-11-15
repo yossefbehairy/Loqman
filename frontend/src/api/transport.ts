@@ -86,9 +86,9 @@ export interface StreamHandle {
   close: () => void;
 }
 
-/** Open a worker event stream (run | mission | execution). Resolves once it is open. */
+/** Open a worker event stream (run | mission). Resolves once it is open. */
 export async function openStream(
-  topic: 'run' | 'mission' | 'execution',
+  topic: 'run' | 'mission',
   id: string,
   onMessage: (msg: StreamMessage) => void,
   lastEventId = 0
@@ -129,10 +129,10 @@ export class WorkerEventSource {
   private listeners = new Map<string, Array<(ev: { data: string }) => void>>();
   private handle: StreamHandle | null = null;
   private closed = false;
-  private topic: 'run' | 'mission' | 'execution';
+  private topic: 'run' | 'mission';
   private id: string;
 
-  constructor(topic: 'run' | 'mission' | 'execution', id: string) {
+  constructor(topic: 'run' | 'mission', id: string) {
     this.topic = topic;
     this.id = id;
     void this.connect();

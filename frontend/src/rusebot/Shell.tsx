@@ -27,7 +27,7 @@ import {
   type Profile,
 } from './data/worker';
 import { useMediaQuery, SIDEBAR_AND_PANEL_FIT } from './lib/use-media-query';
-import type { Agent } from '../types/agentos';
+import type { Agent } from './types';
 import type { ApiError } from '../api/transport';
 import type { DecideResult } from './components/ApprovalCard';
 

@@ -59,7 +59,7 @@ async def test_completed_reply_still_succeeds(fast_clock):
 
 
 def _task(title="conv-run-1"):
-    return ExecuteAgentTask(model_id="m", prompt="hi", session_title=title, timeout=30)
+    return ExecuteAgentTask(model_id="m", prompt="hi", provider_id="opencode", session_title=title, timeout=30)
 
 
 def _wire(r, calls, on_poll):

@@ -48,7 +48,17 @@ def _list(value: str) -> List[str]:
     return [p.strip() for p in value.split(",") if p.strip()]
 
 
-RUNTIME_MODES = ("real", "mock", "claude", "codex", "agy")
+RUNTIME_MODES = ("real", "mock")
+# Modes that used to pin the whole worker to one CLI. The default engine is now a saved preference.
+RETIRED_RUNTIME_MODES = ("claude", "codex", "agy")
+
+
+def runtime_mode_error(mode: str) -> str:
+    """The message for an unusable RUNTIME_MODE value (clear text, never a stack trace)."""
+    if mode in RETIRED_RUNTIME_MODES:
+        return (f"RUNTIME_MODE={mode} is no longer supported. Remove it (or use RUNTIME_MODE=real) and set the "
+                "default provider in Settings; RUNTIME_MODE now accepts only 'real' or 'mock'.")
+    return f"RUNTIME_MODE must be one of {RUNTIME_MODES}, got {mode!r}."
 
 
 @dataclass
@@ -99,18 +109,23 @@ def load_settings(env: Optional[dict] = None, dotenv_path: Optional[str] = ".env
                 setattr(s, f.name, _list(raw))
             else:
                 setattr(s, f.name, raw)
-    if s.RUNTIME_MODE not in RUNTIME_MODES:
-        raise ValueError(f"RUNTIME_MODE must be one of {RUNTIME_MODES}")
     for key, value in overrides.items():
         if value is not None:
             setattr(s, key, value)
+    if s.RUNTIME_MODE not in RUNTIME_MODES:
+        raise ValueError(runtime_mode_error(s.RUNTIME_MODE))
     s.apply_data_dir()
     return s
 
 
 # Process-wide object read by the copied runtime adapters. The entry point
 # (``__main__``) replaces its fields via ``configure`` before serving.
-settings = load_settings(dotenv_path=None)
+try:
+    settings = load_settings(dotenv_path=None)
+except ValueError:
+    # A retired/invalid RUNTIME_MODE in the environment must not crash the import with a trace: the entry point
+    # re-validates the mode and reports it (see __main__).
+    settings = load_settings(dotenv_path=None, env={})
 
 
 def configure(new: Settings) -> Settings:

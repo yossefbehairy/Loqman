@@ -195,7 +195,7 @@ def fake(tmp_path, monkeypatch):
 
 
 def task(**kw):
-    base = dict(prompt="ping", model_id="claude-sonnet-4-6", session_title="t1", timeout=30)
+    base = dict(prompt="ping", model_id="claude-sonnet-4-6", provider_id="antigravity", session_title="t1", timeout=30)
     base.update(kw)
     return ExecuteAgentTask(**base)
 

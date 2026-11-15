@@ -24,7 +24,7 @@ AgentOS checks behaviour at the boundary a user or a caller sees, prefers real S
 Live checks with real CLIs and accounts are run by hand and are not part of CI.
 
 ### Tier 1: Core Unit Logic
-- **Scope**: output validation, sanitizers, prompt context and workflow state machine transitions.
+- **Scope**: output validation and output sanitizers.
 - **Execution Target**: pytest in `backend/tests/pw/` (`test_context_and_sanitizer.py`, `test_state_machine.py`, `test_validator.py`, `test_output_validation.py`).
 - **Characteristics**: pure logic stays in memory; database tests use temporary SQLite files.
 

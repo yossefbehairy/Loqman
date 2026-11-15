@@ -22,10 +22,8 @@ from backend.pyworker.db.core import Database, ts
 from backend.pyworker.errors import api_error
 from backend.pyworker.orchestration import routing
 from backend.pyworker.orchestration.ceo import (
-    ENGINE_PROVIDERS,
     MISSION_NON_TERMINAL,
     EngineSelectionError,
-    _default_engine_runtime_factory,
     _default_runtime_identity,
     _mission_managers,
     _select_task_runtime,
@@ -37,7 +35,9 @@ from backend.pyworker.orchestration.ceo import (
     transition_task,
 )
 from backend.pyworker.runtime.base import ExecuteAgentTask
+from backend.pyworker.runtime.engine_registry import create_engine_runtime
 from backend.pyworker.runtime.errors import RuntimeErrorBase, safe_error_message
+from backend.pyworker.runtime.providers import ledger_provider
 from backend.pyworker.runtime.ledger import KIND_GREETING, run_agent_task
 from backend.pyworker.validate import bad, check_keys, opt_int, opt_list, opt_str, pagination, req_str
 
@@ -78,7 +78,7 @@ async def preflight_model(ctx, runtime, model_id: str, variant: Optional[str], *
     else on the default engine. "Free only" is the engine's own policy."""
     engine = ((profile.get("engine") if profile else None) or "").strip() or None
     if engine is not None:
-        if engine not in ENGINE_PROVIDERS:
+        if ledger_provider(engine) is None:
             raise api_error(400, f"Unsupported engine '{engine}'.")
         if engine == "mock":
             if settings.RUNTIME_MODE != "mock":
@@ -91,7 +91,7 @@ async def preflight_model(ctx, runtime, model_id: str, variant: Optional[str], *
                 raise api_error(400, str(exc)[:300])
             except Exception:
                 raise api_error(503, f"Engine '{engine}' is unavailable.")
-        label, provider, checked = engine, ENGINE_PROVIDERS[engine], engine
+        label, provider, checked = engine, ledger_provider(engine), engine
     else:
         checked = prefs_mod.default_engine_id()
         rt, label, provider = runtime, None, _default_runtime_identity()[1]
@@ -136,7 +136,7 @@ async def _run_explicit_delegation(ctx, mission_id: str, task_id: str, profile_i
             "Complete the assignment and return the actual deliverable directly.")
         model_id = task["model_id"] or prefs_mod.default_model_id()
         task_runtime, provider_id, engine = resolved or await _select_task_runtime(
-            profile, runtime, ctx.engine_factory or _default_engine_runtime_factory, {}, model_id,
+            profile, runtime, ctx.engine_factory or create_engine_runtime, {}, model_id,
             task["variant"])
         result, _ = await manager.run_mission_task(
             runtime=task_runtime, mission_id=mission_id, task_id=task_id, attempt=1,
