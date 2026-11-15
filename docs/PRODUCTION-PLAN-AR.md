@@ -67,7 +67,7 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 ## سجل التقدم
 
 - [x] P1 — التوجيه (pytest 378، Playwright 68/68، تجربة حقيقية ناجحة)
-- [ ] P2 — تنظيف وتحييد
+- [x] P2 — تنظيف وتحييد (pytest 326، Playwright 68/68، node 36، oxlint 9)
 - [ ] P3 — توصيل وإصلاحات صغيرة
 - [ ] P4 — عقد turns وأحداث
 - [ ] P5 — Claude driver
@@ -88,3 +88,12 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 **تصميم P4 (Codex gpt-6.1-sol).** `docs/DRIVER-CONTRACT-DESIGN.md`: يُراجع قبل بدء P4.
 
 **15 نوفمبر.** الجلسة أُعيد تشغيلها؛ ضاع scratchpad (ومعه مراجعة Codex لـ P1، أُعيد تشغيلها). عمل Codex على Electron انقطع لكنه كان مكتملًا: راجعته الجلسة الرئيسية وصار commit `13bdc04` (مشغّل محصّن من `ELECTRON_RUN_AS_NODE`، فتح الروابط في المتصفح، `agentos:backup-save` عبر preload باسم `saveBackup()`، تحصين worker-client؛ 36 اختبار node). P2 توقف بحد الاستخدام قبل أي تعديل واستُكمل بـ SendMessage.
+
+**مراجعة Codex لـ P1 (gpt-6.1-sol).** تُعالج في P3 بهذا الترتيب:
+- **R-P1-1 (P1):** في وضع mock، `ceo.ask` مع `engine` حقيقي (مثل `claude-code`) يشغّل المحرك الحقيقي عبر `ctx.engine_factory`؛ الحماية في الاتجاه العكسي فقط (`api/ceo.py:135-144`). خطر على الاختبارات. الإصلاح: رفض أي محرك غير mock في وضع mock.
+- **R-P1-3 (P2):** تغيير الافتراضي أثناء مهمة جارية يخلط المحرك والسياسة وتسمية السجل بين المراحل (`orchestration/ceo.py:278-292`). الإصلاح: تثبيت اختيار المحرك/النموذج/المزوّد عند إنشاء المهمة وتمريره لكل المراحل.
+- **R-P1-4 (P2):** استرجاع تفضيل الـ worker عند البدء قد يكتب فوق اختيار أحدث للمستخدم (`useProviders.ts:271-274, 300-334`). الإصلاح: التقاط `choiceSeq` قبل بدء الطلبات الأولى.
+- R-P1-2 و R-P1-5 (workflows و `chat.consult` يفترضان OpenCode): يزولان بحذف الكود في P2؛ يُتحقق من ذلك.
+- ملاحظة: محركات الحسابات لا تحفظ ذاكرة Loqman بين الأسئلة إلا آخر 8 رسائل مقطوعة عند 500 حرف؛ الحل الحقيقي جلسات أصلية (P4–P5).
+
+**P2 (Sonnet 5.5، تمت).** حُذف ~3,500 سطر: `api/chat.py`، محرك الـ workflows، `agy_runtime.py`، أوضاع `RUNTIME_MODE` غير real/mock (رسالة خروج واضحة)، `models.refresh` و`runtime.health` و`ceo.history` و`app.info`، وأنواع الواجهة القديمة. 59 اختبارًا حُذفت مع كودها و9 أضيفت. جدول المحركات الوحيد في `providers.py` والمصنع الوحيد `create_engine_runtime`. بقي: `health` (يستعمله Electron والـ smoke)، `models.free` (محرك mock)، و`approvals.capabilities` يذكر `agy` بدل `antigravity` (P3). R-P1-2 و R-P1-5 زالا بحذف الكود.
