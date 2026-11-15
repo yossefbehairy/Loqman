@@ -464,12 +464,14 @@ async def test_invalid_arguments_and_busy_scope(rig):
     assert err.failure.category == "model_unavailable" and rig.log("prompt") == []
 
 
-def test_routing_is_in_one_place_and_default_off(monkeypatch):
+def test_routing_is_in_one_place_and_default_on(monkeypatch):
     runtime = MockRuntime()
+    monkeypatch.setattr(cd, "default_cli_cmd", lambda: None)
     monkeypatch.delenv(engine_registry.CLAUDE_DRIVER_ENV, raising=False)
+    assert isinstance(engine_registry.create_turn_driver("claude-code", runtime), ClaudeStreamDriver)
+    monkeypatch.setenv(engine_registry.CLAUDE_DRIVER_ENV, "wrapper")
     assert isinstance(engine_registry.create_turn_driver("claude-code", runtime), ExecuteTaskDriver)
     monkeypatch.setenv(engine_registry.CLAUDE_DRIVER_ENV, "stream")
-    monkeypatch.setattr(cd, "default_cli_cmd", lambda: None)
     assert isinstance(engine_registry.create_turn_driver("claude-code", runtime), ClaudeStreamDriver)
     assert isinstance(engine_registry.create_turn_driver("codex", runtime), ExecuteTaskDriver)
     assert isinstance(engine_registry.create_turn_driver("claude-code", runtime, enabled=False), ExecuteTaskDriver)

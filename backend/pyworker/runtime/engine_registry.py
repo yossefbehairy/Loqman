@@ -30,10 +30,20 @@ CLAUDE_DRIVER_ENV = "AGENTOS_CLAUDE_DRIVER"
 
 
 def claude_driver_enabled(env=None) -> bool:
-    """Feature flag for the native Claude stream-json driver. Default OFF; ``AGENTOS_CLAUDE_DRIVER=stream`` enables it."""
+    """Feature flag for the native Claude stream-json driver. Default ON; ``AGENTOS_CLAUDE_DRIVER=wrapper`` (or off/0/false) disables it."""
     import os
     value = (os.environ if env is None else env).get(CLAUDE_DRIVER_ENV, "")
-    return value.strip().lower() in ("stream", "1", "on", "true")
+    return value.strip().lower() not in ("wrapper", "off", "0", "false", "no", "legacy")
+
+
+CODEX_DRIVER_ENV = "AGENTOS_CODEX_DRIVER"
+
+
+def codex_driver_enabled(env=None) -> bool:
+    """Feature flag for the native Codex app-server driver. Default OFF; ``AGENTOS_CODEX_DRIVER=appserver`` enables it."""
+    import os
+    value = (os.environ if env is None else env).get(CODEX_DRIVER_ENV, "")
+    return value.strip().lower() in ("appserver", "app-server", "1", "on", "true")
 
 
 def create_turn_driver(engine_id: str, runtime: AgentRuntime, *, legacy_task=None, db=None, conversation_id=None,
@@ -47,5 +57,13 @@ def create_turn_driver(engine_id: str, runtime: AgentRuntime, *, legacy_task=Non
             sessions = SessionRepository(db)
             resume_check = conversation_resume_check(db, conversation_id, run_id)
         return ClaudeStreamDriver(sessions=sessions, resume_prompt=resume_prompt, resume_check=resume_check)
+    if engine_id == "codex" and codex_driver_enabled():
+        from backend.pyworker.runtime.codex_driver import CodexAppServerDriver, conversation_resume_check
+        sessions = resume_check = None
+        if db is not None and conversation_id:
+            from backend.pyworker.runtime.sessions import SessionRepository
+            sessions = SessionRepository(db)
+            resume_check = conversation_resume_check(db, conversation_id, run_id)
+        return CodexAppServerDriver(sessions=sessions, resume_prompt=resume_prompt, resume_check=resume_check)
     from backend.pyworker.runtime.execute_driver import ExecuteTaskDriver
     return ExecuteTaskDriver(runtime, engine_id, legacy_task=legacy_task)

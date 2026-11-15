@@ -115,9 +115,9 @@ Windows job, grandchild, worker-death and taskkill tests are Windows-only.
 
 ## P5 Claude stream-json driver (feature flag)
 
-`runtime/claude_driver.py` is a native `TurnDriver` for engine `claude-code`. It is OFF by default; set
-`AGENTOS_CLAUDE_DRIVER=stream` in the worker's environment (before it starts) to route Claude conversation and
-mission runs through it. Routing lives only in `engine_registry.create_turn_driver`; when off, `ExecuteTaskDriver`
+`runtime/claude_driver.py` is a native `TurnDriver` for engine `claude-code`. It is ON by default since P8
+(the chat UI renders its stream); set `AGENTOS_CLAUDE_DRIVER=wrapper` (also off/0/false) in the worker's environment
+(before it starts) to route Claude conversation and mission runs through the wrapper instead. Routing lives only in `engine_registry.create_turn_driver`; when off, `ExecuteTaskDriver`
 wraps `ClaudeCodeRuntime` exactly as before. CEO/Loqman calls still use the wrapper in P5.
 
 Launch (one supervised process per turn, prompt written as one stream-json user frame on stdin):
@@ -157,6 +157,23 @@ embedded credentials). No API keys or tokens. The legacy `ClaudeCodeRuntime` use
 Interrupt: the stream-json input has no established graceful interrupt, so `interrupt` kills the owned tree (Job
 Object) and settles one cancelled terminal; `exit_grace_s` bounds the wait for a clean exit after `result`
 (a CLI that ignores stdin close is killed). Tests: `backend/tests/pw/test_claude_driver.py` (fake CLI only).
+
+### Codex app-server driver (P6)
+
+`runtime/codex_driver.py` is a native `TurnDriver` for engine `codex` over `codex app-server` (stdio JSON-RPC,
+experimental protocol, schema checked with `codex app-server generate-json-schema`, codex-cli 0.167.0). It is OFF by
+default: set `AGENTOS_CODEX_DRIVER=appserver` in the worker's environment to route Codex runs through it (anything else
+keeps the `codex exec` adapter). One owned process per turn: `initialize`, `initialized`, `thread/start` or
+`thread/resume`, `turn/start`, then notifications until `turn/completed`. Permission level is unchanged: `-c
+approval_policy="never"`, `sandbox` `read-only` and `sandboxPolicy` `readOnly` on thread and turn, every approval or
+question request from the server is denied with a `permission_denied` notice. Same environment allowlist
+(`child_env`, `CODEX_HOME` kept, `OPENAI_API_KEY`/`CODEX_API_KEY` only with `allow_api_key_env`), same model id and
+effort validation (`ultra` refused). Conversation scopes persist the thread id in `runtime_sessions` (protocol
+`codex-app-server`) and send only the incremental prompt on resume when the stored thread saw the latest successful
+turn; a refused `thread/resume` (missing thread, before submission) is rebuilt once from the full prompt with a
+`session_rebuilt` notice. CEO/mission scopes use an ephemeral thread. Interrupt sends `turn/interrupt`, then kills the
+tree after `interrupt_grace_s`. Prompts over 24000 chars are refused (the legacy adapter truncated). Tests:
+`backend/tests/pw/test_codex_driver.py` (fake app-server only).
 
 ## Run
 ```powershell
