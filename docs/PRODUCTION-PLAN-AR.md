@@ -68,8 +68,9 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 
 - [x] P1 — التوجيه (pytest 378، Playwright 68/68، تجربة حقيقية ناجحة)
 - [x] P2 — تنظيف وتحييد (pytest 326، Playwright 68/68، node 36، oxlint 9)
-- [ ] P3 — توصيل وإصلاحات صغيرة
-- [ ] P4 — عقد turns وأحداث
+- [x] P3 — توصيل وإصلاحات صغيرة (commits `b1331d8`، `f459b91`)
+- [x] P4 — عقد turns وأحداث (commit `2758cd9`؛ pytest 373، Playwright 78/78)
+- [ ] S — إصلاحات أمنية من مراجعتي Grok (worker: S1–S9؛ Electron: E1–E7)
 - [ ] P5 — Claude driver
 - [ ] P6 — Codex driver
 - [ ] P7 — نواة ACP
@@ -99,3 +100,28 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 **P2 (Sonnet 5.5، تمت).** حُذف ~3,500 سطر: `api/chat.py`، محرك الـ workflows، `agy_runtime.py`، أوضاع `RUNTIME_MODE` غير real/mock (رسالة خروج واضحة)، `models.refresh` و`runtime.health` و`ceo.history` و`app.info`، وأنواع الواجهة القديمة. 59 اختبارًا حُذفت مع كودها و9 أضيفت. جدول المحركات الوحيد في `providers.py` والمصنع الوحيد `create_engine_runtime`. بقي: `health` (يستعمله Electron والـ smoke)، `models.free` (محرك mock)، و`approvals.capabilities` يذكر `agy` بدل `antigravity` (P3). R-P1-2 و R-P1-5 زالا بحذف الكود.
 
 **P3 — نصف الـ worker (Codex gpt-6.1-terra، commit `b1331d8`).** الجلسة الرئيسية شغّلت الاختبارات: 332 ناجح؛ الستة الجديدة في `test_worker_regressions.py` تفشل على الكود القديم وتنجح بعد الإصلاح. اختبار قديم كان يثبّت «أول نموذج مجاني» عُدّل ليثبّت «نموذج مجاني». نصف الواجهة (Sonnet) جارٍ. P4 بدأ بالتوازي على الـ worker (Codex gpt-6.1-sol).
+
+**P3 (تمت).** الواجهة: زر النسخ الاحتياطي، إلغاء المهمة، تقدّم Loqman، إخفاء «CEO history» الفارغة، لا وميض عند الفتح، وإصلاح سباق الاسترجاع. 10 اختبارات e2e.
+**P4 (Codex gpt-6.1-sol + إصلاح Sonnet).** Codex كتب الطبقة دون تشغيل اختبارات؛ الجلسة الرئيسية شغّلتها فظهر تعليق عند الإغلاق مع محرك يتجاهل الإلغاء (الغلاف ينتظر بلا حد)؛ Sonnet جعل الانتظار محدودًا (`cancel_grace_s`) مع اختبار يفشل قبل الإصلاح. ترقية v18 جُرّبت على **نسخة** من قاعدة المستخدم الحقيقية (v17، 4 profiles، 5 رسائل، 4 usage): البيانات مطابقة، نسخة احتياطية `pre-v18` أُنشئت، التشغيل الثاني لا يغيّر شيئًا؛ النسخة المؤقتة حُذفت.
+
+## S — مراجعة Grok الأمنية (حساب المستخدم، 15 نوفمبر)
+
+**الـ worker:**
+- S1 (P1): استرجاع نسخة احتياطية متلاعب بها (triggers، مسارات workspace مثل `C:\`، صفوف `publishing`) يغيّر جذر العمل ويوافق تلقائيًا على الكتابة (`core/backup.py:117`، `workspace_writes.py:97`، `workspace_fs.py:102`).
+- S2 (P1): Codex يرث بيئة الـ worker ويملك shell مع نصوص ملفات غير موثوقة في الـ prompt (`codex_runtime.py:182, 326`).
+- S3 (P2): Antigravity بنفس المشكلة (`agy_acp_runtime.py:272, 483`).
+- S4 (P2): OpenCode يضع الـ prompt كله في سطر الأوامر (`opencode_runtime.py:179-185`) — يُحل في P7 مع ACP.
+- S5 (P2): Claude يشغّل hooks المستخدم ويرث البيئة (`claude_runtime.py:151, 257`) — يُحل في P5.
+- S6 (P2): نشر التقرير: فحص المسار ثم الإنشاء بالمسار (TOCTOU/junction) و`os.link` يتبع الروابط (`workspace_writes.py:62`).
+- S7 (P2): Chromium الآلي بمنفذ debugging بلا token، و`browser_open` يقبل loopback والشبكات الخاصة (`browser.py:116, 175`).
+- S8 (P3): hardlinks داخل الـ workspace تُقرأ كملفات عادية (`workspace_fs.py:109`، `skills_fs.py:164`).
+- S9 (P3): ملفات مؤقتة للتقرير وللنسخة الاحتياطية تبقى بعد crash؛ مجلد النسخة بلا ACL خاص على Windows؛ نقرة `computer_click` عامة بعد فحص منفصل (`computer.py:157`).
+
+**Electron:**
+- E1 (P2): `window.agentos.call` يمرر أي method تقريبًا (workspaces.create، artifacts.content، approvals.decide، engines.open_setup).
+- E2 (P2): ردود النماذج تحمّل صورًا خارجية تلقائيًا (تسريب عبر prompt injection) (`ChatMarkdown.tsx:360`).
+- E3 (P2): لا CSP في التطبيق المثبّت، والخطوط من Google عند كل تشغيل (`index.html:7`).
+- E4 (P2): لا توقيع للمثبّت ولا updater (`package.json` build) — يحتاج شهادة من صاحب المشروع.
+- E5 (P3): DevTools في القائمة حتى في النسخة المثبّتة (`main.cjs:368`).
+- E6 (P3): المثبّت يضم `electron/*.test.cjs`.
+- E7 (P3): لا `setPermissionRequestHandler`.
