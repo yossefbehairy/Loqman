@@ -75,6 +75,68 @@ async function openDrawerIfNarrow(page: Page) {
 
 const MOCK_REPLY = /Mock task execution succeeded/;
 
+test('model images never fetch remote URLs and local images still render', async ({ page }) => {
+  const remote = 'https://example.com/model-tracker.png?secret=test';
+  const reply = `![Remote image](${remote})\n\n![Local image](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=)`;
+  const conversation = { id: 'image-test', title: 'Images', profile_id: null, created_at: '2026-11-15T00:00:00Z', updated_at: '2026-11-15T00:00:00Z' };
+  let created = false;
+  let answered = false;
+  const requests: string[] = [];
+  page.on('request', (request) => { if (request.url() === remote) requests.push(request.url()); });
+  await page.route('https://example.com/**', (route) => route.abort());
+  await page.route('**/__agentos/call', (route) => {
+    const { method, params } = reqOf(route);
+    const empty = { profiles: [], conversations: [], messages: [], missions: [], approvals: [], actions: [], runs: [], models: [{ id: 'mock', name: 'Mock' }] };
+    if (method === 'engines.status') return okJson(route, { engines: [] });
+    if (method === 'engines.capabilities') return okJson(route, { mock: { conversation_runs: true } });
+    if (method === 'preferences.get') return okJson(route, { engine: 'mock', model_id: 'mock' });
+    if (method === 'conversations.create') { created = true; return okJson(route, conversation); }
+    if (method === 'conversations.list') return okJson(route, { conversations: created ? [conversation] : [] });
+    if (method === 'conversations.messages') return okJson(route, { messages: answered ? [{ seq: 1, conversation_id: conversation.id, role: 'assistant', content: reply, created_at: conversation.created_at }] : [] });
+    if (method === 'conversations.add_message') return okJson(route, { ...params, seq: 1 });
+    return okJson(route, empty);
+  });
+  await page.route('**/__agentos/call', (route) => {
+    if (reqOf(route).method === 'ceo.ask') { answered = true; return okJson(route, {
+      reply,
+      actions_proposed: [], agents_created: [], iterations: 1, fast: true,
+    }); }
+    return route.fallback();
+  });
+  await openBare(page);
+  const box = page.getByRole('textbox', { name: 'Message Loqman' });
+  await box.fill('Show the image');
+  await box.press('Enter');
+  const link = page.getByRole('link', { name: 'Remote image', exact: true });
+  await expect(link).toHaveAttribute('href', remote);
+  await expect(link).toHaveAttribute('target', '_blank');
+  await expect(page.locator('.chat-md img')).toHaveCount(1);
+  await expect(page.getByRole('img', { name: 'Local image', exact: true })).toHaveAttribute('src', /^data:image\//);
+  expect(requests).toEqual([]);
+});
+
+test('startup loads self-hosted fonts without external network requests or CSP violations', async ({ page }) => {
+  const external: string[] = [];
+  page.on('request', (request) => {
+    if (/^https?:/.test(request.url()) && new URL(request.url()).hostname !== '127.0.0.1') external.push(request.url());
+  });
+  await page.addInitScript(() => {
+    (window as unknown as { cspViolations: string[] }).cspViolations = [];
+    document.addEventListener('securitypolicyviolation', (event) => {
+      (window as unknown as { cspViolations: string[] }).cspViolations.push(event.violatedDirective);
+    });
+  });
+  await openBare(page);
+  const loaded = await page.evaluate(async () => {
+    // The families styles.css actually names (Manrope and JetBrains Mono were only in the old Google link).
+    const fonts = ['Inter', 'Poppins', 'Plus Jakarta Sans'];
+    return Promise.all(fonts.map(async (font) => (await document.fonts.load(`500 16px "${font}"`)).length > 0));
+  });
+  expect(external).toEqual([]);
+  expect(await page.evaluate(() => (window as unknown as { cspViolations: string[] }).cspViolations)).toEqual([]);
+  expect(loaded).toEqual([true, true, true]);
+});
+
 test.describe('look and layout match RuseBot 0.1.127', () => {
   test('wide window: sidebar, composer, bubbles and fonts', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });

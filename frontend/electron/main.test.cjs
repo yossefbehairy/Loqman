@@ -8,11 +8,11 @@ const vm = require('node:vm');
 
 const flush = () => new Promise(setImmediate);
 
-function runtime({ lock = true, ready = Promise.resolve(), saveBackup = async () => ({ saved: true }) } = {}) {
+function runtime({ lock = true, isPackaged = false, ready = Promise.resolve(), saveBackup = async () => ({ saved: true }) } = {}) {
   const windows = [], workers = [], timers = [], handlers = {};
   const app = new EventEmitter();
   Object.assign(app, {
-    isPackaged: false, setAppUserModelId() {}, setName() {}, getPath: (name) => `/user/${name}`,
+    isPackaged, setAppUserModelId() {}, setName() {}, getPath: (name) => `/user/${name}`,
     requestSingleInstanceLock: () => lock, whenReady: () => Promise.resolve(),
     quit() { this.quits = (this.quits || 0) + 1; },
   });
@@ -49,7 +49,8 @@ function runtime({ lock = true, ready = Promise.resolve(), saveBackup = async ()
     clearTimeout() {},
     require(name) {
       if (name === 'electron') return {
-        app, BrowserWindow: Window, Menu: { buildFromTemplate() {}, setApplicationMenu() {} },
+        app, BrowserWindow: Window, Menu: { buildFromTemplate(template) { app.menu = template; }, setApplicationMenu() {} },
+        session: { defaultSession: { setPermissionCheckHandler() {}, setPermissionRequestHandler() {}, webRequest: { onHeadersReceived() {} } } },
         dialog: { showSaveDialog: async () => ({}), showMessageBox: async () => ({ response: 1 }), showErrorBox() {} },
         shell: { openExternal: async () => {} }, ipcMain: { handle(name, fn) { handlers[name] = fn; } },
       };
@@ -67,6 +68,60 @@ test('a second process does not start a worker or register IPC', async () => {
   assert.equal(r.app.quits, 1);
   assert.equal(r.workers.length, 0);
   assert.equal(Object.keys(r.handlers).length, 0);
+});
+
+test('renderer RPC rejects syntactically valid methods outside its UI allowlist', async () => {
+  const r = runtime(); await flush();
+  const sender = r.windows[1].webContents;
+  for (const method of ['workspaces.create', 'artifacts.content', 'future.dangerous', 'health']) {
+    await assert.rejects(r.handlers['agentos:call']({ sender }, method, {}), /method.*not allowed/i);
+  }
+  assert.equal(r.workers[0].calls.length, 0);
+});
+
+test('DevTools menu is available only in development', async () => {
+  for (const isPackaged of [false, true]) {
+    const r = runtime({ isPackaged }); await flush();
+    assert.equal(JSON.stringify(r.app.menu).includes('toggleDevTools'), !isPackaged);
+  }
+});
+
+test('every literal renderer transport call is allowed; dynamic calls require review', async () => {
+  const ts = require('typescript');
+  const root = path.resolve(__dirname, '../src');
+  const methods = new Set();
+  function scan(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) { scan(file); continue; }
+      if (!/\.tsx?$/.test(file)) continue;
+      const source = ts.createSourceFile(file, fs.readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+      function visit(node) {
+        if (ts.isCallExpression(node) && (node.expression.getText(source) === 'call' ||
+            /^(?:window\.)?agentos\.call$/.test(node.expression.getText(source)))) {
+          assert.ok(node.arguments[0] && ts.isStringLiteralLike(node.arguments[0]), `Dynamic RPC in ${file}`);
+          methods.add(node.arguments[0].text);
+        }
+        ts.forEachChild(node, visit);
+      }
+      visit(source);
+    }
+  }
+  scan(root);
+  assert.ok(methods.size > 40);
+  const mainSource = ts.createSourceFile('main.cjs', fs.readFileSync(path.join(__dirname, 'main.cjs'), 'utf8'), ts.ScriptTarget.Latest, true);
+  let allowlist;
+  function findAllowlist(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(mainSource) === 'RENDERER_METHODS') {
+      allowlist = new Set(node.initializer.arguments[0].elements.map((item) => item.text));
+    }
+    ts.forEachChild(node, findAllowlist);
+  }
+  findAllowlist(mainSource);
+  assert.deepEqual(allowlist, methods, 'Keep the allowlist exactly aligned with reviewed UI call sites');
+  const r = runtime(); await flush();
+  for (const method of methods) await r.handlers['agentos:call']({ sender: r.windows[1].webContents }, method, {});
+  assert.deepEqual(new Set(r.workers[0].calls.map(([method]) => method)), methods);
 });
 
 test('second instance focuses the existing window without spawning another worker', async () => {

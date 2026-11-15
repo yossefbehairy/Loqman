@@ -1,5 +1,7 @@
 # Windows release procedure
 
+E4 remains owner-blocked: provide a Windows code-signing certificate/private-key service and protected signing credentials for the app and NSIS installer, with timestamping. Before adding an updater, provide a trusted update publishing endpoint and configure signed-update verification. No signing credentials or updater are configured by this security fix.
+
 Run these steps from a Windows checkout after concurrent backend and frontend edits are finished. Do not package a worker built from an earlier source state.
 
 1. Install Python 3.13, Node.js and npm, and the tooling needed by electron-builder for Windows. The repository uses Node 22 in CI. From the repository root, prepare the backend environment and install frontend dependencies:

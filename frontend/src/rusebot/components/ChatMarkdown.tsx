@@ -7,7 +7,7 @@
  */
 import { memo, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { HighlighterCore } from 'shiki/core';
-import Markdown, { type Components } from 'react-markdown';
+import Markdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -273,6 +273,12 @@ function blockText2(children: HastNode[] | undefined): string {
 }
 
 const MARKDOWN_COMPONENTS: Components = {
+  img({ src, alt }) {
+    if (typeof src === 'string' && /^(?:data:image\/|blob:)/i.test(src)) {
+      return <img src={src} alt={alt ?? ''} />;
+    }
+    return <a href={src} target="_blank" rel="noreferrer" className="text-accent underline">{alt || src || 'Image'}</a>;
+  },
   pre: MarkdownCode,
   code({ children }: { children?: ReactNode }) {
     return (
@@ -357,7 +363,8 @@ function ChatMarkdownComponent({ text }: { text: string }) {
   const rehype = useMemo(() => (MATH.test(text) ? [rehypeKatex] : []), [text]);
   return (
     <div className="chat-md min-w-0 [&>*+*]:mt-2">
-      <Markdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={rehype} components={MARKDOWN_COMPONENTS}>
+      <Markdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={rehype} components={MARKDOWN_COMPONENTS}
+        urlTransform={(url, key, node) => node.tagName === 'img' && key === 'src' && /^(?:data:image\/|blob:)/i.test(url) ? url : defaultUrlTransform(url)}>
         {text}
       </Markdown>
     </div>

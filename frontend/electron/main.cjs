@@ -4,14 +4,32 @@
 // every file under electron/ must use the .cjs extension.
 'use strict';
 
-const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, ipcMain, session } = require('electron');
 const path = require('node:path');
 const { WorkerClient, workerCommand, METHOD_RE } = require('./worker-client.cjs');
 const { guardNavigation } = require('./navigation.cjs');
 const { saveBackup } = require('./backup.cjs');
+const { configureSession } = require('./security.cjs');
 const fs = require('node:fs/promises');
 
 const isDev = !app.isPackaged;
+
+// Explicit renderer capabilities. Source-call coverage lives in main.test.cjs.
+const RENDERER_METHODS = new Set([
+  'approvals.decide', 'approvals.list',
+  'ceo.actions', 'ceo.approve', 'ceo.ask', 'ceo.ask_progress', 'ceo.deny',
+  'conversations.add_message', 'conversations.bind_profile', 'conversations.create',
+  'conversations.import_ceo', 'conversations.list', 'conversations.messages',
+  'deliverables.content', 'deliverables.create', 'deliverables.decide',
+  'deliverables.get', 'deliverables.list', 'deliverables.list_all',
+  'engines.capabilities', 'engines.check', 'engines.models', 'engines.open_setup',
+  'engines.setup', 'engines.status', 'engines.test',
+  'missions.cancel', 'missions.create', 'missions.delegate', 'missions.list',
+  'models.free', 'preferences.get', 'preferences.set_default',
+  'profiles.create', 'profiles.delete', 'profiles.list', 'profiles.update',
+  'runs.cancel', 'runs.events', 'runs.get', 'runs.list', 'runs.start_turn',
+  'usage.summary',
+]);
 
 app.setAppUserModelId('app.loqman.desktop');
 // Keep userData deterministic across dev and packaged builds: %APPDATA%\Loqman
@@ -142,8 +160,8 @@ function registerIpc() {
   ipcMain.handle('agentos:call', async (event, method, params) => {
     if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
     if (typeof method !== 'string' || !METHOD_RE.test(method) ||
-        method === 'shutdown' || method.startsWith('backup.') || method.startsWith('stream.')) {
-      throw new Error('Invalid method');
+        !RENDERER_METHODS.has(method)) {
+      throw new Error('Invalid method: renderer method is not allowed');
     }
     if (!worker) throw new Error('Backend is not running');
     try {
@@ -363,10 +381,10 @@ function buildMenu() {
         { role: 'quit' },
       ],
     },
-    {
+    ...(isDev ? [{
       label: 'View',
       submenu: [{ role: 'toggleDevTools' }],
-    },
+    }] : []),
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -541,7 +559,14 @@ if (!hasSingleInstanceLock) {
   });
 
   registerIpc();
-  app.whenReady().then(boot);
+  app.whenReady().then(() => {
+    configureSession(session.defaultSession, {
+      isPackaged: app.isPackaged,
+      rendererFile: path.join(__dirname, '..', 'dist', 'index.html'),
+      getMainContents: () => mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    });
+    return boot();
+  });
 
   app.on('window-all-closed', () => {
     console.error('[exit-trace] window-all-closed firing (all windows are gone)');
