@@ -70,8 +70,8 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 - [x] P2 — تنظيف وتحييد (pytest 326، Playwright 68/68، node 36، oxlint 9)
 - [x] P3 — توصيل وإصلاحات صغيرة (commits `b1331d8`، `f459b91`)
 - [x] P4 — عقد turns وأحداث (commit `2758cd9`؛ pytest 373، Playwright 78/78)
-- [ ] S — إصلاحات أمنية من مراجعتي Grok (worker: S1–S9؛ Electron: E1–E7)
-- [ ] P5 — Claude driver
+- [x] S — إصلاحات أمنية من مراجعتي Grok (commits `13bdc04`...`13a5b4d` worker، `0491896` Electron؛ S4 في P7، E4 يحتاج شهادة المالك)
+- [x] P5 — Claude driver (commit `e628767`؛ pytest 423، تجربة حقيقية ناجحة؛ مطفأ افتراضيًا حتى P8)
 - [ ] P6 — Codex driver
 - [ ] P7 — نواة ACP
 - [ ] P8 — الواجهة: بث و Stop
@@ -125,3 +125,7 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 - E5 (P3): DevTools في القائمة حتى في النسخة المثبّتة (`main.cjs:368`).
 - E6 (P3): المثبّت يضم `electron/*.test.cjs`.
 - E7 (P3): لا `setPermissionRequestHandler`.
+
+**S (تمت).** worker: Codex كتب الإصلاحات دون تشغيل اختبارات (40 فشلًا، منها كسر خيار مفتاح API الاختياري)؛ Sonnet أصلحها وأكملها: 22 من 27 اختبارًا جديدًا تفشل على الكود القديم. حدود باقية: إعادة توجيه DNS في المتصفح الآلي، نافذة ضيقة في نشر التقرير تُكتشف وتُلغى ولا تُمنع، ACL مجلد النسخة الاحتياطية بلا اختبار. Electron: قائمة 43 method، CSP، خطوط محلية (Inter و Poppins و Plus Jakarta Sans، صحّحت الجلسة الرئيسية اختبار Codex الذي كان يبحث عن خطوط غير مستعملة)، لا صور خارجية، DevTools للتطوير فقط، رفض الصلاحيات. Playwright 80/80.
+
+**P5 (Sonnet، تمت).** `ClaudeStreamDriver` خلف `AGENTOS_CLAUDE_DRIVER=stream`. تجربة حقيقية ببيانات معزولة: الرسالة الثانية استكملت الجلسة الأصلية (`resumed: true`) وتذكرت كلمة من الأولى، ردّ طويل بُثّ في 182 حدث `content.delta`، الإلغاء أوقفه. عمليات `claude.exe` التي ظهرت بعد التجربة كانت تابعة لإضافة VS Code لا للتطبيق. يُفعَّل افتراضيًا في P8 بعد أن تعرض الواجهة البث.
