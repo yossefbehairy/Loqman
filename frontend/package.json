@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "test": "playwright test",
     "test:e2e": "playwright test",
-    "desktop": "npm run build && electron .",
+    "desktop": "npm run build && node electron/launch.cjs .",
     "desktop:dist": "npm run build && electron-builder --win --x64"
   },
   "dependencies": {

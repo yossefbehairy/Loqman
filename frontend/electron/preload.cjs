@@ -47,6 +47,13 @@ function unwrap(error) {
 }
 
 contextBridge.exposeInMainWorld('agentos', {
+  saveBackup: async () => {
+    try {
+      return await ipcRenderer.invoke('agentos:backup-save');
+    } catch (error) {
+      throw unwrap(error);
+    }
+  },
   call: async (method, params) => {
     try {
       return await ipcRenderer.invoke('agentos:call', method, params || {});

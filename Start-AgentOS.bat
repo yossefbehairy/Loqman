@@ -4,6 +4,7 @@ REM  AgentOS Launcher — double-click this file to open the app.
 REM  Prefers the portable build, falls back to an installed copy.
 REM ============================================================
 setlocal
+set "ELECTRON_RUN_AS_NODE="
 
 REM Run the current project when its dependencies are installed.
 if exist "%~dp0frontend\node_modules\electron\dist\electron.exe" if exist "%~dp0backend\.venv\Scripts\python.exe" (

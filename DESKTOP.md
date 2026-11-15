@@ -56,6 +56,10 @@ npm run desktop
 
 With `AGENTOS_DEV_SERVER_URL` set, Electron loads the Vite server. Otherwise `npm run desktop` builds and loads the local `dist` files. Electron spawns the worker with the venv Python (`python -m backend.pyworker --data-dir <userData>`) and talks to it over stdin/stdout.
 
+`npm run desktop` uses `electron/launch.cjs`, which removes inherited `ELECTRON_RUN_AS_NODE` before spawning Electron (including VS Code terminals). `Start-AgentOS.bat` also clears it for packaged and installed copies. `desktop:dist` only packages the app; it does not launch Electron.
+
+External HTTP/HTTPS links open in the default browser. Popup windows and renderer navigation away from the app are blocked; other URL schemes are not opened.
+
 For plain-browser development just run `npm run dev`: a serve-only Vite plugin (`frontend/vite-agentos-bridge.mjs`) spawns the same worker (`RUNTIME_MODE` from the environment, default mock; data in `.agentos-dev-data`).
 
 ---
@@ -118,10 +122,27 @@ Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` 
 
 **Preload bridge:** `electron/preload.cjs` exposes exactly two globals via `contextBridge` (context isolation ON, node integration OFF):
 
-- `window.agentos` — `call(method, params)` and `openStream(topic, id, lastEventId, onMessage)`
+- `window.agentos` — `call(method, params)`, `openStream(topic, id, lastEventId, onMessage)`, and `saveBackup()`
 - `window.__AGENTOS_DESKTOP__` — `true`
 
 Any new frontend backend call must go through `call` from `frontend/src/api/transport.ts` (typed wrappers live in `frontend/src/rusebot/data/worker.ts`); event streams use `openStream`.
+
+**Desktop backup:** call `window.agentos.saveBackup()` with no arguments. It returns
+`Promise<{ saved: boolean, path?: string, size?: number, cancelled?: boolean }>`:
+success is `{ saved: true, path, size }`; cancel is `{ saved: false, cancelled: true }`.
+Errors reject using the existing bridge JSON error-message format (`status`, `detail`).
+The native Save dialog defaults to the worker's backup filename in Documents. Only the
+worker-created source is copied, then `backup.cleanup` is attempted even on cancellation
+or a copy/dialog error. A failed create has no returned path to clean; worker death can
+prevent cleanup. Cleanup failures reject (an earlier copy/dialog error takes precedence).
+Generic `call()` rejects `backup.*`, `stream.*`, and `shutdown`; use the dedicated bridge APIs.
+Renderer TypeScript declarations/UI wiring are maintained separately from the desktop shell.
+
+Worker startup errors and crashes reject pending requests; shutdown is bounded and repeat
+quit requests wait for it. Stream ownership is checked on close and released on renderer
+reload, crash, or destruction. A second launch focuses the active window and cannot reboot
+the app during shutdown. The existing three-second window fallback closes the splash if
+`ready-to-show` never arrives.
 
 ---
 
