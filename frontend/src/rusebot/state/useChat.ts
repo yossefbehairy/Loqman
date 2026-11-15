@@ -3,6 +3,8 @@ import {
   CEO_PROFILE_ID,
   bindConversationProfile,
   askCeo,
+  ceoAskProgress,
+  type CeoProgress,
   cancelRun,
   createConversation,
   decideApproval,
@@ -48,6 +50,29 @@ const KEY_AGENTS = 'agentos.rusebot.convAgents.v1';
 
 /** ceo.ask refuses longer questions (backend/pyworker/api/ceo.py), so refuse them before anything is saved. */
 export const CEO_MAX_CHARS = 2000;
+
+/** The conversation the legacy import creates for old CEO exchanges; hidden while it has nothing in it. */
+const CEO_HISTORY_ID = 'legacy-ceo-history';
+const CEO_PROGRESS_MS = 1500;
+
+/** One short line for the pending reply area, from what ceo.ask_progress reports. */
+export function progressText(p: CeoProgress): string | null {
+  const step = p.iteration > 1 ? ` (step ${p.iteration})` : '';
+  switch (p.stage) {
+    case 'starting':
+      return 'Starting';
+    case 'fast':
+      return 'Answering';
+    case 'thinking':
+      return `Thinking${step}`;
+    case 'tool':
+      return p.detail ? `Using ${p.detail.slice(0, 40)}${step}` : `Working${step}`;
+    case 'final':
+      return 'Writing the answer';
+    default:
+      return null;
+  }
+}
 
 export const CONTRACT_OPEN = '[[contract]]';
 export const CONTRACT_CLOSE = '[[/contract]]';
@@ -123,6 +148,8 @@ export interface ChatState {
   select: (id: string | null) => void;
   messages: ConvMessage[];
   pendingUser: string | null;
+  /** What Loqman is doing right now in the selected chat, while he answers; null otherwise. */
+  progress: string | null;
   run: RunState | null;
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
@@ -162,6 +189,15 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
   const [messages, setMessages] = useState<ConvMessage[]>([]);
   const [pendingUser, setPendingUser] = useState<string | null>(null);
+  const [ceoStep, setCeoStep] = useState<{ cid: string; text: string } | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const historyUsed = useRef(false);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
   const [runsBySeq, setRunsBySeq] = useState<Record<number, RunSnapshot>>({});
   const [approvals, setApprovals] = useState<Approval[]>([]);
@@ -191,9 +227,22 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
 
-  const refreshConversations = useCallback(async () => {
-    setConversations(await listConversations());
+  /** The CEO history conversation is hidden while it is empty (it is created for every user by the import). Nothing is deleted. */
+  const withoutEmptyHistory = useCallback(async (list: Conversation[]) => {
+    const history = list.find((c) => c.id === CEO_HISTORY_ID);
+    if (!history || historyUsed.current) return list;
+    const msgs = await listMessages(history.id).catch(() => null);
+    if (msgs === null) return list;
+    if (msgs.length > 0) {
+      historyUsed.current = true;
+      return list;
+    }
+    return list.filter((c) => c.id !== history.id);
   }, []);
+
+  const refreshConversations = useCallback(async () => {
+    setConversations(await withoutEmptyHistory(await listConversations()));
+  }, [withoutEmptyHistory]);
 
   const loadThread = useCallback(async (conversationId: string) => {
     const list = await listMessages(conversationId);
@@ -275,7 +324,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     (async () => {
       try {
         await importLegacyCeo().catch(() => undefined);
-        const list = await listConversations();
+        const all0 = await listConversations();
+        const list = await withoutEmptyHistory(all0);
         if (!alive) return;
         setConversations(list);
         const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -314,7 +364,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       for (const handle of open.values()) handle.close();
       open.clear();
     };
-  }, [follow]);
+  }, [follow, withoutEmptyHistory]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -414,6 +464,21 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           setPendingUser(prompt);
           clearDraft();
           setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'running', error: null } }));
+          // Ask the worker where the answer has got to. One request at a time; it ends with the ask, a chat switch or unmount.
+          let polling = true;
+          void (async () => {
+            while (polling) {
+              await new Promise((r) => window.setTimeout(r, CEO_PROGRESS_MS));
+              if (!polling || !mounted.current || selectedRef.current !== conversationId) return;
+              const p = await ceoAskProgress(ticket).catch(() => null);
+              if (!polling || !mounted.current || selectedRef.current !== conversationId) return;
+              if (p) {
+                const text = progressText(p);
+                if (text) setCeoStep({ cid: conversationId, text });
+                if (p.done) return;
+              }
+            }
+          })();
           try {
             // The worker stores both sides of the exchange in this chat (the question before generating, the
             // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
@@ -427,6 +492,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
               return next;
             });
           } finally {
+            polling = false;
+            setCeoStep(null);
             setPendingUser(null);
             setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'succeeded', error: null } }));
             await refreshConversations().catch(() => undefined);
@@ -584,6 +651,7 @@ ${prompt}`;
     select,
     messages,
     pendingUser,
+    progress: ceoStep && ceoStep.cid === selectedId && currentRun && !isTerminal(currentRun.status) ? ceoStep.text : null,
     run: currentRun,
     runsBySeq,
     approvals,

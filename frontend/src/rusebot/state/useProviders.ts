@@ -184,9 +184,12 @@ export function validModelFor(engine: string, list: EngineModel[]): string | und
 
 /** Bumped on every change of the choice. Anything that awaited before changing it checks that it still holds. */
 let choiceSeq = 0;
+/** Bumped only when the user (or a Settings action) chooses; automatic reconciliation does not count. */
+let userChoiceSeq = 0;
 
 export function setProviderChoice(next: EngineChoice): void {
   choiceSeq += 1;
+  userChoiceSeq += 1;
   const preferred = next.model ? { ...snap.preferred, [next.engine]: next.model } : snap.preferred;
   patch({ choice: next, preferred });
   writeJson(KEY_ENGINE, next);
@@ -211,6 +214,7 @@ export async function saveDefaultProvider(next: EngineChoice): Promise<void> {
 /** Switch provider; the model becomes that provider's preferred one (or its first). The last request wins. */
 export async function selectProviderEngine(engine: string): Promise<void> {
   const ticket = ++choiceSeq;
+  userChoiceSeq += 1;
   const list = await loadProviderModels(engine);
   if (ticket !== choiceSeq) return;
   setProviderChoice({ engine, model: modelFor(engine, list) });
@@ -262,15 +266,19 @@ async function reconcileChoice(): Promise<void> {
   }
 }
 
-/** The worker's saved default replaces a remembered choice, once, if it is usable and still offers its model. */
-async function applyWorkerDefault(pref: DefaultPreference | null): Promise<void> {
+/**
+ * The worker's saved default replaces a remembered choice, once, if it is usable and still offers its model.
+ * `userSeq` was captured before the first requests started: anything the user chose since wins.
+ */
+async function applyWorkerDefault(pref: DefaultPreference | null, userSeq: number): Promise<void> {
   if (!pref?.engine || !pref.model_id) return;
+  if (userSeq !== userChoiceSeq) return;
   if (snap.selectable.some((e) => e.id === 'mock')) return; // test mode keeps "mock" preferred
   const entry = snap.selectable.find((e) => e.id === pref.engine);
   if (!entry || !isUsable(entry)) return;
   const ticket = choiceSeq;
   const models = await loadProviderModels(pref.engine);
-  if (ticket !== choiceSeq || !models.some((m) => m.id === pref.model_id)) return;
+  if (ticket !== choiceSeq || userSeq !== userChoiceSeq || !models.some((m) => m.id === pref.model_id)) return;
   setProviderChoice({ engine: pref.engine, model: pref.model_id });
 }
 
@@ -295,6 +303,7 @@ let workerDefaultRead = false;
 export function refreshProviders(force = false): Promise<void> {
   if (loadRequest) return force ? loadRequest.then(() => refreshProviders(true)) : loadRequest;
   patch({ refreshing: true });
+  const userSeq = userChoiceSeq; // before any request starts, so a choice made while they are pending is seen
   loadRequest = (async () => {
     let failure: string | null = null;
     const [caps, statuses, pref] = await Promise.all([
@@ -331,7 +340,7 @@ export function refreshProviders(force = false): Promise<void> {
       error: failure,
       checkedAt: statuses ? (stamps.sort().at(-1) ?? new Date().toISOString()) : snap.checkedAt,
     });
-    await applyWorkerDefault(pref);
+    await applyWorkerDefault(pref, userSeq);
     // Account changes and empty first answers must not stick: an explicit Refresh reloads every list that was loaded.
     if (force) await Promise.all(Object.keys(snap.models).map((id) => loadProviderModels(id, true)));
     await reconcileChoice();

@@ -7,6 +7,8 @@ export interface Company {
   agents: Agent[];
   teams: Team[];
   ceo: Agent | null;
+  /** True once the first profiles request has settled. */
+  loaded: boolean;
   reload: () => Promise<void>;
 }
 
@@ -43,8 +45,10 @@ export function agentOf(profile: Profile): Agent {
 /** Agents are the worker's profiles: the CEO plus whatever the user or the CEO has created. */
 export function useCompany(): Company {
   const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const reload = useCallback(async () => {
     setProfiles(await listProfiles().catch(() => [] as Profile[]));
+    setLoaded(true);
   }, []);
   useEffect(() => {
     void reload();
@@ -54,5 +58,5 @@ export function useCompany(): Company {
   const names = new Map<string, string>();
   for (const a of agents) if (a.team && !names.has(a.team)) names.set(a.team, a.team === 'agents' ? 'Agents' : a.team);
   const teams: Team[] = [...names].map(([id, name]) => ({ id, name, desc: '', mgr: null, color: '' }));
-  return { profiles, agents, teams, ceo: agents.find((a) => a.mgr) ?? null, reload };
+  return { profiles, agents, teams, ceo: agents.find((a) => a.mgr) ?? null, loaded, reload };
 }

@@ -202,6 +202,7 @@ export function Shell() {
             onOpenProfile={() => goView('team')}
             onNewAgent={() => setNewAgent(true)}
             onManageProviders={() => setSettings('ai')}
+            ready={chat.loaded && company.loaded}
           />
         )}
         {(view === 'team' || view === 'contracts') && (

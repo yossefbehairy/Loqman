@@ -308,6 +308,9 @@ export const isMissionTerminal = (status: string) => !MISSION_ACTIVE.includes(st
 
 export const listMissions = () => call<{ missions: Mission[] }>('missions.list').then((r) => r.missions);
 
+/** Cancel a queued, planning or running mission. Returns the mission as the worker now has it. */
+export const cancelMission = (missionId: string) => call<Mission>('missions.cancel', { mission_id: missionId });
+
 export function followRun(
   runId: string,
   onEvent: (type: string, data: Record<string, unknown>, id: number | null | undefined) => void,
@@ -410,6 +413,15 @@ export const askCeo = (question: string, engine: string, modelId: string, reques
     request_id: requestId,
     ...(conversationId ? { conversation_id: conversationId } : {}),
   });
+
+export interface CeoProgress {
+  stage: string;
+  detail: string;
+  iteration: number;
+  done: boolean;
+}
+/** Where a running ceo.ask has got to; the id is the request_id that ask was sent with. */
+export const ceoAskProgress = (requestId: string) => call<CeoProgress>('ceo.ask_progress', { request_id: requestId });
 
 export const addMessage = (conversationId: string, role: 'user' | 'assistant', content: string) =>
   call<ConvMessage>('conversations.add_message', { conversation_id: conversationId, role, content });

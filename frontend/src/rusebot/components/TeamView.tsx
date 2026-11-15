@@ -6,11 +6,11 @@
  * zoom or drag-to-arrange). Structure comes from the classic AgentOS company
  * storage; profiles, missions and delegation use the AgentOS worker.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, FileText, MessageCircle, Send, Trash2, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { Agent, Team } from '../types';
-import { CEO_PROFILE_ID, isMissionTerminal, delegateToAgent, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
+import { CEO_PROFILE_ID, cancelMission, isMissionTerminal, delegateToAgent, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
 
 const DOTS = {
@@ -48,25 +48,99 @@ function resultText(value: unknown): string {
   }
 }
 
-function MissionRow({ mission, open, onToggle }: { mission: Mission; open: boolean; onToggle: () => void }) {
+function MissionRow({
+  mission,
+  open,
+  onToggle,
+  onCancelled,
+}: {
+  mission: Mission;
+  open: boolean;
+  onToggle: () => void;
+  /** Resolves when the mission list has been read again. */
+  onCancelled: () => Promise<void>;
+}) {
   const summary = resultText(mission.final_summary);
   const failure = typeof mission.error_summary === 'string' ? mission.error_summary : '';
   const tasks = mission.tasks ?? [];
+  const active = !isMissionTerminal(mission.status);
+  const [confirming, setConfirming] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const cancel = async () => {
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelMission(mission.id);
+      await onCancelled();
+      if (alive.current) setConfirming(false);
+    } catch (e) {
+      if (alive.current) setCancelError(messageOf(e));
+    } finally {
+      if (alive.current) setCancelling(false);
+    }
+  };
+
   return (
     <li data-mission={mission.id} className="rounded-lg border border-hairline/40 bg-card text-[12.5px]">
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={onToggle}
-        className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left hover:bg-raised focus-visible:outline-2 focus-visible:outline-accent"
-      >
-        <ChevronDown size={14} className={cn('shrink-0 text-ink-secondary transition-transform', !open && '-rotate-90')} />
-        <span dir="auto" className="min-w-0 flex-1 truncate">
-          {mission.title}
-        </span>
-        <span className="shrink-0 text-ink-secondary">{tasks.length} tasks</span>
-        <span className="shrink-0 rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-secondary">{mission.status}</span>
-      </button>
+      <div className="flex items-center">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-3 py-2 text-left hover:bg-raised focus-visible:outline-2 focus-visible:outline-accent"
+        >
+          <ChevronDown size={14} className={cn('shrink-0 text-ink-secondary transition-transform', !open && '-rotate-90')} />
+          <span dir="auto" className="min-w-0 flex-1 truncate">
+            {mission.title}
+          </span>
+          <span className="shrink-0 text-ink-secondary">{tasks.length} tasks</span>
+          <span className="shrink-0 rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-secondary">{mission.status}</span>
+        </button>
+        {active && !confirming && (
+          <button
+            type="button"
+            data-mission-cancel={mission.id}
+            aria-label={`Cancel mission ${mission.title}`}
+            onClick={() => setConfirming(true)}
+            className="ui-button ui-button-sm mr-2 shrink-0"
+          >
+            Cancel
+          </button>
+        )}
+      </div>
+      {active && confirming && (
+        <div data-mission-confirm className="flex flex-wrap items-center gap-2 border-t border-hairline/30 px-3 py-2">
+          <span className="min-w-0 flex-1 text-ink-secondary">Stop this mission? Work already done is kept.</span>
+          <button type="button" disabled={cancelling} onClick={() => void cancel()} className="ui-button ui-button-sm text-danger">
+            {cancelling ? 'Cancelling…' : 'Yes, cancel mission'}
+          </button>
+          <button
+            type="button"
+            disabled={cancelling}
+            onClick={() => {
+              setConfirming(false);
+              setCancelError(null);
+            }}
+            className="ui-button ui-button-sm"
+          >
+            Keep running
+          </button>
+        </div>
+      )}
+      {cancelError && (
+        <p role="alert" dir="auto" className="break-words border-t border-hairline/30 px-3 py-2 text-danger">
+          Could not cancel. {cancelError}
+        </p>
+      )}
       {open && (
         <div data-mission-detail className="flex flex-col gap-2 border-t border-hairline/30 px-3 py-2.5">
           {summary && (
@@ -466,7 +540,13 @@ export function TeamView(props: TeamViewProps) {
               <h2 className="mb-2 text-[13px] font-semibold">Delegated missions</h2>
               <ul className="flex flex-col gap-1.5">
                 {shownMissions.map((m) => (
-                  <MissionRow key={m.id} mission={m} open={openMission === m.id} onToggle={() => setOpenMission(openMission === m.id ? null : m.id)} />
+                  <MissionRow
+                    key={m.id}
+                    mission={m}
+                    open={openMission === m.id}
+                    onToggle={() => setOpenMission(openMission === m.id ? null : m.id)}
+                    onCancelled={onPollMissions}
+                  />
                 ))}
               </ul>
             </section>

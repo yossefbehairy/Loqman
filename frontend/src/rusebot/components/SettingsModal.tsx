@@ -6,7 +6,7 @@
  * engines.models), About.
  */
 import { useEffect, useRef, useState } from 'react';
-import { Info, Palette, Search, Sparkles, User, X } from 'lucide-react';
+import { Download, Info, Palette, Search, Sparkles, User, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { SKINS, applySkin, readSkin, type SkinId } from '../lib/skins';
 import { FONT_IDS, applyFont, readFont, type FontId } from '../lib/fonts';
@@ -15,7 +15,7 @@ import { AiProviders } from './AiProviders';
 
 export type PageId = 'general' | 'appearance' | 'ai' | 'about';
 const PAGES: Array<{ id: PageId; label: string; icon: typeof User; keywords?: string }> = [
-  { id: 'general', label: 'General', icon: User, keywords: 'profile name' },
+  { id: 'general', label: 'General', icon: User, keywords: 'profile name data backup export' },
   { id: 'appearance', label: 'Appearance', icon: Palette, keywords: 'theme font chat width skin' },
   { id: 'ai', label: 'AI', icon: Sparkles, keywords: 'providers engines models accounts claude chatgpt codex opencode antigravity sign in' },
   { id: 'about', label: 'About', icon: Info },
@@ -44,6 +44,83 @@ function Row({ id, title, subtitle, children }: { id: string; title: string; sub
         <div className="min-w-0 sm:max-w-[240px]">{children}</div>
       </div>
     </div>
+  );
+}
+
+interface BackupBridge {
+  saveBackup?: () => Promise<{ saved: boolean; path?: string; size?: number; cancelled?: boolean }>;
+}
+/** Only the desktop app (Electron preload) can write a backup file; the browser dev server cannot. */
+const backupBridge = () => (typeof window !== 'undefined' ? (window as unknown as { agentos?: BackupBridge }).agentos : undefined);
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+type BackupState = { kind: 'idle' } | { kind: 'running' } | { kind: 'saved'; path: string; size?: number } | { kind: 'error'; text: string };
+
+function DataCard() {
+  const available = typeof backupBridge()?.saveBackup === 'function';
+  const [state, setState] = useState<BackupState>({ kind: 'idle' });
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const run = async () => {
+    const save = backupBridge()?.saveBackup;
+    if (!save) return;
+    setState({ kind: 'running' });
+    try {
+      const out = await save();
+      if (!alive.current) return;
+      if (out?.saved && out.path) setState({ kind: 'saved', path: out.path, size: out.size });
+      else setState({ kind: 'idle' }); // cancelled in the save dialog: nothing to report
+    } catch (e) {
+      if (!alive.current) return;
+      let text = e instanceof Error ? e.message : String(e);
+      try {
+        const parsed = JSON.parse(text) as { detail?: unknown };
+        if (parsed && typeof parsed.detail === 'string') text = parsed.detail;
+      } catch {
+        /* plain message */
+      }
+      setState({ kind: 'error', text });
+    }
+  };
+
+  return (
+    <Card title="Data" subtitle="A copy of your chats, agents and missions as one file you can keep somewhere safe.">
+      <div className="flex flex-col items-start gap-2">
+        <button type="button" data-backup-button disabled={!available || state.kind === 'running'} onClick={() => void run()} className="ui-button ui-button-md">
+          <Download size={13} aria-hidden="true" />
+          {state.kind === 'running' ? 'Backing up…' : 'Back up data…'}
+        </button>
+        {!available && <p className="text-[12px] text-ink-secondary">Backups are available in the desktop app.</p>}
+        {state.kind === 'running' && (
+          <p role="status" className="text-[12px] text-ink-secondary">
+            Saving the backup…
+          </p>
+        )}
+        {state.kind === 'saved' && (
+          <p role="status" dir="auto" className="break-all text-[12px] text-success">
+            Saved to {state.path}
+            {state.size != null ? ` (${formatSize(state.size)})` : ''}
+          </p>
+        )}
+        {state.kind === 'error' && (
+          <p role="alert" dir="auto" className="break-words text-[12px] text-danger">
+            Could not back up. {state.text}
+          </p>
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -157,6 +234,7 @@ export function SettingsModal({
                     className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
                   />
                 </Card>
+                <DataCard />
               </section>
             )}
             {page === 'appearance' && (

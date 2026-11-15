@@ -157,6 +157,7 @@ export function ChatView({
   onOpenProfile,
   onNewAgent,
   onManageProviders,
+  ready = true,
 }: {
   chat: ChatState;
   engines: EngineState;
@@ -166,13 +167,15 @@ export function ChatView({
   onOpenProfile: () => void;
   onNewAgent: () => void;
   onManageProviders?: () => void;
+  /** False until the conversation list and the agents are loaded, so the remembered chat is not shown as Loqman first. */
+  ready?: boolean;
 }) {
   const dockRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const dock = useComposerDockPad(dockRef);
-  const ASSISTANT_NAME = agent?.name ?? FALLBACK_NAME;
+  const ASSISTANT_NAME = ready ? (agent?.name ?? FALLBACK_NAME) : '';
   const running = Boolean(chat.run && (chat.run.status === 'queued' || chat.run.status === 'running'));
-  const title = conversation?.title ?? legacyThread?.title ?? 'New chat';
+  const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? 'New chat');
 
   const lastKey = `${chat.messages.length}:${chat.pendingUser ?? ''}:${running}:${legacyThread?.turns.length ?? 0}`;
   useEffect(() => {
@@ -287,7 +290,7 @@ export function ChatView({
               ))
             ) : (
               <>
-                {chat.messages.length === 0 && !chat.pendingUser && !running && (
+                {ready && chat.messages.length === 0 && !chat.pendingUser && !running && (
                   <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description="Send a message to start the conversation." />
                 )}
                 {rows}
@@ -307,7 +310,7 @@ export function ChatView({
                 {running && (
                   <div data-working className="flex items-center gap-2 px-1 text-[13px] text-ink-secondary" role="status">
                     <WorkingDots size={5} className="text-ink-tertiary" />
-                    <span>{chat.run?.status === 'queued' ? 'Queued' : 'Working'}</span>
+                    <span>{chat.run?.status === 'queued' ? 'Queued' : (chat.progress ?? 'Working')}</span>
                   </div>
                 )}
               </>
@@ -326,13 +329,13 @@ export function ChatView({
             <div className="pointer-events-auto relative w-full">
               <div className="relative">
                 <Composer
-                  placeholder={`Message ${ASSISTANT_NAME}`}
+                  placeholder={ready ? `Message ${ASSISTANT_NAME}` : 'Loading…'}
                   value={chat.draft}
                   onChange={chat.setDraft}
                   onSend={chat.send}
                   onStop={chat.stop}
                   running={running}
-                  disabled={engines.loading}
+                  disabled={engines.loading || !ready}
                   engines={engines}
                   onNewAgent={onNewAgent}
                   onManageProviders={onManageProviders}

@@ -1597,3 +1597,245 @@ test.describe('routing: the worker default decides, Loqman sends the chosen engi
     await expect(dialog.getByRole('alert').filter({ hasText: 'Could not save the default' })).toBeVisible();
   });
 });
+
+// ---------------------------------------------------------------------------------------
+// P3 (UI): startup race, backup, cancel mission, Loqman progress, empty CEO history, no Loqman flash.
+// ---------------------------------------------------------------------------------------
+test.describe('P3: startup and Settings', () => {
+  const ENGINES: StubEngine[] = [
+    { engine_id: 'ready-e', title: 'Alpha', vendor: 'Vendor A', state: 'ready' },
+    { engine_id: 'unverified-e', title: 'Gamma', vendor: 'Vendor G', state: 'unverified' },
+  ];
+
+  test('a model chosen while the worker default is still loading is not overwritten by it', async ({ page }) => {
+    let answered = false;
+    await stubProviders(page, ENGINES, {
+      'engines.capabilities': capsWithoutMock(ENGINES),
+      'preferences.get': async () => {
+        await sleep(2500);
+        answered = true;
+        return { engine: 'ready-e', model_id: 'm1' };
+      },
+    });
+    await page.goto('/?ui=rusebot');
+    await expect(page.locator('[data-rusebot-shell]')).toBeVisible();
+    // The user's choice arrives while preferences.get is pending (the store module is the one the app uses).
+    await page.evaluate(async () => {
+      const store = await import(/* @vite-ignore */ '/src/rusebot/state/useProviders.ts');
+      store.setProviderChoice({ engine: 'unverified-e', model: 'm2' });
+    });
+    await expect.poll(() => answered, { timeout: 15000 }).toBe(true);
+    await page.waitForTimeout(800); // the late worker answer has been handled
+    await expect(page.locator('[data-chathead-pill] [title="unverified-e · m2"]')).toBeVisible();
+    await expect(page.locator('[data-chathead-pill] [title="ready-e · m1"]')).toHaveCount(0);
+  });
+
+  const BRIDGE_INIT = (mode: string) => {
+    const w = window as unknown as { agentos: Record<string, unknown> };
+    let release: () => void = () => undefined;
+    (window as unknown as { __releaseBackup: () => void }).__releaseBackup = () => release();
+    w.agentos = {
+      call: async (method: string, params: Record<string, unknown>) => {
+        const res = await fetch('/__agentos/call', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ method, params }) });
+        const body = await res.json();
+        if (!res.ok) throw new Error(JSON.stringify({ status: res.status, detail: body.detail }));
+        return body.result;
+      },
+      openStream: async () => {
+        throw new Error('no streams in this test');
+      },
+      saveBackup: async () => {
+        await new Promise<void>((r) => {
+          release = r;
+        });
+        if (mode === 'cancel') return { saved: false, cancelled: true };
+        if (mode === 'error') throw new Error(JSON.stringify({ status: null, detail: 'The disk is full.' }));
+        return { saved: true, path: 'C:\\Backups\\agentos-backup.zip', size: 1572864 };
+      },
+    };
+  };
+  const releaseBackup = (page: Page) => page.evaluate(() => (window as unknown as { __releaseBackup: () => void }).__releaseBackup());
+
+  async function openGeneral(page: Page) {
+    await openBare(page);
+    await openDrawerIfNarrow(page);
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.locator('[data-settings-block=general]')).toBeVisible();
+    return dialog;
+  }
+
+  test('without the desktop bridge the backup button is disabled with a note', async ({ page }) => {
+    const dialog = await openGeneral(page);
+    await expect(dialog.getByRole('button', { name: 'Back up data…', exact: true })).toBeDisabled();
+    await expect(dialog.getByText('Backups are available in the desktop app.')).toBeVisible();
+  });
+
+  test('desktop: backup shows progress, then where it was saved and how big it is', async ({ page }) => {
+    await page.addInitScript(BRIDGE_INIT, 'saved');
+    const dialog = await openGeneral(page);
+    const button = dialog.getByRole('button', { name: 'Back up data…', exact: true });
+    await expect(button).toBeEnabled();
+    await expect(dialog.getByText('Backups are available in the desktop app.')).toHaveCount(0);
+    await button.click();
+    await expect(dialog.getByRole('status').filter({ hasText: 'Saving the backup' })).toBeVisible();
+    await expect(dialog.locator('[data-backup-button]')).toBeDisabled();
+    await releaseBackup(page);
+    await expect(dialog.getByRole('status').filter({ hasText: 'Saved to C:\\Backups\\agentos-backup.zip (1.5 MB)' })).toBeVisible();
+    await expect(dialog.locator('[data-backup-button]')).toBeEnabled();
+  });
+
+  test('desktop: cancelling the save dialog shows nothing', async ({ page }) => {
+    await page.addInitScript(BRIDGE_INIT, 'cancel');
+    const dialog = await openGeneral(page);
+    await dialog.locator('[data-backup-button]').click();
+    await expect(dialog.getByRole('status').filter({ hasText: 'Saving the backup' })).toBeVisible();
+    await releaseBackup(page);
+    await expect(dialog.locator('[data-backup-button]')).toBeEnabled();
+    await expect(dialog.getByRole('status')).toHaveCount(0);
+    await expect(dialog.getByRole('alert')).toHaveCount(0);
+  });
+
+  test('desktop: a failed backup says why', async ({ page }) => {
+    await page.addInitScript(BRIDGE_INIT, 'error');
+    const dialog = await openGeneral(page);
+    await dialog.locator('[data-backup-button]').click();
+    await releaseBackup(page);
+    await expect(dialog.getByRole('alert')).toContainText('Could not back up. The disk is full.');
+    await expect(dialog.locator('[data-backup-button]')).toBeEnabled();
+  });
+});
+
+test.describe('P3: missions and Loqman', () => {
+  const mission = (id: string, status: string) => ({ id, title: `Mission ${id}`, objective: 'x', status, final_summary: null, error_summary: null, tasks: [] });
+
+  test('an active mission can be cancelled after a confirm step; errors are readable', async ({ page }) => {
+    let status = 'running';
+    let failing = true;
+    const cancelled: Array<Record<string, unknown>> = [];
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (req.method === 'missions.list') return okJson(route, { missions: [mission('m-run', status), mission('m-done', 'succeeded')] });
+      if (req.method === 'missions.cancel') {
+        cancelled.push(req.params ?? {});
+        if (failing) return route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ status: 500, detail: 'The engine is busy.' }) });
+        status = 'cancelled';
+        return okJson(route, mission('m-run', 'cancelled'));
+      }
+      return route.continue();
+    });
+    await openBare(page);
+    await openDrawerIfNarrow(page);
+    await page.getByRole('button', { name: 'Team', exact: true }).click();
+    const row = page.locator('[data-mission=m-run]');
+    await expect(row).toBeVisible();
+    await expect(page.locator('[data-mission=m-done] [data-mission-cancel]')).toHaveCount(0);
+    await row.locator('[data-mission-cancel]').click();
+    await expect(row.locator('[data-mission-confirm]')).toBeVisible();
+    expect(cancelled).toEqual([]); // nothing is sent before the confirm
+    await row.getByRole('button', { name: 'Keep running', exact: true }).click();
+    await expect(row.locator('[data-mission-confirm]')).toHaveCount(0);
+    await row.locator('[data-mission-cancel]').click();
+    await row.getByRole('button', { name: 'Yes, cancel mission', exact: true }).click();
+    await expect(row.getByRole('alert')).toContainText('Could not cancel. The engine is busy.');
+    failing = false;
+    await row.getByRole('button', { name: 'Yes, cancel mission', exact: true }).click();
+    await expect(row).toContainText('cancelled');
+    await expect(row.locator('[data-mission-cancel]')).toHaveCount(0);
+    expect(cancelled).toEqual([{ mission_id: 'm-run' }, { mission_id: 'm-run' }]);
+  });
+
+  test('while Loqman answers, the current step is shown; polling never overlaps and stops with the answer', async ({ page }) => {
+    let polls = 0;
+    let inflight = 0;
+    let maxInflight = 0;
+    const asked: Array<Record<string, unknown>> = [];
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (req.method === 'ceo.ask') {
+        asked.push(req.params ?? {});
+        await sleep(4200);
+        return okJson(route, { reply: 'done', actions_proposed: [], agents_created: [], iterations: 2, fast: false });
+      }
+      if (req.method === 'ceo.ask_progress') {
+        polls += 1;
+        inflight += 1;
+        maxInflight = Math.max(maxInflight, inflight);
+        await sleep(300);
+        inflight -= 1;
+        const first = polls === 1;
+        return okJson(route, { stage: first ? 'thinking' : 'tool', detail: first ? '' : 'web_search', iteration: first ? 1 : 2, done: false });
+      }
+      return route.continue();
+    });
+    await openBare(page);
+    const box = page.getByRole('textbox', { name: 'Message Loqman' });
+    await box.fill(`progress-${uid()}`);
+    await box.press('Enter');
+    const working = page.locator('[data-working]');
+    await expect(working).toContainText('Working');
+    await expect(working).toContainText('Thinking', { timeout: 8000 });
+    await expect(working).toContainText('Using web_search (step 2)', { timeout: 8000 });
+    expect(String(asked[0].request_id)).toMatch(/^ceo-/);
+    await expect(working).toHaveCount(0, { timeout: 10000 });
+    const after = polls;
+    await page.waitForTimeout(3500);
+    expect(polls).toBe(after);
+    expect(maxInflight).toBe(1);
+  });
+
+  const HISTORY = { id: 'legacy-ceo-history', title: 'CEO history', workspace_id: null, profile_id: null, created_at: '2026-11-01T10:00:00+00:00', updated_at: '2026-11-01T10:00:00+00:00' };
+  async function stubHistory(page: Page, messages: unknown[]) {
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (req.method === 'conversations.list') {
+        const body = (await (await route.fetch()).json()) as { result: { conversations: Array<{ id: string }> } };
+        body.result.conversations = [...body.result.conversations.filter((c) => c.id !== HISTORY.id), HISTORY];
+        return okJson(route, body.result);
+      }
+      if (req.method === 'conversations.messages' && req.params?.conversation_id === HISTORY.id) return okJson(route, { messages });
+      return route.continue();
+    });
+  }
+
+  test('the CEO history conversation is hidden while it has no messages', async ({ page }) => {
+    await stubHistory(page, []);
+    await openBare(page);
+    await openDrawerIfNarrow(page);
+    await expect(page.locator('[data-sidebar-thread-row]').filter({ hasText: 'CEO history' })).toHaveCount(0);
+  });
+
+  test('the CEO history conversation shows once it has messages', async ({ page }) => {
+    const msg = { seq: 1, conversation_id: HISTORY.id, role: 'user', content: 'old question', client_message_id: 'ceo:g1', created_at: '2026-11-01T10:00:00+00:00' };
+    await stubHistory(page, [msg]);
+    await openBare(page);
+    await openDrawerIfNarrow(page);
+    await expect(page.locator('[data-sidebar-thread-row]').filter({ hasText: 'CEO history' })).toHaveCount(1);
+  });
+
+  test('the remembered chat is not shown as Loqman while the app is still loading', async ({ page }) => {
+    await open(page); // creates an agent (agentName)
+    const profiles = await call<{ profiles: Array<{ id: string; name: string }> }>(page, 'profiles.list');
+    const agent = profiles.profiles.find((p) => p.name === agentName)!;
+    const conv = await call<{ id: string }>(page, 'conversations.create', { title: `flash-${uid()}`, profile_id: agent.id });
+    await page.evaluate(
+      ([id, agentId]) => {
+        localStorage.setItem('agentos.rusebot.selected.v1', JSON.stringify(id));
+        localStorage.setItem('agentos.rusebot.convAgents.v1', JSON.stringify({ [id]: agentId }));
+      },
+      [conv.id, agent.id]
+    );
+    await page.route('**/__agentos/call', async (route: Route) => {
+      if (reqOf(route).method === 'profiles.list') await sleep(1500);
+      return route.continue();
+    });
+    await page.reload();
+    await expect(page.locator('[data-rusebot-shell]')).toBeVisible();
+    for (let i = 0; i < 6; i++) {
+      expect(await page.getByRole('textbox', { name: 'Message Loqman' }).count()).toBe(0); // no retry: a single look at each moment
+      await page.waitForTimeout(150);
+    }
+    await expect(page.getByRole('textbox', { name: `Message ${agentName}` })).toBeVisible({ timeout: 15000 });
+    await expect(page.getByRole('textbox', { name: 'Message Loqman' })).toHaveCount(0);
+  });
+});
