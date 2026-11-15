@@ -34,3 +34,12 @@ test('saveBackup uses the existing bridge error format', async () => {
     return true;
   });
 });
+
+test('openStream passes the event format to the main process', async () => {
+  const seen = [];
+  const api = bridge(async (...args) => { seen.push(args); return 'sid'; });
+  await api.openStream('run', 'r1', 0, () => {}, 'normalised-v1');
+  await api.openStream('run', 'r2', 0, () => {});
+  assert.deepEqual(seen[0], ['agentos:stream-open', 'run', 'r1', 0, 'normalised-v1']);
+  assert.equal(seen[1][4], undefined);
+});

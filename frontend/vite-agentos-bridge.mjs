@@ -128,6 +128,8 @@ export default function agentosBridge() {
           const params = { topic: url.searchParams.get('topic'), id: url.searchParams.get('id') };
           const last = Number(url.searchParams.get('last') || 0);
           if (last > 0) params.last_event_id = last;
+          // Opt in to driver events (live text, tool items); anything else keeps the legacy status-only stream.
+          if (url.searchParams.get('format') === 'normalised-v1') params.event_format = 'normalised-v1';
           await client.request('stream.open', params, 15000, ({ stream_id: streamId }) => {
             res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
             res.write('retry: 2000\n\n');

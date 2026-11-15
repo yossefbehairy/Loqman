@@ -33,6 +33,7 @@ import {
   type RunSnapshot,
 } from '../data/worker';
 import type { StreamHandle } from '../../api/transport';
+import { emptyLive, freezeLive, hasLiveContent, reduceLive, type LiveTurn } from './liveTurn';
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
 import type { Agent } from '../types';
 import {
@@ -151,6 +152,8 @@ export interface ChatState {
   /** What Loqman is doing right now in the selected chat, while he answers; null otherwise. */
   progress: string | null;
   run: RunState | null;
+  /** The reply as it streams in (normalised driver events) in the selected chat; null when nothing is streaming. */
+  live: LiveTurn | null;
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
   drafts: Record<string, Draft[]>;
@@ -199,6 +202,64 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   }, []);
   const historyUsed = useRef(false);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
+  const [live, setLive] = useState<Record<string, LiveTurn>>({});
+  const liveRuns = useRef(new Map<string, LiveTurn>());
+  const stoppedRuns = useRef(new Set<string>());
+  const liveDirty = useRef(new Map<string, string>());
+  const liveFrame = useRef<number | null>(null);
+  const liveLastFlush = useRef(0);
+  /** Publish the streamed text to React at most about every 60 ms and once per frame, however many deltas arrived. */
+  const scheduleLive = useCallback((conversationId: string, runId: string) => {
+    liveDirty.current.set(conversationId, runId);
+    if (liveFrame.current !== null) return;
+    const tick = () => {
+      if (performance.now() - liveLastFlush.current < 60) {
+        liveFrame.current = requestAnimationFrame(tick);
+        return;
+      }
+      liveFrame.current = null;
+      liveLastFlush.current = performance.now();
+      const entries = [...liveDirty.current];
+      liveDirty.current.clear();
+      setLive((prev) => {
+        const next = { ...prev };
+        for (const [cid, rid] of entries) {
+          const turn = liveRuns.current.get(rid);
+          if (turn) next[cid] = turn;
+        }
+        return next;
+      });
+    };
+    liveFrame.current = requestAnimationFrame(tick);
+  }, []);
+  const applyLive = useCallback(
+    (conversationId: string, runId: string, type: string, data: Record<string, unknown>) => {
+      if (stoppedRuns.current.has(runId)) return;
+      const cur = liveRuns.current.get(runId) ?? emptyLive(runId);
+      const next = reduceLive(cur, type, data);
+      if (next === cur) return;
+      liveRuns.current.set(runId, next);
+      scheduleLive(conversationId, runId);
+    },
+    [scheduleLive]
+  );
+  const dropLive = useCallback((conversationId: string, runId: string) => {
+    liveRuns.current.delete(runId);
+    stoppedRuns.current.delete(runId);
+    if (liveDirty.current.get(conversationId) === runId) liveDirty.current.delete(conversationId);
+    setLive((prev) => {
+      if (!(conversationId in prev)) return prev;
+      const next = { ...prev };
+      delete next[conversationId];
+      return next;
+    });
+  }, []);
+  useEffect(
+    () => () => {
+      if (liveFrame.current !== null) cancelAnimationFrame(liveFrame.current);
+    },
+    []
+  );
   const [runsBySeq, setRunsBySeq] = useState<Record<number, RunSnapshot>>({});
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
@@ -286,6 +347,18 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         setRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error: err } }));
         setPendingUser(null);
         if (err && status !== 'cancelled' && selectedRef.current === conversationId) setError(err);
+        const partial = liveRuns.current.get(runId);
+        if (status === 'cancelled' && hasLiveContent(partial)) {
+          // Keep what was written, marked as stopped; a reload shows only what the worker stored.
+          const kept = freezeLive(partial);
+          liveRuns.current.set(runId, kept);
+          setLive((prev) => ({ ...prev, [conversationId]: kept }));
+        } else {
+          // The stored reply replaces the live one in the same render, so the text never shows twice or disappears.
+          const stored = status === 'succeeded' ? await listMessages(conversationId).catch(() => null) : null;
+          if (stored && selectedRef.current === conversationId) setMessages(stored);
+          dropLive(conversationId, runId);
+        }
         await refreshConversations().catch(() => undefined);
         if (selectedRef.current === conversationId) await loadThread(conversationId).catch(() => undefined);
         setApprovals(await listApprovals().catch(() => []));
@@ -295,8 +368,11 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       followRun(
         runId,
         (type, data) => {
+          // Only a lifecycle terminal ends the run; driver events feed the live reply; anything else is ignored.
           if (isTerminal(type)) void finish(type, typeof data.error === 'string' ? data.error : null);
-          else setRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
+          else if (type === 'queued' || type === 'running') {
+            setRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
+          } else applyLive(conversationId, runId, type, data);
         },
         () => {
           if (streams.current.has(runId)) {
@@ -305,7 +381,9 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
               else streams.current.delete(runId);
             });
           }
-        }
+        },
+        0,
+        'normalised-v1'
       )
         .then((handle) => {
           if (streams.current.has(runId)) streams.current.set(runId, handle);
@@ -316,7 +394,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           setError(messageOf(e));
         });
     },
-    [loadThread, refreshConversations]
+    [loadThread, refreshConversations, applyLive, dropLive]
   );
 
   useEffect(() => {
@@ -518,6 +596,12 @@ ${prompt}`;
           }
         }
         setPendingUser(prompt);
+        setLive((prev) => {
+          if (!(cid! in prev)) return prev;
+          const next = { ...prev };
+          delete next[cid!];
+          return next;
+        });
         const snap = await startTurn({
           conversationId: cid,
           engine: engine.engine,
@@ -570,9 +654,22 @@ ${prompt}`;
     const cid = selectedRef.current;
     const run = cid ? runs[cid] : undefined;
     if (!run || run.runId.startsWith('ceo-')) return; // a CEO answer cannot be cancelled midway
+    // The text stops changing the moment Stop is pressed, before the worker confirms.
+    stoppedRuns.current.add(run.runId);
+    const turn = liveRuns.current.get(run.runId);
+    if (turn && cid) {
+      const frozen = freezeLive(turn);
+      liveRuns.current.set(run.runId, frozen);
+      setLive((prev) => ({ ...prev, [cid]: frozen }));
+    }
     try {
       await cancelRun(run.runId);
     } catch (e) {
+      stoppedRuns.current.delete(run.runId);
+      if (turn && cid) {
+        liveRuns.current.set(run.runId, turn);
+        setLive((prev) => ({ ...prev, [cid]: turn }));
+      }
       setError(messageOf(e));
     }
   }, [runs]);
@@ -653,6 +750,7 @@ ${prompt}`;
     pendingUser,
     progress: ceoStep && ceoStep.cid === selectedId && currentRun && !isTerminal(currentRun.status) ? ceoStep.text : null,
     run: currentRun,
+    live: selectedId ? (live[selectedId] ?? null) : null,
     runsBySeq,
     approvals,
     drafts,

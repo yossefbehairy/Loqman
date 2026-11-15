@@ -5,7 +5,7 @@
  * Left out: mentions, thread references, GitHub references, attachments and
  * Mermaid, which depend on the RuseBot store.
  */
-import { memo, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createContext, memo, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { HighlighterCore } from 'shiki/core';
 import Markdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -135,8 +135,12 @@ async function highlightFence(code: string, lang: string): Promise<string> {
   });
 }
 
+/** True while the text is still streaming in: code is shown plain until the turn completes (highlighting every delta is costly). */
+const LiveText = createContext(false);
+
 export function CodeBlock({ code, lang, initialWrap = false }: { code: string; lang: string; initialWrap?: boolean }) {
-  const highlightable = code.length <= HIGHLIGHT_MAX_CHARS;
+  const streaming = useContext(LiveText);
+  const highlightable = !streaming && code.length <= HIGHLIGHT_MAX_CHARS;
   const key = `${lang}:${code}`;
   const [highlighted, setHtml] = useState<string | null>(() => (highlightable ? (highlightCache.get(key) ?? null) : null));
   const html = highlightable ? (highlightCache.get(key) ?? highlighted) : highlighted;
@@ -359,16 +363,18 @@ const MARKDOWN_COMPONENTS: Components = {
 
 const MATH = /\$\$[\s\S]+?\$\$|\$[^$\n]+\$|\\\(|\\\[/;
 
-function ChatMarkdownComponent({ text }: { text: string }) {
+function ChatMarkdownComponent({ text, live = false }: { text: string; live?: boolean }) {
   const rehype = useMemo(() => (MATH.test(text) ? [rehypeKatex] : []), [text]);
   return (
+    <LiveText.Provider value={live}>
     <div className="chat-md min-w-0 [&>*+*]:mt-2">
       <Markdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={rehype} components={MARKDOWN_COMPONENTS}
         urlTransform={(url, key, node) => node.tagName === 'img' && key === 'src' && /^(?:data:image\/|blob:)/i.test(url) ? url : defaultUrlTransform(url)}>
         {text}
       </Markdown>
     </div>
+    </LiveText.Provider>
   );
 }
 
-export const ChatMarkdown = memo(ChatMarkdownComponent, (a, b) => a.text === b.text);
+export const ChatMarkdown = memo(ChatMarkdownComponent, (a, b) => a.text === b.text && a.live === b.live);

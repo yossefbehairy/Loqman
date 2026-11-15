@@ -1,4 +1,4 @@
-import { call, openStream, type StreamHandle, type StreamMessage } from '../../api/transport';
+import { call, openStream, type StreamEventFormat, type StreamHandle, type StreamMessage } from '../../api/transport';
 
 export interface Conversation {
   id: string;
@@ -20,6 +20,8 @@ export interface ConvMessage {
 
 export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
 export const ACTIVE_STATUSES: RunStatus[] = ['queued', 'running'];
+/** The only run states that end a run. Driver events (content.delta, item.*, ...) never do. */
+export const TERMINAL_STATUSES: RunStatus[] = ['succeeded', 'failed', 'cancelled', 'interrupted'];
 
 export interface RunSnapshot {
   id: string;
@@ -315,7 +317,8 @@ export function followRun(
   runId: string,
   onEvent: (type: string, data: Record<string, unknown>, id: number | null | undefined) => void,
   onEnd: () => void,
-  lastEventId = 0
+  lastEventId = 0,
+  eventFormat: StreamEventFormat = 'legacy'
 ): Promise<StreamHandle> {
   return openStream(
     'run',
@@ -327,12 +330,14 @@ export function followRun(
       }
       onEvent(msg.event ?? '', (msg.data ?? {}) as Record<string, unknown>, msg.id);
     },
-    lastEventId
+    lastEventId,
+    eventFormat
   );
 }
 
+/** True only for a real lifecycle terminal; any other string (queued, running, a driver event type) is not an end. */
 export function isTerminal(status: string): boolean {
-  return !ACTIVE_STATUSES.includes(status as RunStatus);
+  return TERMINAL_STATUSES.includes(status as RunStatus);
 }
 
 export interface CeoAction {

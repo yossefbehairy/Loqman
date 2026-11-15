@@ -61,10 +61,10 @@ contextBridge.exposeInMainWorld('agentos', {
       throw unwrap(error);
     }
   },
-  openStream: async (topic, id, lastEventId, onMessage) => {
+  openStream: async (topic, id, lastEventId, onMessage, eventFormat) => {
     let streamId;
     try {
-      streamId = await ipcRenderer.invoke('agentos:stream-open', topic, id, lastEventId || 0);
+      streamId = await ipcRenderer.invoke('agentos:stream-open', topic, id, lastEventId || 0, eventFormat);
     } catch (error) {
       throw unwrap(error);
     }

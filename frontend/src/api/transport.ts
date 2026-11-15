@@ -17,13 +17,17 @@ export interface StreamMessage {
   reason?: string;
 }
 
+/** `normalised-v1` adds the driver's content/tool events to a run stream; `legacy` is lifecycle status only. */
+export type StreamEventFormat = 'legacy' | 'normalised-v1';
+
 interface AgentosBridge {
   call: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
   openStream: (
     topic: string,
     id: string,
     lastEventId: number,
-    onMessage: (msg: StreamMessage) => void
+    onMessage: (msg: StreamMessage) => void,
+    eventFormat?: StreamEventFormat
   ) => Promise<{ close: () => Promise<boolean> | void }>;
 }
 
@@ -91,18 +95,19 @@ export async function openStream(
   topic: 'run' | 'mission',
   id: string,
   onMessage: (msg: StreamMessage) => void,
-  lastEventId = 0
+  lastEventId = 0,
+  eventFormat: StreamEventFormat = 'legacy'
 ): Promise<StreamHandle> {
   const b = bridge();
   if (b) {
     try {
-      const handle = await b.openStream(topic, id, lastEventId, onMessage);
+      const handle = await b.openStream(topic, id, lastEventId, onMessage, eventFormat);
       return { close: () => void handle.close() };
     } catch (e) {
       throw fromBridge(e);
     }
   }
-  const url = `/__agentos/stream?topic=${encodeURIComponent(topic)}&id=${encodeURIComponent(id)}&last=${lastEventId}`;
+  const url = `/__agentos/stream?topic=${encodeURIComponent(topic)}&id=${encodeURIComponent(id)}&last=${lastEventId}${eventFormat === 'legacy' ? '' : `&format=${encodeURIComponent(eventFormat)}`}`;
   const es = new EventSource(url);
   const forward = (ev: MessageEvent) => {
     try {

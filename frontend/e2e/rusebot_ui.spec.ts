@@ -1901,3 +1901,214 @@ test.describe('P3: missions and Loqman', () => {
     await expect(page.getByRole('textbox', { name: 'Message Loqman' })).toHaveCount(0);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// Streaming chat: the worker's run stream is replaced by a fake EventSource the test drives, and
+// runs.* is stubbed, so no model is ever called. Everything else talks to the real mock worker.
+// ---------------------------------------------------------------------------------------------
+test.describe('chat: streaming replies', () => {
+  const RUN_ID = 'run-live-1';
+
+  async function fakeStream(page: Page) {
+    await page.addInitScript(() => {
+      type Listener = (ev: { data: string }) => void;
+      type Fake = { listeners: Record<string, Listener[]>; url: string; closed: boolean };
+      const w = window as unknown as { __streams: Fake[]; EventSource: unknown };
+      w.__streams = [];
+      const Real = window.EventSource;
+      w.EventSource = function (url: string) {
+        if (!/__agentos\/stream/.test(String(url))) return new Real(url);
+        const fake: Fake & Record<string, unknown> = {
+          url: String(url),
+          closed: false,
+          listeners: {},
+          addEventListener(name: string, fn: Listener) {
+            (fake.listeners[name] ??= []).push(fn);
+          },
+          close() {
+            fake.closed = true;
+          },
+        };
+        w.__streams.push(fake);
+        return fake;
+      } as unknown;
+    });
+  }
+
+  const emit = (page: Page, event: string, data: unknown, id = 1) =>
+    page.evaluate(
+      ([event, data, id]) => {
+        const w = window as unknown as { __streams: Array<{ listeners: Record<string, Array<(ev: { data: string }) => void>>; closed: boolean }> };
+        const msg = { type: 'stream', stream_id: 's1', event, id, data };
+        for (const s of w.__streams) if (!s.closed) for (const fn of s.listeners.stream ?? []) fn({ data: JSON.stringify(msg) });
+      },
+      [event, data, id] as const
+    );
+
+  const driver = (type: string, itemId: string | null, data: Record<string, unknown>) => ({
+    version: 1, type, item_id: itemId, run_id: RUN_ID, turn_id: 't1', seq: 1, engine: 'claude-code', data,
+  });
+  const delta = (page: Page, itemId: string, text: string) =>
+    emit(page, 'content.delta', driver('content.delta', itemId, { stream_kind: 'assistant_text', delta: text }));
+
+  /** Starts a chat whose run is a stub; the stored assistant message appears once the run ends as succeeded. */
+  async function startRun(page: Page, text: string) {
+    await fakeStream(page);
+    const state = { cid: '', stored: false, cancelled: false, status: 'running', answer: 'The stored final answer.' };
+    const snap = () => ({
+      id: RUN_ID, conversation_id: state.cid, engine: 'mock', model_id: 'mock', status: state.status, user_message_seq: 1,
+      assistant_message_seq: state.stored ? 2 : null, assistant_content: null, error: null, tool_mode: 'none',
+      created_at: '2026-11-15T00:00:00', started_at: null, finished_at: null,
+    });
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const { method, params } = reqOf(route);
+      if (method === 'runs.start_turn') {
+        state.cid = String(params?.conversation_id);
+        return okJson(route, snap());
+      }
+      if (method === 'runs.get') return okJson(route, snap());
+      if (method === 'runs.list') return okJson(route, { runs: state.cid ? [snap()] : [] });
+      if (method === 'runs.cancel') {
+        state.cancelled = true;
+        state.status = 'cancelled';
+        return okJson(route, snap());
+      }
+      if (method === 'conversations.messages' && state.cid && params?.conversation_id === state.cid) {
+        const base = { conversation_id: state.cid, client_message_id: null, created_at: '2026-11-15T00:00:00+00:00' };
+        const after = Number(params?.after ?? 0);
+        const all = [
+          { ...base, seq: 1, role: 'user', content: text },
+          ...(state.stored ? [{ ...base, seq: 2, role: 'assistant', content: state.answer }] : []),
+        ];
+        return okJson(route, { messages: all.filter((m) => m.seq > after) });
+      }
+      return route.fallback();
+    });
+    await open(page);
+    await send(page, text);
+    await expect(page.locator('[data-working]')).toBeVisible();
+    await expect.poll(() => page.evaluate(() => (window as unknown as { __streams: unknown[] }).__streams.length)).toBeGreaterThan(0);
+    await emit(page, 'running', {}, 1);
+    return {
+      state,
+      finish: async (status: 'succeeded' | 'cancelled' | 'failed', id = 99) => {
+        state.status = status;
+        if (status === 'succeeded') state.stored = true;
+        await emit(page, status, status === 'failed' ? { error: 'boom' } : {}, id);
+      },
+    };
+  }
+
+  const live = (page: Page) => page.locator('[data-live-bubble]');
+
+  test('the chat run stream asks for normalised events', async ({ page }) => {
+    await startRun(page, `fmt-${uid()}`);
+    const urls = await page.evaluate(() => (window as unknown as { __streams: Array<{ url: string }> }).__streams.map((s) => s.url));
+    expect(urls.some((u) => /topic=run/.test(u) && /format=normalised-v1/.test(u))).toBe(true);
+  });
+
+  test('live text grows in order and the stored message replaces it after the terminal', async ({ page }) => {
+    const run = await startRun(page, `grow-${uid()}`);
+    await delta(page, 'a1', 'Hel');
+    await expect(live(page)).toContainText('Hel');
+    await delta(page, 'a1', 'lo wor');
+    await expect(live(page)).toContainText('Hello wor');
+    await delta(page, 'a1', 'ld');
+    await expect(live(page).locator('[data-live-item]')).toHaveText('Hello world');
+    await expect(page.locator('[data-working]')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
+    await emit(page, 'item.completed', driver('item.completed', 'a1', { item_type: 'assistant', phase: 'final', text: 'Hello world' }));
+    await run.finish('succeeded');
+    await expect(live(page)).toHaveCount(0);
+    await expect(page.locator('[data-chat-bubble]').filter({ hasText: 'The stored final answer.' })).toHaveCount(1);
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+  });
+
+  test('a tool step shows while it runs and as done after; commentary is dimmed', async ({ page }) => {
+    const run = await startRun(page, `tool-${uid()}`);
+    await delta(page, 'a1', 'Let me look. ');
+    await emit(page, 'item.completed', driver('item.completed', 'a1', { item_type: 'assistant', phase: 'commentary', text: 'Let me look. ' }));
+    await emit(page, 'item.started', driver('item.started', 'tool1', { item_type: 'tool', title: 'Read', status: 'running' }));
+    const chip = live(page).locator('[data-live-tool]');
+    await expect(chip).toContainText('Read');
+    await expect(chip).toHaveAttribute('data-status', 'running');
+    await expect(live(page).locator('[data-live-item][data-phase=commentary]')).toContainText('Let me look.');
+    await emit(page, 'item.completed', driver('item.completed', 'tool1', { item_type: 'tool', status: 'completed', ok: true }));
+    await expect(chip).toHaveAttribute('data-status', 'done');
+    await delta(page, 'a2', 'Done.');
+    await expect(live(page).locator('[data-live-item]').nth(1)).toHaveText('Done.');
+    await run.finish('succeeded');
+    await expect(live(page)).toHaveCount(0);
+  });
+
+  test('Stop freezes the text at once and shows it as stopped', async ({ page }) => {
+    const run = await startRun(page, `stop-${uid()}`);
+    await delta(page, 'a1', 'Partial answer');
+    await expect(live(page)).toContainText('Partial answer');
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await expect(live(page)).toHaveAttribute('data-stopped', 'true');
+    await delta(page, 'a1', ' that must not appear');
+    await page.waitForTimeout(250);
+    await expect(live(page).locator('[data-live-item]')).toHaveText('Partial answer');
+    await run.finish('cancelled');
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+    await expect(live(page)).toContainText('Partial answer');
+    await expect(live(page).locator('[data-live-stopped]')).toHaveText('Stopped');
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(run.state.cancelled).toBe(true);
+  });
+
+  test('a run without deltas looks as before and ignores the single completed item', async ({ page }) => {
+    const run = await startRun(page, `plain-${uid()}`);
+    await emit(page, 'item.completed', driver('item.completed', 'legacy-1', { item_type: 'assistant', phase: 'final', text: 'whole reply' }));
+    await page.waitForTimeout(200);
+    await expect(live(page)).toHaveCount(0);
+    await expect(page.locator('[data-working]')).toBeVisible();
+    await run.finish('succeeded');
+    await expect(page.locator('[data-working]')).toHaveCount(0);
+    await expect(page.locator('[data-chat-bubble]').filter({ hasText: 'The stored final answer.' })).toHaveCount(1);
+    await expect(live(page)).toHaveCount(0);
+  });
+
+  test('unknown and non-lifecycle events never end the run', async ({ page }) => {
+    const run = await startRun(page, `unk-${uid()}`);
+    for (const type of ['turn.completed', 'usage', 'runtime.notice', 'runtime.error', 'session.started', 'future.event', 'done', 'finished']) {
+      await emit(page, type, driver(type, null, { anything: 1 }));
+    }
+    await emit(page, 'weird', 'not an object');
+    await page.waitForTimeout(250);
+    await expect(page.locator('[data-working]')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
+    await delta(page, 'a1', 'still streaming');
+    await expect(live(page)).toContainText('still streaming');
+    await run.finish('succeeded');
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+    await expect(live(page)).toHaveCount(0);
+  });
+
+  test('hundreds of deltas are coalesced into few renders', async ({ page }) => {
+    const run = await startRun(page, `burst-${uid()}`);
+    const mutations = await page.evaluate(async () => {
+      const w = window as unknown as { __streams: Array<{ listeners: Record<string, Array<(ev: { data: string }) => void>> }> };
+      let count = 0;
+      const obs = new MutationObserver((list) => {
+        count += list.length;
+      });
+      obs.observe(document.body, { childList: true, subtree: true, characterData: true });
+      for (let i = 0; i < 400; i++) {
+        const msg = {
+          type: 'stream', stream_id: 's1', event: 'content.delta', id: 2 + i,
+          data: { type: 'content.delta', item_id: 'a1', data: { stream_kind: 'assistant_text', delta: 'x' } },
+        };
+        for (const s of w.__streams) for (const fn of s.listeners.stream ?? []) fn({ data: JSON.stringify(msg) });
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      obs.disconnect();
+      return count;
+    });
+    await expect(live(page).locator('[data-live-item]')).toHaveText('x'.repeat(400));
+    expect(mutations).toBeLessThan(400);
+    await run.finish('succeeded');
+  });
+});

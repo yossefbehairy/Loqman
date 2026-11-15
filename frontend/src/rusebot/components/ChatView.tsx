@@ -16,6 +16,7 @@ import { Composer } from './Composer';
 import { ApprovalCard } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
 import { stripContract, type ChatState, type EngineState } from '../state/useChat';
+import { hasLiveContent, type LiveTurn } from '../state/liveTurn';
 import type { Agent } from '../types';
 import { useKeepDecided } from '../state/useKeepDecided';
 import type { Conversation } from '../data/worker';
@@ -119,6 +120,41 @@ function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string;
   );
 }
 
+/** The reply while it streams in: live text per item, tool steps as compact chips. The stored message replaces it when the turn ends. */
+function LiveReply({ turn }: { turn: LiveTurn }) {
+  const last = turn.items.length - 1;
+  return (
+    <div data-live-bubble="" data-stopped={turn.stopped ? 'true' : 'false'} className="flex w-full flex-col items-start">
+      <div className="w-fit max-w-[min(var(--chat-bubble-max),var(--chat-bubble-pct))] rounded-[23px] bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink">
+        {turn.items.map((item, i) => {
+          if (item.kind === 'tool') {
+            const state = item.status === 'running' ? 'running' : item.status === 'failed' ? 'failed' : 'done';
+            return (
+              <div key={item.id} data-live-tool="" data-status={state} className="my-1 flex items-center gap-1.5 text-[12.5px] text-ink-secondary">
+                <Cpu size={12} aria-hidden="true" />
+                <span className="font-medium">{item.title}</span>
+                <span>{state === 'running' ? 'running' : state === 'failed' ? 'failed' : 'done'}</span>
+              </div>
+            );
+          }
+          if (!item.streamed || !item.text) return null;
+          const commentary = item.done && item.phase === 'commentary';
+          return (
+            <div key={item.id} data-live-item="" data-phase={item.phase ?? 'streaming'} className={cn(commentary && 'text-ink-secondary opacity-70')}>
+              <ChatMarkdown text={item.text} live={!item.done && !turn.stopped && i <= last} />
+            </div>
+          );
+        })}
+        {turn.stopped && (
+          <div data-live-stopped="" className="mt-1 text-[12.5px] text-ink-tertiary">
+            Stopped
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function EmptyChat({ name, role, description }: { name: string; role?: string; description: string }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-3 py-24 text-center">
@@ -182,6 +218,14 @@ export function ChatView({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [lastKey, chat.selectedId]);
+
+  const live = hasLiveContent(chat.live) ? chat.live : null;
+  const liveSize = live ? live.items.reduce((n, i) => n + i.text.length + 1, 0) : 0;
+  const stick = useRef(true);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [liveSize]);
 
   const runApprovals = useMemo(
     () => chat.approvals.filter((a) => chat.run && a.run_id === chat.run.runId),
@@ -268,7 +312,13 @@ export function ChatView({
           </div>
         </GlassBar>
 
-        <div ref={scrollRef} className="glass-scroller h-full overflow-x-hidden overflow-y-auto overscroll-y-contain px-5 [overflow-anchor:none]">
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+          }}
+          className="glass-scroller h-full overflow-x-hidden overflow-y-auto overscroll-y-contain px-5 [overflow-anchor:none]">
           <div
             className="glass-scroller-content chat-column relative flex w-full flex-col gap-3"
             style={{ paddingBottom: dock.pad }}
@@ -290,7 +340,7 @@ export function ChatView({
               ))
             ) : (
               <>
-                {ready && chat.messages.length === 0 && !chat.pendingUser && !running && (
+                {ready && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
                   <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description="Send a message to start the conversation." />
                 )}
                 {rows}
@@ -307,7 +357,8 @@ export function ChatView({
                     onDecide={(decision) => decideApproval(a, () => chat.decide(a, decision))}
                   />
                 ))}
-                {running && (
+                {live && <LiveReply turn={live} />}
+                {running && !live && (
                   <div data-working className="flex items-center gap-2 px-1 text-[13px] text-ink-secondary" role="status">
                     <WorkingDots size={5} className="text-ink-tertiary" />
                     <span>{chat.run?.status === 'queued' ? 'Queued' : (chat.progress ?? 'Working')}</span>

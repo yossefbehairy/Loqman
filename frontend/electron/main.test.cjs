@@ -218,3 +218,20 @@ test('stream opening across a renderer reload closes instead of retaining an orp
   assert.equal(worker.calls.at(-1)[0], 'stream.close');
   assert.equal(await r.handlers['agentos:stream-close']({ sender }, 'late'), false);
 });
+
+test('stream-open forwards only the known event format to the worker', async () => {
+  const r = runtime(); await flush();
+  const sender = r.windows[1].webContents;
+  const worker = r.workers[0];
+  worker.request = async (method, params, _timeout, onResult) => {
+    worker.calls.push([method, params]);
+    if (onResult) onResult({ stream_id: 'fmt' });
+    return { stream_id: 'fmt' };
+  };
+  await r.handlers['agentos:stream-open']({ sender }, 'run', 'a', 0, 'normalised-v1');
+  assert.equal(worker.calls.at(-1)[1].event_format, 'normalised-v1');
+  await r.handlers['agentos:stream-open']({ sender }, 'run', 'b', 0, 'anything-else');
+  assert.equal('event_format' in worker.calls.at(-1)[1], false);
+  await r.handlers['agentos:stream-open']({ sender }, 'run', 'c', 0);
+  assert.equal('event_format' in worker.calls.at(-1)[1], false);
+});

@@ -189,11 +189,13 @@ function registerIpc() {
     }
   });
 
-  ipcMain.handle('agentos:stream-open', async (event, topic, id, lastEventId) => {
+  ipcMain.handle('agentos:stream-open', async (event, topic, id, lastEventId, eventFormat) => {
     if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
     if (!worker) throw new Error('Backend is not running');
     const params = { topic, id };
     if (Number.isInteger(lastEventId) && lastEventId > 0) params.last_event_id = lastEventId;
+    // Only the one known format is forwarded; anything else keeps the legacy stream.
+    if (eventFormat === 'normalised-v1') params.event_format = 'normalised-v1';
     const owner = worker;
     const generation = streamGenerations.get(event.sender);
     try {
