@@ -50,6 +50,20 @@ cd frontend && npx tsc -b && npx oxlint && npm run build && npx playwright test
 
 خط الأساس عند البدء (commit `032a42b`): pytest 351 ناجح و1 متخطى؛ node 11؛ Playwright 65/65؛ oxlint 9 تحذيرات.
 
+## تفصيل P4–P8 حسب تصميم العقد
+
+التصميم المعتمد: [DRIVER-CONTRACT-DESIGN.md](DRIVER-CONTRACT-DESIGN.md) (راجعته الجلسة الرئيسية في 15 نوفمبر؛ يُتّبع كما هو ما لم تُكتب هنا مخالفة).
+
+| المرحلة | خطوات التصميم | ملاحظات ملزمة |
+|---|---|---|
+| P4 | الخطوات 1–3: `TurnDriver` و`ExecuteTaskDriver` يغلّف المحركات الحالية؛ schema v18 (`runtime_sessions`، أعمدة `conversation_runs` و`conversation_run_events` و`approvals`) عبر `migrate.py` مع اختبار ترقية من v17 ونسخة احتياطية؛ `collect_turn` | لا تغيير سلوكي ظاهر؛ البث يبقى status-only افتراضيًا؛ تسجيل الاستخدام في نقطة واحدة؛ Job Object على Windows ضمن المشرف المشترك |
+| P5 | الخطوة 4: Claude `stream-json` و`--resume` خلف feature flag | نفس سياسة الأدوات الحالية أولًا؛ لا رجوع للمسار القديم بعد إرسال غير مؤكد |
+| P6 | الخطوة 5: `codex app-server` | عملية لكل turn أولًا؛ لا توسيع للصلاحيات (read-only) |
+| P7 | الخطوتان 6–7: نواة ACP؛ Antigravity ثم OpenCode بجانب القديم | لكل dialect أسلوب استكمال خاص؛ حذف adapter الـ OpenCode القديم فقط بعد إثبات تكافؤ القيود |
+| P8 | الخطوة 8: الواجهة | تعرّف صريح على الحالات النهائية قبل تفعيل الأحداث الجديدة |
+
+Loqman والمهام يبقون على `collect_turn` بنص كامل وسياق معزول لكل استدعاء حتى تصبح بانيات الـ prompt تزايدية (خطر تكرار التاريخ).
+
 ## سجل التقدم
 
 - [x] P1 — التوجيه (pytest 378، Playwright 68/68، تجربة حقيقية ناجحة)
@@ -72,3 +86,5 @@ cd frontend && npx tsc -b && npx oxlint && npm run build && npx playwright test
 **تمهيد P9 (Codex gpt-6.1-terra، كُتب دون تشغيل بناء).** `pyinstaller/smoke_test.py` و`smoke-test.ps1` (بوابة فعلية للـ exe)، مهمة Windows في CI، `docs/RELEASE.md`. غير متحقق منه حتى يُشغَّل بناء حقيقي في P9.
 
 **تصميم P4 (Codex gpt-6.1-sol).** `docs/DRIVER-CONTRACT-DESIGN.md`: يُراجع قبل بدء P4.
+
+**15 نوفمبر.** الجلسة أُعيد تشغيلها؛ ضاع scratchpad (ومعه مراجعة Codex لـ P1، أُعيد تشغيلها). عمل Codex على Electron انقطع لكنه كان مكتملًا: راجعته الجلسة الرئيسية وصار commit `13bdc04` (مشغّل محصّن من `ELECTRON_RUN_AS_NODE`، فتح الروابط في المتصفح، `agentos:backup-save` عبر preload باسم `saveBackup()`، تحصين worker-client؛ 36 اختبار node). P2 توقف بحد الاستخدام قبل أي تعديل واستُكمل بـ SendMessage.
