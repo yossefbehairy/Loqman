@@ -138,6 +138,17 @@ test('startup loads self-hosted fonts without external network requests or CSP v
 });
 
 test.describe('look and layout match RuseBot 0.1.127', () => {
+  test('an agent without a chat is listed in the sidebar and opens its chat', async ({ page }) => {
+    const name = `Idle-${uid()}`;
+    await call(page, 'profiles.create', { name, role_type: 'custom', description: 'Researcher', instructions: 'Be brief.' });
+    await open(page);
+    const row = page.locator('[data-sidebar-agent-row]').filter({ hasText: name });
+    await expect(row).toBeVisible();
+    await row.click();
+    await expect(page.locator('[data-sidebar-thread-row]').filter({ hasText: name })).toBeVisible();
+    await expect(page.locator('[data-sidebar-agent-row]').filter({ hasText: name })).toHaveCount(0);
+  });
+
   test('wide window: sidebar, composer, bubbles and fonts', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await open(page);

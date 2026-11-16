@@ -185,6 +185,8 @@ export function Shell() {
             goView('chat');
           }}
           onNewAgent={() => setNewAgent(true)}
+          agents={company.agents}
+          onOpenAgent={(a) => void openChatWith(a)}
           onSettings={() => setSettings('general')}
           activeRunIds={chat.activeRunIds}
           needsYou={needsYou}

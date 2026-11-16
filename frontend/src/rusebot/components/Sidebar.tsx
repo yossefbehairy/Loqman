@@ -8,9 +8,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, FileText, Loader2, MessageSquarePlus, PackageCheck, Plus, Search, Settings, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { GlassBar, GlassScrollFrame, GlassScroller } from './GlassScrollFrame';
-import type { Conversation } from '../data/worker';
+import { CEO_PROFILE_ID, type Conversation } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
+import type { Agent } from '../types';
 
 export type View = 'chat' | 'team' | 'contracts' | 'results';
 
@@ -73,6 +74,9 @@ export interface SidebarProps {
   onView: (view: View) => void;
   conversations: Conversation[];
   legacy: LegacyThread[];
+  /** Every agent of the company; the ones without a chat yet are listed so they can be opened from here. */
+  agents: Agent[];
+  onOpenAgent: (agent: Agent) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNewChat: () => void;
@@ -121,6 +125,12 @@ export function Sidebar(props: SidebarProps) {
     () => props.conversations.filter((c) => !q || c.title.toLowerCase().includes(q)),
     [props.conversations, q]
   );
+  const idleAgents = useMemo(() => {
+    const withChat = new Set(props.conversations.map((c) => c.profile_id).filter(Boolean));
+    return props.agents.filter(
+      (a) => a.id !== CEO_PROFILE_ID && !withChat.has(a.id) && (!q || a.name.toLowerCase().includes(q))
+    );
+  }, [props.agents, props.conversations, q]);
   const legacyRows = useMemo(
     () => props.legacy.filter((t) => !q || t.title.toLowerCase().includes(q)),
     [props.legacy, q]
@@ -341,6 +351,43 @@ export function Sidebar(props: SidebarProps) {
                 Boolean(props.activeRunIds[c.id])
               )
             )}
+            {idleAgents.length > 0 && !rail && (
+              <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+                Agents
+              </div>
+            )}
+            {idleAgents.map((a) =>
+              rail ? (
+                <button
+                  key={`agent:${a.id}`}
+                  type="button"
+                  data-sidebar-agent-row={a.id}
+                  title={a.name}
+                  aria-label={a.name}
+                  onClick={() => props.onOpenAgent(a)}
+                  className="mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium text-ink-secondary hover:bg-raised/50 hover:text-ink"
+                >
+                  {a.name.trim().charAt(0).toUpperCase() || '?'}
+                </button>
+              ) : (
+                <button
+                  key={`agent:${a.id}`}
+                  type="button"
+                  data-sidebar-agent-row={a.id}
+                  title={a.name}
+                  onClick={() => props.onOpenAgent(a)}
+                  className="flex min-h-[46px] min-w-0 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none hover:bg-raised/50 focus-visible:ring-1 focus-visible:ring-accent/60"
+                >
+                  <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-raised text-[13px] font-medium text-ink-secondary">
+                    {a.name.trim().charAt(0).toUpperCase() || '?'}
+                  </span>
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span dir="auto" className="truncate text-[14px] font-medium leading-5 text-ink">{a.name}</span>
+                    <span dir="auto" className="truncate text-[12.5px] leading-4 text-ink-secondary">{a.role}</span>
+                  </span>
+                </button>
+              )
+            )}
             {legacyRows.length > 0 && !rail && (
               <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
                 Earlier chats
@@ -355,7 +402,7 @@ export function Sidebar(props: SidebarProps) {
                 false
               )
             )}
-            {rows.length === 0 && legacyRows.length === 0 && q && (
+            {rows.length === 0 && legacyRows.length === 0 && idleAgents.length === 0 && q && (
               <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">No chats match “{query}”.</div>
             )}
           </div>
