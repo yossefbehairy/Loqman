@@ -76,6 +76,8 @@ class Application:
         db = Database(path)
         try:
             init_db(db)
+            from .db.ceo_history_dedupe import dedupe_ceo_history
+            dedupe_ceo_history(db)
             from .core.workspace_writes import recover
             recover(db)
             recovery = run_startup_crash_recovery(db)

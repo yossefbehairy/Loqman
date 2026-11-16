@@ -245,6 +245,9 @@ against the real CLI. Owner check before deleting the legacy adapter (needs the 
 5. Send a second message in the same conversation and check it resumed (`session.started.resumed`), then cancel mid-reply.
 6. Confirm free models still need no key, or set the opt-in keys. Only after 1-6 delete `opencode_runtime`'s HTTP/argv path.
 
+## CEO history dedupe (audit C14)
+At start, after migrate, `db/ceo_history_dedupe.py` removes messages duplicated by old repeated imports in conversations titled "CEO history": same conversation, role, content and `created_at`, keeping the lowest `seq` (rows referenced by runs are never deleted). No schema bump or marker: a clean DB is a no-op; before the first deletion a `<db>.pre-ceo-dedupe-<stamp>.bak` copy is made. Only the removed count is logged.
+
 ## Run
 ```powershell
 backend\.venv\Scripts\python.exe -m backend.pyworker --data-dir C:\path\userData      # <dir>\agentos.db (desktop)
