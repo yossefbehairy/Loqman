@@ -91,6 +91,19 @@ REQUIRED_FLAGS = ("--print", "--output-format", "--tools", "--strict-mcp-config"
 
 # Documented aliases only. Availability for the user's account is NOT verified.
 KNOWN_MODEL_ALIASES = ("sonnet", "opus", "haiku")
+# Full model ids and long-context variants the CLI accepts for --model. The CLI cannot list models, so every
+# entry is 'unverified': it works only if the user's Claude account has access to it.
+KNOWN_MODELS = (
+    ("sonnet", "Claude Sonnet (latest)"),
+    ("opus", "Claude Opus (latest)"),
+    ("haiku", "Claude Haiku (latest)"),
+    ("claude-fable-5-2", "Claude Fable 5.2"),
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ("sonnet[1m]", "Claude Sonnet (latest, 1M context)"),
+    ("opus[1m]", "Claude Opus (latest, 1M context)"),
+)
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\[\]]{0,63}$")
 _STRIPPED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
@@ -217,7 +230,7 @@ class ClaudeCodeRuntime:
     # -- health / models ---------------------------------------------------
     async def check_health(self) -> RuntimeHealth:
         """Install + login status only. Never starts a model turn."""
-        models = len(KNOWN_MODEL_ALIASES)
+        models = len(KNOWN_MODELS)
         if not self._cmd:
             return RuntimeHealth(status="offline", service_url=None,
                                  default_model_status="unavailable", models_count=0,
@@ -236,7 +249,7 @@ class ClaudeCodeRuntime:
                              models_count=models, free_models_count=0)
 
     async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]:
-        """Static documented aliases. The CLI cannot list models, so these are
+        """Static documented aliases and ids. The CLI cannot list models, so these are
         'unverified' and never free (free_only=True therefore returns [])."""
         if free_only:
             return []
