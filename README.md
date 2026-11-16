@@ -8,7 +8,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Loqman is a local-first desktop app for running a small company of specialized AI agents. You chat with Loqman, the CEO agent, who can create agents and teams for you and answer questions about your company. You talk to the agents directly, delegate work, and review what they deliver. The in-app engine is called **AgentOS**.
+Loqman is a local-first desktop app for running a small company of specialized AI agents. You chat with Loqman, the CEO agent, who can create agents and teams for you and answer questions about your company. You talk to the agents directly, delegate work, and review what they deliver.
 
 Everything runs on your machine: SQLite for state and a frozen backend sidecar inside the installer. There is no Loqman cloud account and no paid fallback model. OpenCode is limited to its free models; Claude Code, Codex and Antigravity use the accounts you signed in to in their own CLIs.
 
@@ -150,7 +150,7 @@ cd frontend
 npm run desktop:dist
 ```
 
-The NSIS installer lands in `frontend\release\AgentOS-Setup-<version>.exe`. It bundles the frozen backend, so the target machine needs neither Python nor Node. `Start-AgentOS.bat` launches the latest built copies.
+The NSIS installer lands in `frontend\release\Loqman-Setup-<version>.exe`. It bundles the frozen backend, so the target machine needs neither Python nor Node. `Start-Loqman.bat` launches the latest built copies.
 
 ## Configuration
 

@@ -2,7 +2,7 @@
  * Visual structure follows RuseBot 0.1.127 src/components/ApprovalCard.tsx and
  * PendingApproval.tsx (Apache-2.0, Copyright 2026 Milind Soni and OpenMausBot
  * contributors): card container, title row, monospace detail block, status
- * line and the rounded approve/deny controls. Decisions go to the AgentOS
+ * line and the rounded approve/deny controls. Decisions go to the Loqman
  * worker (approvals.decide for tool permissions, ceo.approve / ceo.deny for
  * manager proposals).
  */

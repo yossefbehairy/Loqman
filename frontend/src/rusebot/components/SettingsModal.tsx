@@ -298,11 +298,11 @@ export function SettingsModal({
             {page === 'ai' && <AiProviders />}
             {page === 'about' && (
               <section data-settings-block="about" className="flex flex-col gap-4">
-                <Card title="AgentOS" subtitle="Local-first multi-agent workflow app.">
+                <Card title="Loqman" subtitle="Local-first multi-agent workflow app.">
                   <p className="text-[12.5px] leading-relaxed text-ink-secondary">
                     This interface is adapted from RuseBot 0.1.127, Copyright 2026 Milind Soni and OpenMausBot contributors, used under the
                     Apache License 2.0. RuseBot is a modified version of OpenMausBot; the OpenMausBot name and mascot are not licensed
-                    for this product. Changes: the RuseBot server, store and cloud features were replaced by the AgentOS worker.
+                    for this product. Changes: the RuseBot server, store and cloud features were replaced by the Loqman worker.
                   </p>
                 </Card>
               </section>

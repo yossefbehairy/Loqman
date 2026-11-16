@@ -41,7 +41,7 @@ for features this port does not use (T3 Code, Cache Tax, hpke-js, WebRTC) are no
 | `components/ResultsView.tsx` | `TeamMapPage.tsx` header |
 | `components/SettingsModal.tsx` | `SettingsModal.tsx`, `SettingsPrimitives.tsx` |
 
-Written for AgentOS (no RuseBot source): `data/*`, `state/*`, `entry.tsx`.
+Written for Loqman (no RuseBot source): `data/*`, `state/*`, `entry.tsx`.
 
 ## Build
 
@@ -61,7 +61,7 @@ only), plus browser-stored threads (`agentos_ceo_threads_v1`) shown read-only un
 
 ## Known differences from the reference
 
-Intended (content or capability AgentOS does not have):
+Intended (content or capability Loqman does not have):
 
 - No mascot/avatar art; initials are used. No voice, call, phone pairing, apps/plugins,
   routines, channels, browser/computer panels, usage page, updates, onboarding tour,

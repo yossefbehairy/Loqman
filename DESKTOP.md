@@ -7,8 +7,8 @@ Desktop packaging for AgentOS uses **Electron** (shell + UI) and **PyInstaller**
 ## 1. Architecture
 
 ```
-AgentOS-Setup-x.x.x.exe (electron-builder · NSIS)
-└── AgentOS.exe  (Electron)
+Loqman-Setup-x.x.x.exe (electron-builder · NSIS)
+└── Loqman.exe  (Electron)
     ├── app.asar
     │   ├── electron/         ← main.cjs · preload.cjs · worker-client.cjs · splash.html
     │   └── dist/             ← built React frontend (vite, base "./")
@@ -56,7 +56,7 @@ npm run desktop
 
 With `AGENTOS_DEV_SERVER_URL` set, Electron loads the Vite server. Otherwise `npm run desktop` builds and loads the local `dist` files. Electron spawns the worker with the venv Python (`python -m backend.pyworker --data-dir <userData>`) and talks to it over stdin/stdout.
 
-`npm run desktop` uses `electron/launch.cjs`, which removes inherited `ELECTRON_RUN_AS_NODE` before spawning Electron (including VS Code terminals). `Start-AgentOS.bat` also clears it for packaged and installed copies. `desktop:dist` only packages the app; it does not launch Electron.
+`npm run desktop` uses `electron/launch.cjs`, which removes inherited `ELECTRON_RUN_AS_NODE` before spawning Electron (including VS Code terminals). `Start-Loqman.bat` also clears it for packaged and installed copies. `desktop:dist` only packages the app; it does not launch Electron.
 
 External HTTP/HTTPS links open in the default browser. Popup windows and renderer navigation away from the app are blocked; other URL schemes are not opened.
 
@@ -102,7 +102,7 @@ cd d:\AgentOS\frontend
 npm run desktop:dist          # npm run build && electron-builder --win --x64
 ```
 
-Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` → the user picks the install directory; per-user by default).
+Output: `frontend\release\Loqman-Setup-<version>.exe` (NSIS, `oneClick: false` → the user picks the install directory; per-user by default).
 
 > `electron-builder` **requires** `frontend\build-resources\agentos-backend.exe` to exist (Step 1). Packaging fails without it.
 

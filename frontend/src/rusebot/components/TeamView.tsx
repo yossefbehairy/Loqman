@@ -3,8 +3,8 @@
  * src/components/TeamMapPage.tsx and TeamCanvas.tsx (Apache-2.0, Copyright
  * 2026 Milind Soni and OpenMausBot contributors): page header, dotted canvas,
  * department sections and 236x126 bot cards. The canvas is static (no pan,
- * zoom or drag-to-arrange). Structure comes from the classic AgentOS company
- * storage; profiles, missions and delegation use the AgentOS worker.
+ * zoom or drag-to-arrange). Structure comes from the classic Loqman company
+ * storage; profiles, missions and delegation use the Loqman worker.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronDown, FileText, MessageCircle, Send, Trash2, UserPlus, UsersRound, X } from 'lucide-react';

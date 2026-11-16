@@ -1,7 +1,7 @@
 /*
  * Provider marks copied from RuseBot 0.1.127 src/components/ProviderIcons.tsx
  * (Apache-2.0, Copyright 2026 Milind Soni and OpenMausBot contributors).
- * Only the marks for the engines AgentOS can run are included.
+ * Only the marks for the engines Loqman can run are included.
  */
 import { cn } from '../lib/cn';
 

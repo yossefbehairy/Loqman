@@ -3,7 +3,7 @@
  * src/components/AttachmentGallery.tsx / AttachmentPreview.tsx (Apache-2.0,
  * Copyright 2026 Milind Soni and OpenMausBot contributors): rounded surface,
  * file name row, expandable preview. Review state and content come from the
- * AgentOS worker (deliverables.*).
+ * Loqman worker (deliverables.*).
  */
 import { useState } from 'react';
 import { Check, ChevronDown, Download, FileText, X } from 'lucide-react';

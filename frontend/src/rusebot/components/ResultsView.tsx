@@ -1,7 +1,7 @@
 /*
  * Page chrome follows RuseBot 0.1.127 src/components/TeamMapPage.tsx header
  * (Apache-2.0, Copyright 2026 Milind Soni and OpenMausBot contributors).
- * Content is AgentOS-specific: runs waiting on you (tool approvals, manager
+ * Content is Loqman-specific: runs waiting on you (tool approvals, manager
  * proposals) and every deliverable draft produced by recorded runs.
  */
 import { PackageCheck } from 'lucide-react';

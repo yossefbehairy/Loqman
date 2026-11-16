@@ -35,7 +35,7 @@ Run these steps from a Windows checkout after concurrent backend and frontend ed
    Pop-Location
    ```
 
-   The configured output is `frontend\release\AgentOS-Setup-<version>.exe` (Windows x64 NSIS). Check that the packaged worker is the just-tested build. Build and smoke-test again if worker source changes.
+   The configured output is `frontend\release\Loqman-Setup-<version>.exe` (Windows x64 NSIS). Check that the packaged worker is the just-tested build. Build and smoke-test again if worker source changes.
 
 5. On a clean Windows user profile, install and launch the installer. Confirm first-run startup, create a conversation and exercise the intended configured engine, quit and relaunch, and confirm persistence. Check that the data folder is `%APPDATA%\Loqman` and contains `agentos.db`; Electron sets its name to `Loqman`. Test an upgrade over a previous installed version with an existing database, confirming data survives and works after migration. Uninstall and inspect the installed files and user data; expected uninstall data retention is not established by the repository configuration, so record the observed behavior. Test without development tools installed. Record Windows version, installer version and results.
 

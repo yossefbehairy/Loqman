@@ -2,7 +2,7 @@
  * Frame composition follows RuseBot 0.1.127 src/App.tsx (Apache-2.0, Copyright
  * 2026 Milind Soni and OpenMausBot contributors): sidebar + main column, the
  * hamburger/drawer behaviour below the md breakpoint and the collapse to an
- * icon rail when a side panel needs the room. State comes from the AgentOS
+ * icon rail when a side panel needs the room. State comes from the Loqman
  * worker instead of the RuseBot store.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';

@@ -3,7 +3,7 @@
  * src/components/Composer.tsx and ComposerPlusMenu.tsx (Apache-2.0, Copyright
  * 2026 Milind Soni and OpenMausBot contributors): rounded composer surface,
  * "+" button, auto-growing textarea, Enter to send, Shift+Enter for a newline.
- * The voice/call control is replaced by send/stop wired to the AgentOS worker;
+ * The voice/call control is replaced by send/stop wired to the Loqman worker;
  * the "+" menu holds the engine and model choice.
  */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';

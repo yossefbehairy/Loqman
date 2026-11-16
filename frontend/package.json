@@ -2,8 +2,8 @@
   "name": "frontend",
   "private": true,
   "version": "0.2.2",
-  "description": "AgentOS — local-first multi-agent workflow desktop app",
-  "author": "AgentOS",
+  "description": "Loqman — local-first multi-agent workflow desktop app",
+  "author": "Loqman",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -48,8 +48,8 @@
   },
   "build": {
     "appId": "com.agentos.desktop",
-    "productName": "AgentOS",
-    "artifactName": "AgentOS-Setup-${version}.exe",
+    "productName": "Loqman",
+    "artifactName": "Loqman-Setup-${version}.exe",
     "directories": {
       "output": "release"
     },
