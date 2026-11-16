@@ -94,9 +94,9 @@ KNOWN_MODEL_ALIASES = ("sonnet", "opus", "haiku")
 # Full model ids and long-context variants the CLI accepts for --model. The CLI cannot list models, so every
 # entry is 'unverified': it works only if the user's Claude account has access to it.
 KNOWN_MODELS = (
-    ("sonnet", "Claude Sonnet (latest)"),
-    ("opus", "Claude Opus (latest)"),
-    ("haiku", "Claude Haiku (latest)"),
+    ("sonnet", "Claude Sonnet"),
+    ("opus", "Claude Opus"),
+    ("haiku", "Claude Haiku"),
     ("claude-fable-5-2", "Claude Fable 5.2"),
     ("claude-opus-5-5", "Claude Opus 5.5"),
     ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
@@ -253,10 +253,10 @@ class ClaudeCodeRuntime:
         'unverified' and never free (free_only=True therefore returns [])."""
         if free_only:
             return []
-        return [ModelCatalogEntry(id=a, name=f"Claude {a.capitalize()}",
+        return [ModelCatalogEntry(id=mid, name=name,
                                   provider_id="anthropic", cost=ModelCost(), variants=[],
                                   is_free=False, status="unverified")
-                for a in KNOWN_MODEL_ALIASES]
+                for mid, name in KNOWN_MODELS]
 
     # -- execution -----------------------------------------------------------
     async def execute_task(self, task: ExecuteAgentTask) -> AgentResult:

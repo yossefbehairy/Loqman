@@ -203,7 +203,7 @@ def test_models_never_free_or_verified():
     rt = ClaudeCodeRuntime(cli_cmd=["nonexistent"])
     assert run(rt.list_available_models(free_only=True)) == []
     ms = run(rt.list_available_models(free_only=False))
-    assert {m.id for m in ms} == {"sonnet", "opus", "haiku"}
+    assert {"sonnet", "opus", "haiku"} <= {m.id for m in ms}
     assert all(not m.is_free and m.status == "unverified" for m in ms)
 
 
@@ -216,3 +216,11 @@ def test_factory_selection_and_default(monkeypatch):
     monkeypatch.setattr(rtpkg, "_engine_instances", {})
     assert isinstance(rtpkg.get_runtime("claude-code"), ClaudeCodeRuntime)   # chosen by engine id, not by RUNTIME_MODE
     monkeypatch.setattr(rtpkg, "_runtime_instance", None)
+
+
+def test_catalog_lists_aliases_full_ids_and_long_context_variants():
+    rt = ClaudeCodeRuntime(cli_cmd=["nonexistent"])
+    ids = [m.id for m in run(rt.list_available_models(free_only=False))]
+    assert ids[:3] == ["sonnet", "opus", "haiku"]  # the default stays the first alias
+    for expected in ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "sonnet[1m]", "opus[1m]"):
+        assert expected in ids

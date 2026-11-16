@@ -156,7 +156,8 @@ async def test_model_names_are_clean(make_app, monkeypatch):
     api = Api(make_app(runtime_factory=lambda e: ClaudeCodeRuntime() if e == "claude-code" else CodexCliRuntime(),
                        mode="real"))
     claude = (await api("engines.models", engine_id="claude-code"))["models"]
-    assert [m["name"] for m in claude] == ["Claude Sonnet", "Claude Opus", "Claude Haiku"]
+    assert [m["name"] for m in claude][:3] == ["Claude Sonnet", "Claude Opus", "Claude Haiku"]
+    assert "Claude Fable 5.2" in [m["name"] for m in claude]
     assert all(m["status"] == "unverified" for m in claude)
     codex = (await api("engines.models", engine_id="codex"))["models"]
     assert [m["name"] for m in codex] == ["GPT-5"] and codex[0]["status"] == "unverified"
