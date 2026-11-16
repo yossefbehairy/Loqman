@@ -56,6 +56,16 @@ def antigravity_driver_enabled(env=None) -> bool:
     return value.strip().lower() in ("acp", "1", "on", "true")
 
 
+OPENCODE_DRIVER_ENV = "AGENTOS_OPENCODE_DRIVER"
+
+
+def opencode_driver_enabled(env=None) -> bool:
+    """Feature flag for the native OpenCode ACP driver. Default OFF; ``AGENTOS_OPENCODE_DRIVER=acp`` enables it."""
+    import os
+    value = (os.environ if env is None else env).get(OPENCODE_DRIVER_ENV, "")
+    return value.strip().lower() in ("acp", "1", "on", "true")
+
+
 def create_turn_driver(engine_id: str, runtime: AgentRuntime, *, legacy_task=None, db=None, conversation_id=None,
                        run_id=None, resume_prompt=None, enabled=None):
     """The ONE place that chooses a turn driver. Claude streaming only when enabled; otherwise the whole-result wrapper."""
@@ -85,5 +95,9 @@ def create_turn_driver(engine_id: str, runtime: AgentRuntime, *, legacy_task=Non
             resume_check = conversation_resume_check(db, conversation_id, run_id)
         return AntigravityAcpDriver(sessions=sessions, resume_prompt=resume_prompt, resume_check=resume_check,
                                     allow_api_key_env=bool(getattr(runtime, "_allow_api_key_env", False)))
+    if engine_id == "opencode" and opencode_driver_enabled():
+        from backend.pyworker.runtime.opencode_driver import build_opencode_driver
+        return build_opencode_driver(db=db, conversation_id=conversation_id, run_id=run_id, resume_prompt=resume_prompt,
+                                     runtime=runtime)
     from backend.pyworker.runtime.execute_driver import ExecuteTaskDriver
     return ExecuteTaskDriver(runtime, engine_id, legacy_task=legacy_task)

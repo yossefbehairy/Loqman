@@ -213,6 +213,38 @@ CEO/mission/workflow scopes stay isolated. Interrupt sends the `session/cancel` 
 `interrupt_grace_s`. Prompts over 200000 chars are refused (the legacy adapter truncated). Tests:
 `backend/tests/pw/test_acp_transport.py`, `backend/tests/pw/test_antigravity_driver.py` (fake ACP agent only).
 
+### OpenCode ACP driver (P7b)
+
+`runtime/opencode_driver.py` runs `opencode acp` on the shared ACP transport by subclassing the Antigravity driver
+(same deny-all permissions, single terminal event, `session/resume`-only probing, `runtime_sessions` rows with protocol
+`acp-resume` and namespace `opencode:default`, interrupt = `session/cancel` then kill). OFF by default: set
+`AGENTOS_OPENCODE_DRIVER=acp` to route OpenCode runs through it; anything else keeps the legacy `opencode api` adapter
+(`opencode_runtime.py`, NOT removed yet). The prompt travels only in the JSON-RPC `session/prompt` frame, never on argv
+(resolves S4); argv is exactly `opencode acp` (its only flag, `--login`, is never passed; cwd goes in `session/new`).
+
+Restrictions vs the legacy adapter, fail closed:
+- Locked agent: the ACP session mode IS the OpenCode agent. Only `agentos-chat` / `agentos-worker` are accepted (default
+  worker, as legacy); the agent must be offered in `session/new.modes`, accepted by `session/set_mode`, and any later
+  `current_mode_update` to another mode aborts the turn. If OpenCode does not expose those (they are `hidden: true` in
+  `~/.config/opencode/agents`) the turn fails `unsupported_capability` before the prompt; it never runs `build`.
+- Free-only: ACP has no pricing, so the model is verified before launch with the legacy catalog check
+  (`RealOpenCodeRuntime.resolve_model`, explicit 0/0 cost + allowlisted provider; that CLI call carries no prompt). The
+  wire id `<providerID>/<modelID>` must be offered by `session/new` and accepted by `session/set_model`; no resolver = refuse.
+- Variants/effort, a separate system prompt and scoped MCP tools are refused. Output cap 60000 chars. The legacy
+  24000-char silent prompt truncation is gone (it existed for argv size); over 200000 is refused.
+- Environment: `child_env` allowlist plus non-secret OpenCode/XDG location variables; `NVIDIA_API_KEY` /
+  `OPENCODE_API_KEY` only with the opt-in flag. Narrower than legacy (which forwarded the whole environment).
+
+Status: implemented and tested against a fake ACP agent only (`backend/tests/pw/test_opencode_driver.py`). NOT verified
+against the real CLI. Owner check before deleting the legacy adapter (needs the user's OpenCode install; no login needed):
+1. `set AGENTOS_OPENCODE_DRIVER=acp` and restart the worker; send one short chat message with a free model.
+2. Expect a reply. If the turn fails with "does not offer the locked agent mode", OpenCode hides `agentos-*` over ACP:
+   un-hide them (or add a non-hidden locked agent and allow its id) and retry; do not loosen the check.
+3. Confirm the model id format OpenCode lists (`provider/model`); a "not offered" failure means the format differs.
+4. Ask it to run a shell command / read a file: it must refuse (permission denied notice, no side effect).
+5. Send a second message in the same conversation and check it resumed (`session.started.resumed`), then cancel mid-reply.
+6. Confirm free models still need no key, or set the opt-in keys. Only after 1-6 delete `opencode_runtime`'s HTTP/argv path.
+
 ## Run
 ```powershell
 backend\.venv\Scripts\python.exe -m backend.pyworker --data-dir C:\path\userData      # <dir>\agentos.db (desktop)

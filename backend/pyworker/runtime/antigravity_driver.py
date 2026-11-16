@@ -184,6 +184,10 @@ class _Turn:
 
 class AntigravityAcpDriver:
     engine = "antigravity"
+    # Dialect hooks (class attributes / small methods) so a sibling ACP driver (opencode_driver) reuses everything else.
+    namespace = NAMESPACE
+    acp_args = tuple(ACP_ARGS)
+    sessions_dir = "antigravity-sessions"
     capabilities = DriverCapabilities(True, True, False, False, "resume", "relaunch", False)
 
     def __init__(self, cli_cmd=None, *, runtime_key: str = "default", sessions: Optional[SessionRepository] = None,
@@ -215,7 +219,7 @@ class AntigravityAcpDriver:
         root = self._cwd_root
         if root is None:
             from backend.pyworker.appsettings import settings
-            root = os.path.join(os.path.dirname(os.path.abspath(settings.SQLITE_DB_PATH)), "antigravity-sessions")
+            root = os.path.join(os.path.dirname(os.path.abspath(settings.SQLITE_DB_PATH)), self.sessions_dir)
         path = os.path.join(root, "conversation", scope_dir_name(scope_id))
         os.makedirs(path, exist_ok=True)
         return path
@@ -283,7 +287,7 @@ class AntigravityAcpDriver:
                     raise _failure("unsupported_capability", "Session protocol is not supported by Antigravity.", "resume", "not-submitted")
                 resume_id, generation = t.session.native_session_id, t.session.generation
             elif (row is not None and not force_fresh and not t.session_reset and row["state"] != "invalid"
-                  and row["last_turn_id"] and row["protocol"] == PROTOCOL and row["namespace"] == NAMESPACE
+                  and row["last_turn_id"] and row["protocol"] == PROTOCOL and row["namespace"] == self.namespace
                   and row["cwd"] == cwd and (self.resume_check is None or self.resume_check(row))):
                 resume_id, generation = row["native_session_id"], row["generation"]
             if resume_id is None and row is not None:
@@ -296,8 +300,19 @@ class AntigravityAcpDriver:
                 "prompt": incremental if resume_id else t.prompt, "row": row,
                 "rebuilt": bool(persist and resume_id is None and row is not None)}
 
+    def _mode_for(self, s: _Turn) -> str:
+        """The session mode this turn must run in (a restricted mode); anything else fails closed."""
+        return REQUIRED_MODE
+
+    def _model_for(self, s: _Turn) -> str:
+        """The model id as the agent's ACP dialect spells it (what is offered / set / compared)."""
+        return s.turn.model_id
+
+    async def _prepare(self, s: _Turn) -> None:
+        """Async admission checks that need I/O, run once after ``_validate`` and before any process is launched."""
+
     def _fingerprint(self, s: _Turn) -> str:
-        blob = json.dumps({"args": list(ACP_ARGS), "mode": REQUIRED_MODE, "model": s.turn.model_id, "permissions": "cancelled"},
+        blob = json.dumps({"args": list(self.acp_args), "mode": self._mode_for(s), "model": self._model_for(s), "permissions": "cancelled"},
                           sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:32]
 
@@ -307,7 +322,7 @@ class AntigravityAcpDriver:
         try:
             self.sessions.put(
                 scope_kind=s.turn.scope_kind, scope_id=s.turn.scope_id, engine=self.engine, runtime_key=self.runtime_key,
-                protocol=PROTOCOL, namespace=NAMESPACE, native_session_id=s.session_id, generation=s.generation,
+                protocol=PROTOCOL, namespace=self.namespace, native_session_id=s.session_id, generation=s.generation,
                 state=state, model_id=s.turn.model_id, provider_id=s.turn.provider_id, variant=s.turn.variant,
                 agent_id=s.turn.agent_id, cwd=plan["cwd"], config_fingerprint=self._fingerprint(s),
                 last_turn_id=last_turn_id)
@@ -339,6 +354,7 @@ class AntigravityAcpDriver:
             await self._started(s)
             self._check(s)
             self._validate(s)
+            await self._prepare(s)
             if not self._cmd:
                 raise _failure("cli_missing", "agy CLI not found on PATH.", "launch", "not-submitted")
             plan = self._plan(s)
@@ -429,7 +445,7 @@ class AntigravityAcpDriver:
         with tempfile.TemporaryDirectory(prefix="agentos-agy-acp-", ignore_cleanup_errors=True) as scratch:
             cwd = plan["cwd"] or scratch
             proc = await _StreamProcess.launch(
-                [*self._cmd, *ACP_ARGS], cwd=cwd, env=self._env(), on_out=conn.feed, on_err=lambda d: self._stderr(s, d),
+                [*self._cmd, *self.acp_args], cwd=cwd, env=self._env(), on_out=conn.feed, on_err=lambda d: self._stderr(s, d),
                 max_bytes=STREAM_BYTES)
             s.proc = proc
             exited = exit_timer = None
@@ -510,7 +526,7 @@ class AntigravityAcpDriver:
         await self._select_mode_and_model(s, conn, sid, info)
         self._check(s)
         await self._send(s, "session.started", {
-            "session_id": sid, "protocol": PROTOCOL, "namespace": NAMESPACE, "generation": s.generation,
+            "session_id": sid, "protocol": PROTOCOL, "namespace": self.namespace, "generation": s.generation,
             "model_id": s.model_seen or t.model_id, "resumed": s.resumed, "rebuilt": s.rebuilt})
         row = plan["row"]
         self._save_session(s, plan, "unverified", row["last_turn_id"] if (row and s.resumed) else None)  # durable before submit
@@ -595,22 +611,22 @@ class AntigravityAcpDriver:
         return models, modes
 
     async def _select_mode_and_model(self, s: _Turn, conn: AcpConnection, sid: str, info: dict):
-        model = s.turn.model_id
+        model, required = self._model_for(s), self._mode_for(s)
         models, modes = self._offered(info)
         fresh = not s.resumed  # a session/new result is authoritative; a resume result may omit the lists
-        if (modes is None and fresh) or (modes is not None and REQUIRED_MODE not in modes):
+        if (modes is None and fresh) or (modes is not None and required not in modes):
             raise _failure("unsupported_capability", "agy acp does not offer plan mode; refusing to run.", "handshake", "not-submitted")
         if (models is None and fresh) or (models is not None and model not in models):
             raise _failure("model_unavailable", "Requested model is not offered by agy acp.", "handshake", "not-submitted")
         try:
-            await self._call(s, "session/set_mode", s.conn.request, "session/set_mode", {"sessionId": sid, "modeId": REQUIRED_MODE})
+            await self._call(s, "session/set_mode", s.conn.request, "session/set_mode", {"sessionId": sid, "modeId": required})
         except AcpError:
             raise _failure("unsupported_capability", "agy acp did not accept plan mode; refusing to run (fail closed).",
                            "handshake", "not-submitted")
         s.plan_set = True
         try:
             await self._call(s, "session/set_model", s.conn.request, "session/set_model", {"sessionId": sid, "modelId": model})
-            s.model_seen = model
+            s.model_seen = s.turn.model_id
             return
         except AcpError as exc:
             if exc.code != -32601:  # only "method not found" may fall back
@@ -630,7 +646,7 @@ class AntigravityAcpDriver:
             for opt in returned:
                 if isinstance(opt, dict) and opt.get("id") == config_id and "currentValue" in opt and opt["currentValue"] != model:
                     raise _failure("model_unavailable", "agy acp kept a different model than requested.", "handshake", "not-submitted")
-        s.model_seen = model
+        s.model_seen = s.turn.model_id
 
     # -- agent -> client ----------------------------------------------------------------------------------------------
     def _violate(self, s: _Turn, message: str, phase: str = "running") -> DriverTurnError:
@@ -684,7 +700,7 @@ class AntigravityAcpDriver:
     async def _on_update(self, s: _Turn, update: dict, params: dict):
         kind = update.get("sessionUpdate")
         if kind == "current_mode_update":
-            if s.plan_set and update.get("currentModeId") != REQUIRED_MODE:  # also AFTER the prompt result: fails the turn
+            if s.plan_set and update.get("currentModeId") != self._mode_for(s):  # also AFTER the prompt result: fails the turn
                 raise self._violate(s, "agy acp left plan mode; aborting (fail closed).")
             return
         if kind == "config_option_update":
@@ -707,7 +723,7 @@ class AntigravityAcpDriver:
         for option in update.get("configOptions") or ():
             if isinstance(option, dict) and (option.get("category") == "model" or option.get("id") == "model") \
                     and isinstance(option.get("currentValue"), str):
-                if option["currentValue"] != s.turn.model_id:
+                if option["currentValue"] != self._model_for(s):
                     raise self._violate(s, "agy acp switched to a different model than requested; aborting (fail closed).")
 
     def _close_items(self, s: _Turn):
