@@ -12,6 +12,8 @@ import { cn } from '../lib/cn';
 import type { Agent, Team } from '../types';
 import { CEO_PROFILE_ID, cancelMission, isMissionTerminal, delegateToAgent, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
+import { useProviders } from '../state/useProviders';
+import { effectiveModel } from '../state/effectiveModel';
 
 const DOTS = {
   backgroundImage: 'radial-gradient(circle, color-mix(in srgb, var(--color-ink) 14%, transparent) 1px, transparent 1px)',
@@ -194,7 +196,8 @@ function initials(name: string): string {
   return name.trim().charAt(0).toUpperCase() || '?';
 }
 
-function AgentCard({ agent, selected, onOpen, onChat }: { agent: Agent; selected: boolean; onOpen: () => void; onChat: () => void }) {
+function AgentCard({ agent, profile, selected, onOpen, onChat }: { agent: Agent; profile: Profile | null; selected: boolean; onOpen: () => void; onChat: () => void }) {
+  const eff = effectiveModel(useProviders(), profile?.engine, agent.model);
   return (
     <article
       data-agent-card={agent.id}
@@ -235,8 +238,9 @@ function AgentCard({ agent, selected, onOpen, onChat }: { agent: Agent; selected
         >
           <MessageCircle size={15} />
         </button>
-        <span title={`Default model: ${agent.model}`} className="ml-auto flex h-8 min-w-0 max-w-[130px] items-center rounded-md px-2 text-[10px] text-ink-secondary">
-          <span className="truncate">{agent.model}</span>
+        <span
+          title={eff.inherited ? `Uses the default model chosen in Settings${eff.saved ? ` (saved model "${eff.saved}" is not offered by this provider)` : ''}` : `Model: ${eff.label}`} className="ml-auto flex h-8 min-w-0 max-w-[130px] items-center rounded-md px-2 text-[10px] text-ink-secondary">
+          <span className="truncate">{eff.label}</span>
         </span>
       </div>
     </article>
@@ -256,6 +260,7 @@ export function AgentPanel({
   onChat: () => void;
   onChanged: () => void;
 }) {
+  const drawerModel = effectiveModel(useProviders(), profile?.engine, profile?.default_model_id ?? agent.model);
   const [task, setTask] = useState('');
   const [instructions, setInstructions] = useState(profile?.instructions ?? '');
   const [note, setNote] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
@@ -334,7 +339,7 @@ export function AgentPanel({
         <dt className="text-ink-secondary">Status</dt>
         <dd>{agent.status}</dd>
         <dt className="text-ink-secondary">Model</dt>
-        <dd className="break-all">{profile?.default_model_id ?? agent.model}</dd>
+        <dd className="break-all">{drawerModel.label}</dd>
         <dt className="text-ink-secondary">Effort</dt>
         <dd>{agent.reason}</dd>
         <dt className="text-ink-secondary">Timeout</dt>
@@ -527,7 +532,7 @@ export function TeamView(props: TeamViewProps) {
                   </header>
                   <div className="flex flex-col gap-4 px-5 pb-5">
                     {g.members.map((a) => (
-                      <AgentCard key={a.id} agent={a} selected={selected === a.id} onOpen={() => setSelected(a.id)} onChat={() => props.onOpenChat(a)} />
+                      <AgentCard key={a.id} agent={a} profile={profiles.find((p) => p.id === a.profileId) ?? null} selected={selected === a.id} onOpen={() => setSelected(a.id)} onChat={() => props.onOpenChat(a)} />
                     ))}
                     {g.members.length === 0 && <p className="w-[236px] text-[12px] text-ink-secondary">No members yet.</p>}
                   </div>

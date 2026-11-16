@@ -149,6 +149,17 @@ test.describe('look and layout match RuseBot 0.1.127', () => {
     await expect(page.locator('[data-sidebar-agent-row]').filter({ hasText: name })).toHaveCount(0);
   });
 
+  test('an agent saved with a model the provider does not offer shows the default, not the stale id', async ({ page }) => {
+    const name = `Stale-${uid()}`;
+    await call(page, 'profiles.create', { name, role_type: 'custom', description: 'Analyst', instructions: 'Be brief.', default_model_id: 'zz-old-model-9' });
+    await open(page);
+    await page.locator('[data-sidebar-nav=team]').click();
+    const card = page.locator('article').filter({ hasText: name });
+    await expect(card).toBeVisible();
+    await expect(card).not.toContainText('zz-old-model-9');
+    await expect(card).toContainText('Default');
+  });
+
   test('wide window: sidebar, composer, bubbles and fonts', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await open(page);
