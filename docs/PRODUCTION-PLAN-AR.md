@@ -74,9 +74,9 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 - [x] P5 — Claude driver (commit `e628767`؛ pytest 423، تجربة حقيقية ناجحة؛ مطفأ افتراضيًا حتى P8)
 - [x] R — R-A (`0af3957`) و R-B (`dec632b`) و R-C (`4a6fb6d`); pytest 565
 - [x] P6 — Codex driver (commit `7b80c37`؛ تجربة حقيقية ناجحة؛ مطفأ افتراضيًا `AGENTOS_CODEX_DRIVER=appserver`)
-- [ ] P7 — P7a تم (`eb7a81a` + إصلاحات Grok `9c9b1a9`، مطفأ افتراضيًا)؛ P7b (OpenCode على ACP) قيد التنفيذ
+- [x] P7 — P7a (`eb7a81a`، `9c9b1a9`) و P7b (`70d9624`)؛ كلاهما مطفأ افتراضيًا؛ تجربة حقيقية تحتاج حساب المالك
 - [x] P8 — الواجهة: بث و Stop (commit `9108d99`؛ Playwright 87/87)
-- [ ] P9 — جاهزية الإنتاج
+- [x] P9 — بُني backend المجمّد (10.8MB) و smoke PASSED، بُني المثبّت AgentOS-Setup-0.2.2.exe (غير موقّع)، التطبيق المُغلَّف يعمل على قاعدة بيانات قائمة بلا عمليات يتيمة
 
 ### ملاحظات التنفيذ
 
@@ -163,3 +163,9 @@ Loqman والمهام يبقون على `collect_turn` بنص كامل وسيا�
 - **R-B:** 12 من 13 اختبارًا يفشل على الكود القديم؛ commit `dec632b`.
 
 > تعليمة المستخدم (16 نوفمبر): كمّل بدون توقف وانتظر لو الليميت خلص؛ عند الانتهاء من كل المراحل والاختبارات اعمل commit ثم **اقفل الجهاز** (هذا يلغي قاعدة عدم الإطفاء). Sonnet على R-A والإصلاحات، Sonnet على ملاحظات Grok لـ P7a.
+
+## الملخص النهائي (16 نوفمبر)
+
+- الفحوص النهائية: pytest 580 نجح/2 تخطي، node 44/44، Playwright 87/87، tsc نظيف، oxlint 9 تحذيرات (الخط الأساسي)، smoke للـ exe المجمّد PASSED، المثبّت `frontend/release/AgentOS-Setup-0.2.2.exe` اتبنى.
+- ما يحتاج المالك: (1) شهادة توقيع الكود (E4) — المثبّت حاليًا NotSigned؛ (2) تجربة حقيقية لسواقي Antigravity و OpenCode (خطوات في docs/PYWORKER.md) ثم تفعيل الأعلام `AGENTOS_ANTIGRAVITY_DRIVER=acp` و `AGENTOS_OPENCODE_DRIVER=acp` و `AGENTOS_CODEX_DRIVER=appserver`، وبعدها حذف adapter OpenCode القديم؛ (3) قرار تكرارات تاريخ CEO؛ (4) تجربة المثبّت/الإزالة على جهاز نظيف.
+- حدود معروفة: DNS rebinding في متصفح الأتمتة، نافذة سباق صغيرة في نشر ملفات workspace على ويندوز، P4-4 بدون اختبار يثبت منع هروب الأحفاد عند البدء.
