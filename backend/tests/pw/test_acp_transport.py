@@ -276,3 +276,45 @@ def test_capability_probe_never_assumes_and_model_config_lookup():
                {"id": "mode", "category": "mode", "options": [{"value": "m1"}]}]
     assert find_model_config(options, "m1") == "model" and find_model_config(options, "m2") == "model"
     assert find_model_config(options, "m3") is None and find_model_config("nope", "m1") is None
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_request_tombstones_its_id_and_one_late_response_is_ignored():
+    w = Wire().start()
+    with pytest.raises(AcpTimeout):
+        await w.conn.request("slow", {}, timeout=0.01)
+    late_id = w.out[0]["id"]
+    w.agent({"jsonrpc": "2.0", "id": late_id, "result": {}})  # the late answer: ignored, connection still healthy
+    await settle(10)
+    assert w.conn.fatal is None
+    t = asyncio.create_task(w.conn.request("next", {}))
+    await settle()
+    w.agent({"jsonrpc": "2.0", "id": w.out[-1]["id"], "result": {"v": 1}})
+    assert await t == {"v": 1}
+    w.agent({"jsonrpc": "2.0", "id": late_id, "result": {}})  # a SECOND frame for the same id is a violation again
+    await settle(10)
+    assert isinstance(w.conn.fatal, AcpTransportError)
+    await w.conn.close()
+
+
+@pytest.mark.asyncio
+async def test_after_callback_runs_only_after_the_reply_frame_was_written():
+    order = []
+    w = Wire()
+    orig = w.write
+
+    async def write(data):
+        await orig(data)
+        order.append("write")
+
+    async def handler(method, params, rid):
+        async def after():
+            order.append("after")
+        return "result", {"outcome": "cancelled"}, after
+
+    w.conn = AcpConnection(on_request=handler)
+    w.conn.start(write)
+    w.agent({"jsonrpc": "2.0", "id": "p-1", "method": "session/request_permission", "params": {}})
+    await settle(10)
+    assert order == ["write", "after"] and w.out[0]["result"] == {"outcome": "cancelled"}
+    await w.conn.close()

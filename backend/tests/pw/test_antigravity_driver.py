@@ -143,14 +143,38 @@ FAKE = textwrap.dedent(r'''
         if MODE == "tool_only":
             update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "x", "status": "completed"})
             ok(mid, {"stopReason": "end_turn"}); return
-        if MODE in ("perm_continue", "perm_respected"):
+        if MODE in ("mode_after", "model_after"):   # the prompt result and a policy-breaking update in ONE write
+            chunk(sid, "late")
+            upd = ({"sessionUpdate": "current_mode_update", "currentModeId": "accept-edits"} if MODE == "mode_after" else
+                   {"sessionUpdate": "config_option_update", "configOptions": [{"id": "model", "category": "model", "currentValue": "other-model"}]})
+            both = [{"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}},
+                    {"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": upd}}]
+            raw("".join(json.dumps(o) + "\n" for o in both)); time.sleep(0.5); return
+        if MODE == "perm_before":                    # the tool finished BEFORE the permission request for it arrives
+            update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "write", "status": "completed"})
+            send({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission",
+                  "params": {"sessionId": sid, "toolCall": {"toolCallId": "t1"}, "options": []}})
+            recv_response("perm-1")
+            chunk(sid, "finished"); ok(mid, {"stopReason": "end_turn"}); return
+        if MODE == "perm_noid":                      # a denial without a tool id: any later terminal tool is suspect
+            send({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission",
+                  "params": {"sessionId": sid, "toolCall": {}, "options": []}})
+            recv_response("perm-1")
+            update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t9", "title": "x", "status": "failed"})
+            chunk(sid, "finished"); ok(mid, {"stopReason": "end_turn"}); return
+        if MODE == "hang_tool":
+            chunk(sid, parts[0])
+            update(sid, {"sessionUpdate": "tool_call", "toolCallId": "tl", "title": "git push secret-token", "kind": "execute",
+                         "status": "in_progress", "rawInput": {"command": "git push secret-token"}})
+            log(event="streaming"); time.sleep(120)
+        if MODE in ("perm_continue", "perm_respected", "perm_failed"):
             update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "write", "status": "pending"})
             send({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission",
                   "params": {"sessionId": sid, "toolCall": {"toolCallId": "t1"},
                              "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}]}})
             recv_response("perm-1")
             update(sid, {"sessionUpdate": "tool_call_update", "toolCallId": "t1",
-                         "status": "completed" if MODE == "perm_continue" else "failed"})
+                         "status": {"perm_continue": "completed", "perm_failed": "failed"}.get(MODE, "in_progress")})
             chunk(sid, "finished"); ok(mid, {"stopReason": "end_turn"}); return
         # ok / noise: interleaved updates, replies, requests and notifications
         chunk("other-session", "LEAK")
@@ -187,7 +211,13 @@ FAKE = textwrap.dedent(r'''
         if method not in advertised:
             err(mid, -32601, "Method not found"); return
         if MODE == "resume_notfound":
+            err(mid, -32603, "Session does not exist", {"sessionId": params["sessionId"]}); return
+        if MODE == "resume_invalid":
             err(mid, -32602, "Invalid params", {"sessionId": params["sessionId"]}); return
+        if MODE == "resume_invalid_msg":
+            err(mid, -32603, "invalid sessionId"); return
+        if MODE == "resume_other_id":
+            ok(mid, {"sessionId": "someone-else"}); return
         if MODE == "resume_msg":
             err(mid, -32603, "Session not found: " + params["sessionId"]); return
         if MODE == "resume_auth":
@@ -197,7 +227,7 @@ FAKE = textwrap.dedent(r'''
         if MODE == "resume_unsupported":
             err(mid, -32601, "Method not found"); return
         if not os.path.exists(os.path.join(store, params["sessionId"])):
-            err(mid, -32602, "Invalid params", {"sessionId": params["sessionId"]}); return
+            err(mid, -32603, "Session not found: " + params["sessionId"]); return
         sid = params["sessionId"]
         chunk(sid, "REPLAY-TEXT", replay=True)
         update(sid, {"sessionUpdate": "current_mode_update", "currentModeId": "accept-edits"}, replay=True)
@@ -330,9 +360,9 @@ def conv(**kw):
 
 def seed(db, rig, sid="gone", last="prev", **kw):
     SessionRepository(db).put(**{**dict(
-        scope_kind="conversation", scope_id="c1", engine="antigravity", runtime_key="default", protocol="acp-antigravity",
+        scope_kind="conversation", scope_id="c1", engine="antigravity", runtime_key="default", protocol="acp-resume",
         namespace="antigravity:default", native_session_id=sid, generation=1, state="ready", model_id="gem-x",
-        cwd=os.path.join(rig.cwd_root, "conversation"), last_turn_id=last), **kw})
+        cwd=os.path.join(rig.cwd_root, "conversation", ad.scope_dir_name("c1")), last_turn_id=last), **kw})
 
 
 # -- handshake, argv, events ----------------------------------------------------------------------------------------------
@@ -439,7 +469,47 @@ async def test_agent_that_acts_after_a_denial_fails_the_turn(rig):
     assert types(events).count("turn.completed") == 1 and events[-1].data["status"] == "failed"
     result, events, err = await run_turn(rig.driver("perm_respected"), turn_id="t2", run_id="t2")
     assert err is None and result.text == "finished"
-    assert any(e.type == "item.completed" and e.data.get("status") == "failed" for e in events)
+    assert any(e.type == "item.completed" and e.data.get("status") == "unknown" for e in events)  # never reached a terminal status
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["perm_continue", "perm_failed", "perm_before", "perm_noid"])
+async def test_acting_after_a_denial_in_any_order_or_status_fails_and_the_reply_still_went_out_first(rig, mode):
+    result, events, err = await run_turn(rig.driver(mode))
+    assert err.failure.category == "runtime_error" and "denied" in err.failure.message
+    assert types(events).count("turn.completed") == 1 and events[-1].data["status"] == "failed"
+    if mode != "perm_before":  # there the tree is killed right after the reply: the fake may not get to log it
+        assert {r["id"]: r for r in rig.log("client_response")}["perm-1"]["result"] == {"outcome": {"outcome": "cancelled"}}
+    assert not pid_alive(rig.log("launch")[0]["pid"])
+
+
+async def drive(driver, emit, **kw):
+    """start_turn with a custom sink; waits for the (single) terminal event the sink accepted."""
+    await driver.start_turn(turn(**kw), emit)
+    state = driver._turns[kw.get("turn_id", "t1")]
+    await asyncio.wait_for(asyncio.wait({state.task}), 40)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_cancelled_permission_reply_is_written_before_the_sink_and_survives_a_failing_sink(rig):
+    seen_before_notice = []
+    events = []
+
+    async def emit(e):
+        if e.type == "runtime.notice" and e.data["code"] == "permission_denied":
+            for _ in range(100):  # the reply must already be on the wire while the sink is still being awaited
+                if any(r["id"] == "perm-1" for r in rig.log("client_response")):
+                    seen_before_notice.append(True)
+                    break
+                await asyncio.sleep(0.05)
+            raise RuntimeError("sink down")
+        events.append(e)
+
+    await drive(rig.driver(), emit)
+    assert seen_before_notice == [True]
+    assert {r["id"]: r for r in rig.log("client_response")}["perm-1"]["result"] == {"outcome": {"outcome": "cancelled"}}
+    assert [e.type for e in events].count("turn.completed") == 1 and events[-1].data["status"] == "succeeded"
 
 
 # -- tools ---------------------------------------------------------------------------------------------------------------
@@ -456,6 +526,7 @@ async def test_tool_calls_partial_missing_ids_already_completed_and_unfinished(r
     assert len(unkeyed) == 1 and not done[unkeyed[0]].data["ok"] and done[unkeyed[0]].data["status"] == "failed"
     assert started["t3"].data.get("synthetic") and done["t3"].data["ok"]  # update without a start: start synthesised
     assert done["t4"].data["status"] == "unknown" and not done["t4"].data["ok"]  # unfinished at the end: settled, not lost
+    assert started["t1"].data["title"] == "Tool call" and "ls" not in started["t1"].data["title"]
     assert "sekret" not in json.dumps(started["t1"].data) and "[redacted]" in started["t1"].data["input"]
     assert sum(1 for e in events if e.type == "item.completed" and e.item_id == "t2") == 1  # duplicate ignored
     commentary = next(e for e in events if e.type == "item.completed" and e.data.get("phase") == "commentary")
@@ -548,11 +619,11 @@ async def test_conversation_session_is_stored_then_resumed_with_incremental_prom
     result, events, err = await run_turn(driver, prompt="FULL1", **conv())
     assert err is None
     row = SessionRepository(db).get("conversation", "c1", "antigravity")
-    assert row["protocol"] == "acp-antigravity" and row["native_session_id"] == result.session_id
+    assert row["protocol"] == "acp-resume" and row["native_session_id"] == result.session_id
     assert row["last_turn_id"] == "t1" and row["state"] == "ready" and row["generation"] == 1
     assert "agentos-agy" not in row["cwd"] and os.path.isdir(row["cwd"])
     started = next(e for e in events if e.type == "session.started")
-    assert started.data["resumed"] is False and started.data["protocol"] == "acp-antigravity"
+    assert started.data["resumed"] is False and started.data["protocol"] == "acp-resume"
 
     result2, events2, err = await run_turn(driver, turn_id="t2", run_id="t2", prompt="FULL2", **conv())
     assert err is None and result2.session_id == result.session_id
@@ -570,16 +641,56 @@ async def test_conversation_session_is_stored_then_resumed_with_incremental_prom
 
 
 @pytest.mark.asyncio
-async def test_load_is_used_only_when_advertised_and_replay_is_suppressed(rig, db):
-    driver = rig.driver(caps="load", db=db, resume_prompt="INC")
+@pytest.mark.parametrize("caps", ["load", "none"])
+async def test_session_load_is_never_called_load_only_agents_get_a_new_session_with_the_full_prompt(rig, db, caps):
+    driver = rig.driver(caps=caps, db=db, resume_prompt="INC")
     r1, _, err = await run_turn(driver, prompt="F1", **conv())
     assert err is None
     r2, events, err = await run_turn(driver, turn_id="t2", run_id="t2", prompt="F2", **conv())
+    assert err is None and r2.text == "echo:F2" and r2.session_id != r1.session_id
+    assert "session/load" not in rig.methods() and "session/resume" not in rig.methods()
+    assert rig.prompts() == ["F1", "F2"]
+    assert any(e.type == "runtime.notice" and e.data["code"] == "session_resume_unsupported" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_both_capabilities_still_use_resume_only_and_replay_is_suppressed(rig, db):
+    driver = rig.driver(caps="both", db=db, resume_prompt="INC")
+    await run_turn(driver, prompt="F1", **conv())
+    r2, events, err = await run_turn(driver, turn_id="t2", run_id="t2", prompt="F2", **conv())
     assert err is None and r2.text == "echo:INC"
-    assert "session/load" in rig.methods() and "session/resume" not in rig.methods()
-    assert "REPLAY-TEXT" not in r2.text and "HISTORY-TEXT" not in r2.text
+    assert "session/resume" in rig.methods() and "session/load" not in rig.methods()
     assert not any("TEXT" in str(e.data.get("delta", "")) for e in events)
     assert events[-1].data["status"] == "succeeded"  # replayed + early mode updates did not trip the plan-mode check
+
+
+@pytest.mark.asyncio
+async def test_rows_stored_under_the_old_protocol_are_not_resumable(rig, db):
+    seed(db, rig, sid="old-session", protocol="acp-antigravity")
+    result, events, err = await run_turn(rig.driver(db=db, resume_prompt="INC"), prompt="FULL", **conv())
+    assert err is None and rig.prompts() == ["FULL"] and "session/resume" not in rig.methods()
+    row = SessionRepository(db).get("conversation", "c1", "antigravity")
+    assert row["protocol"] == "acp-resume" and row["generation"] == 2 and row["native_session_id"] == result.session_id
+
+
+@pytest.mark.asyncio
+async def test_conversations_get_their_own_sanitised_working_directory(rig, db):
+    driver = rig.driver(db=db)
+    await run_turn(driver, turn_id="a", run_id="a", scope_kind="conversation", scope_id="c1")
+    await run_turn(driver, turn_id="b", run_id="b", scope_kind="conversation", scope_id="../evil id")
+    cwds = [r["cwd"] for r in rig.log("launch")]
+    assert len(set(cwds)) == 2 and all(os.path.dirname(os.path.dirname(c)) == os.path.join(rig.cwd_root) for c in cwds)
+    assert ad.scope_dir_name("../evil id").startswith("___evil_id-") and ".." not in os.path.basename(cwds[1])
+    assert ad.scope_dir_name("a b") != ad.scope_dir_name("a_b")
+    assert SessionRepository(db).get("conversation", "c1", "antigravity")["cwd"] == cwds[0]
+
+
+@pytest.mark.asyncio
+async def test_resume_result_with_a_different_session_id_is_a_protocol_error_before_the_prompt(rig, db):
+    seed(db, rig)
+    result, events, err = await run_turn(rig.driver("resume_other_id", db=db, resume_prompt="INC"), prompt="FULL", **conv())
+    assert err.failure.category == "protocol_error" and err.failure.acceptance == "not-submitted"
+    assert "session/prompt" not in rig.methods() and "session/new" not in rig.methods()
 
 
 @pytest.mark.asyncio
@@ -613,7 +724,8 @@ async def test_missing_session_is_rebuilt_once_before_submission(rig, db, mode):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode,category", [("resume_auth", "auth"), ("resume_boom", "runtime_error")])
+@pytest.mark.parametrize("mode,category", [("resume_auth", "auth"), ("resume_boom", "runtime_error"),
+                                          ("resume_invalid", "runtime_error"), ("resume_invalid_msg", "runtime_error")])
 async def test_resume_auth_or_other_errors_are_not_missing_session(rig, db, mode, category):
     seed(db, rig)
     result, events, err = await run_turn(rig.driver(mode, db=db, resume_prompt="INC"), prompt="FULL", **conv())
@@ -879,9 +991,60 @@ async def test_conversation_runs_use_native_session_without_replaying_history(ri
     assert rig.methods().count("session/new") == 1 and rig.methods().count("session/resume") == 1
     assert "Previous conversation" not in rig.prompts()[1]
     row = SessionRepository(api.db).get("conversation", cid, "antigravity")
-    assert row["last_turn_id"] == second["id"] and row["state"] == "ready" and row["protocol"] == "acp-antigravity"
+    assert row["last_turn_id"] == second["id"] and row["state"] == "ready" and row["protocol"] == "acp-resume"
     api.db.execute("UPDATE runtime_sessions SET last_turn_id='someone-else'")
     third = await api("runs.start_turn", conversation_id=cid, engine="antigravity", model_id="gem-x", prompt="third")
     done3 = await wait_status(api, third["id"], "succeeded", timeout=40)
     assert "Previous conversation (JSON)" in done3["assistant_content"] and rig.methods().count("session/new") == 2
     assert SessionRepository(api.db).get("conversation", cid, "antigravity")["generation"] == 2
+
+
+# -- review fixes: drift after the prompt result, settlement, terminal delivery ---------------------------------------------
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["mode_after", "model_after"])
+async def test_mode_or_model_drift_right_after_the_prompt_result_fails_the_turn_and_never_saves_ready(rig, db, mode):
+    r1, _, err = await run_turn(rig.driver(db=db, resume_prompt="INC"), prompt="F1", **conv())
+    assert err is None
+    result, events, err = await run_turn(rig.driver(mode, db=db, resume_prompt="INC"), turn_id="t2", run_id="t2", prompt="F2", **conv())
+    assert err is not None and err.failure.category == "unsupported_capability"
+    assert types(events).count("turn.completed") == 1 and events[-1].data["status"] == "failed"
+    row = SessionRepository(db).get("conversation", "c1", "antigravity")
+    assert row["state"] == "unverified" and row["last_turn_id"] == "t1"
+    assert not pid_alive(rig.log("launch")[-1]["pid"])
+
+
+@pytest.mark.asyncio
+async def test_interrupt_fallback_settles_open_tools_as_cancelled_with_one_terminal(rig):
+    driver = rig.driver("hang_tool", interrupt_grace_s=0.5)
+    events = await _start_and_wait_streaming(rig, driver)
+    await asyncio.sleep(0.5)
+    assert await driver.interrupt("t1") == "requested"
+    done = [e for e in events if e.type == "item.completed" and e.item_id == "tl"]
+    assert len(done) == 1 and done[0].data["status"] == "cancelled"
+    started = next(e for e in events if e.type == "item.started")
+    assert started.data["title"] == "Run command" and "secret-token" not in json.dumps(started.data["title"])
+    assert types(events).count("turn.completed") == 1 and events[-1].data["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_event_is_retried_once_and_counted_only_after_the_sink_accepts(rig):
+    got = []
+    attempts = []
+
+    async def emit(e):
+        if e.type == "turn.completed":
+            attempts.append(e.seq)
+            if len(attempts) == 1:
+                raise RuntimeError("sink hiccup")
+        got.append(e)
+
+    state = await drive(rig.driver(), emit)
+    assert [e.type for e in got].count("turn.completed") == 1 and len(attempts) == 2 and attempts[0] == attempts[1]
+    assert state.terminal is True
+
+    async def dead(e):
+        if e.type == "turn.completed":
+            raise RuntimeError("sink down")
+
+    state = await drive(rig.driver(), dead, turn_id="t2", run_id="t2")
+    assert state.terminal is False  # never accepted: not claimed as delivered

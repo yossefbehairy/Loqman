@@ -196,11 +196,19 @@ default: set `AGENTOS_ANTIGRAVITY_DRIVER=acp` to route Antigravity runs through 
 `agy_acp_runtime`). Launch, plan-mode requirement, model verification, deny-all permission policy (every
 `session/request_permission` answered `cancelled` with a `permission_denied` notice; NEW: a tool whose permission was
 denied that still reports `completed` fails the turn), environment allowlist and `GEMINI_API_KEY`/`GOOGLE_API_KEY`
-opt-in are the legacy adapter's: `agy acp --stdio --sandbox --include-default-customizations=false`. Resume is probed
-from `initialize.agentCapabilities` (`sessionCapabilities.resume` -> `session/resume`, else `loadSession` ->
-`session/load`, else none): conversation scopes persist the session id in `runtime_sessions` (protocol
-`acp-antigravity`) and send only the incremental prompt on a successful resume; unsupported or explicitly missing
-sessions start a new session in the same process with the full prompt and a notice, never after the prompt was written.
+opt-in are the legacy adapter's: `agy acp --stdio --sandbox --include-default-customizations=false`. The cancelled
+permission reply is returned to the transport before any sink await (the `permission_denied` notice follows and a
+failing sink cannot undo it). A tool that reports ANY terminal status after a denial (or completed before its denial
+arrived, or after a denial that carried no tool id) fails the turn; mode/model drift after the prompt result also fails
+it (never saved as `ready`, tree killed). Resume is probed from `initialize.agentCapabilities`: only
+`sessionCapabilities.resume` -> `session/resume` is used, `session/load` is never called (it replays instead of
+restoring). Conversation scopes persist the session id in `runtime_sessions` (protocol `acp-resume`; rows stored as
+`acp-antigravity` are not resumable) with one working directory per conversation (`antigravity-sessions/conversation/
+<sanitised-id>-<hash>`); a resume result must carry the requested `sessionId` (or none). Only the incremental prompt is
+sent on a successful resume; unsupported resume or an explicit not-found/does-not-exist error starts a new session in the
+same process with the full prompt and a notice, never after the prompt was written. `-32602`/"invalid sessionId"
+and auth errors fail the turn. A timed-out request's id is tombstoned so its late response is ignored. Tool titles are
+generic (never the raw command). The terminal event counts only after the sink accepted it (one retry).
 CEO/mission/workflow scopes stay isolated. Interrupt sends the `session/cancel` notification, then kills the tree after
 `interrupt_grace_s`. Prompts over 200000 chars are refused (the legacy adapter truncated). Tests:
 `backend/tests/pw/test_acp_transport.py`, `backend/tests/pw/test_antigravity_driver.py` (fake ACP agent only).

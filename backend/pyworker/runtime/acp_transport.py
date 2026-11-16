@@ -36,6 +36,7 @@ MAX_DIAGNOSTIC_LINES = 2000
 DIAGNOSTIC_TAIL_LINES = 20
 DIAGNOSTIC_LINE_CHARS = 300
 MAX_ID_CHARS = 200
+MAX_TOMBSTONES = 64
 WRITE_TIMEOUT_S = 10.0
 PROTOCOL_VERSION = 1
 
@@ -51,7 +52,8 @@ class AcpTransportError(Exception):
 
 
 class AcpTimeout(Exception):
-    """A request got no response within its deadline (the connection stays usable)."""
+    """A request got no response within its deadline (the connection stays usable: its id is tombstoned, so one late
+    response for it is ignored instead of being a protocol violation)."""
 
     def __init__(self, method: str):
         super().__init__(method)
@@ -155,6 +157,9 @@ def find_model_config(config_options: Any, model: str) -> Optional[str]:
 
 
 Handler = Callable[[dict, dict], Awaitable[None]]
+# ("result"|"error", payload) or ("result"|"error", payload, after): ``after`` is a no-arg callable (sync or async) run
+# AFTER the reply frame was written, so a slow or failing sink can never delay or skip the reply. Whatever it raises
+# fails the connection (a driver that must not stop the reply swallows its own sink errors inside ``after``).
 RequestHandler = Callable[[str, Any, Any], Awaitable[tuple]]
 
 
@@ -180,6 +185,7 @@ class AcpConnection:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue)
         self._pending: dict = {}
         self._hooks: dict = {}
+        self._tombstones: dict = {}
         self._next_id = 0
         self._sessions: dict = {}
         self._write_fn: Optional[Callable[[bytes], Awaitable[None]]] = None
@@ -325,6 +331,11 @@ class AcpConnection:
                 frame: dict = {"jsonrpc": "2.0", "id": rid}
                 frame["error" if outcome[0] == "error" else "result"] = outcome[1]
                 await self._write(frame)
+                after = outcome[2] if len(outcome) > 2 else None
+                if after is not None:
+                    done = after()
+                    if asyncio.iscoroutine(done):
+                        await done
             elif method == "session/update":
                 await self._route_update(params)
             elif self.on_notification is not None:
@@ -333,6 +344,9 @@ class AcpConnection:
         rid = msg.get("id")
         fut = self._pending.pop(rid, None) if type(rid) is int else None
         if fut is None:
+            if type(rid) is int and rid in self._tombstones:
+                del self._tombstones[rid]  # the late answer to a request that timed out: ignored exactly once
+                return
             raise AcpTransportError("protocol", "unexpected response id")
         hook = self._hooks.pop(rid, None)
         if hook is not None:
@@ -438,6 +452,9 @@ class AcpConnection:
         except asyncio.TimeoutError:
             self._pending.pop(rid, None)
             self._hooks.pop(rid, None)
+            self._tombstones[rid] = None
+            while len(self._tombstones) > MAX_TOMBSTONES:
+                del self._tombstones[next(iter(self._tombstones))]
             raise AcpTimeout(method)
         finally:
             if not fut.done():

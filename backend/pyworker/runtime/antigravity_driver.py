@@ -15,13 +15,14 @@ Dialect rules kept from the legacy adapter (fail closed):
     NEW relative to the legacy adapter (which only counted denials): if a tool whose permission was denied later
     reports ``completed``, the agent acted anyway and the turn fails (fail closed).
 
-Sessions: only conversation scopes persist a native session (``runtime_sessions``, protocol ``acp-antigravity``). Resume
-is PROBED, never assumed: after ``initialize`` the agent's ``agentCapabilities`` decide the method
-(``sessionCapabilities.resume`` -> ``session/resume``, the Antigravity dialect; otherwise ``loadSession: true`` ->
-``session/load``; neither -> no attempt). A successful resume sends only the incremental prompt. If resume is unsupported
-or refused with an explicit missing-session error (both strictly before the prompt is written) the SAME process starts a
-fresh ``session/new`` with the caller's full history-seeded prompt plus a ``session_rebuilt`` notice, generation + 1.
-Auth, malformed-parameter or other errors are not "missing session" and fail the turn. Plan mode and the model are
+Sessions: only conversation scopes persist a native session (``runtime_sessions``, protocol ``acp-resume``, one working
+directory per conversation). Resume is PROBED, never assumed: only ``sessionCapabilities.resume`` -> ``session/resume``
+(``session/load`` is NEVER called: it replays the transcript instead of restoring it). A successful resume (whose result
+``sessionId`` is absent or the requested one) sends only the incremental prompt. If resume is unsupported or refused with
+an explicit not-found / does-not-exist error (both strictly before the prompt is written) the SAME process starts a
+fresh ``session/new`` with the caller's full history-seeded prompt plus a notice, generation + 1. Auth, malformed or
+invalid parameters (``-32602``, "invalid sessionId") and other errors are not "missing session" and fail the turn. Rows
+stored under the old ``acp-antigravity`` protocol are not resumable (a new session is started). Plan mode and the model are
 re-applied and verified on every session, resumed or new. CEO / mission / workflow scopes use a fresh empty scratch
 directory and a fresh session every call. Once the prompt frame is written nothing is ever replayed.
 
@@ -60,7 +61,7 @@ from .sessions import SessionRepository
 
 logger = logging.getLogger("agentos.runtime.antigravity_driver")
 
-PROTOCOL = "acp-antigravity"
+PROTOCOL = "acp-resume"  # the contract dialect (driver.SessionProtocol); only session/resume is ever used
 NAMESPACE = "antigravity:default"
 REQUIRED_MODE = "plan"
 MAX_PROMPT_CHARS = 200_000
@@ -76,8 +77,19 @@ STREAM_BYTES = 64 * 1024 * 1024
 AUTH_LINK_MARKER = "authenticate the acp server"
 _STRIPPED_ENV = ("GEMINI_API_KEY", "GOOGLE_API_KEY")  # opt-in only; AGENTOS_LOCAL_TOKEN is never forwarded
 _OK_STOP = "end_turn"
-_MISSING_RE = re.compile(r"(session|conversation)[^.\n]{0,60}(not found|does not exist|no longer exists|unknown|invalid|expired)|"
-                          r"(unknown|no such|missing|invalid) session|no session", re.I)
+# Only an explicit not-found / does-not-exist signal means "session missing". "invalid", "unknown" or -32602 are
+# malformed requests and fail the turn.
+_MISSING_RE = re.compile(r"(session|conversation)[^.\n]{0,60}(not found|does not exist|doesn't exist|no longer exists)|"
+                         r"no such (session|conversation)", re.I)
+_ACTED_AFTER_DENIAL = "agy performed an action after its permission request was denied; aborting (fail closed)."
+_TOOL_TITLES = {"read": "Read file", "edit": "Edit file", "delete": "Delete file", "move": "Move file",
+                "search": "Search", "execute": "Run command", "think": "Think", "fetch": "Fetch", "switch_mode": "Switch mode"}
+
+
+def scope_dir_name(scope_id: str) -> str:
+    """One working directory per conversation scope: sanitised id plus a short hash so distinct ids never collide."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", scope_id)[:48]
+    return f"{safe}-{hashlib.sha256(scope_id.encode('utf-8')).hexdigest()[:10]}"
 
 
 def default_cli_cmd() -> Optional[list]:
@@ -125,6 +137,8 @@ class _Turn:
     task: Optional[asyncio.Task] = None
     seq: int = 0
     terminal: bool = False
+    terminal_sending: bool = False
+    violation: Optional[DriverTurnError] = None
     started: bool = False
     cancelled: bool = False
     stop: Optional[asyncio.Task] = None
@@ -155,6 +169,8 @@ class _Turn:
     tool_status: dict = field(default_factory=dict)
     tool_updates: int = 0
     denied: set = field(default_factory=set)
+    denied_unkeyed: bool = False
+    completed_ok: set = field(default_factory=set)
     denied_count: int = 0
     rejected_count: int = 0
     text_chars: int = 0
@@ -195,12 +211,12 @@ class AntigravityAcpDriver:
         env.update(self._extra_env or {})
         return env
 
-    def _conversation_cwd(self) -> str:
+    def _conversation_cwd(self, scope_id: str) -> str:
         root = self._cwd_root
         if root is None:
             from backend.pyworker.appsettings import settings
             root = os.path.join(os.path.dirname(os.path.abspath(settings.SQLITE_DB_PATH)), "antigravity-sessions")
-        path = os.path.join(root, "conversation")
+        path = os.path.join(root, "conversation", scope_dir_name(scope_id))
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -227,14 +243,25 @@ class AntigravityAcpDriver:
         return TurnRef(turn.turn_id, turn.run_id)
 
     # -- event plumbing -----------------------------------------------------------------------------------------------
-    async def _send(self, s: _Turn, type_: str, data: dict, *, item_id=None):
-        if s.terminal or (s.cancelled and type_ not in {"turn.started", "turn.completed"}):
+    async def _send(self, s: _Turn, type_: str, data: dict, *, item_id=None, settle: bool = False):
+        if s.terminal or s.terminal_sending or (s.cancelled and not settle and type_ not in {"turn.started", "turn.completed"}):
             return
         s.seq += 1
-        if type_ == "turn.completed":
-            s.terminal = True  # the sole settlement gate, before awaiting the sink
-        await s.emit(DriverEvent(1, new_id(), s.turn.turn_id, s.turn.run_id, s.seq, self.engine, self.runtime_key, ts(),
-                                 type_, data, native_session_id=s.session_id, item_id=item_id))
+        event = DriverEvent(1, new_id(), s.turn.turn_id, s.turn.run_id, s.seq, self.engine, self.runtime_key, ts(),
+                            type_, data, native_session_id=s.session_id, item_id=item_id)
+        if type_ != "turn.completed":
+            await s.emit(event)
+            return
+        s.terminal_sending = True  # the sole settlement gate: one caller passes; ``terminal`` only after the sink accepts
+        try:
+            try:
+                await s.emit(event)
+            except Exception as exc:
+                logger.warning("antigravity driver terminal event rejected by the sink (%s); retrying once", type(exc).__name__)
+                await s.emit(event)  # same event (same id and seq) so a sink can deduplicate
+            s.terminal = True
+        finally:
+            s.terminal_sending = False
 
     async def _started(self, s: _Turn):
         if not s.started:
@@ -247,7 +274,7 @@ class AntigravityAcpDriver:
     def _plan(self, s: _Turn, *, force_fresh: bool = False) -> dict:
         t = s.turn
         persist = t.scope_kind == "conversation" and self.sessions is not None
-        cwd = self._conversation_cwd() if persist else None
+        cwd = self._conversation_cwd(t.scope_id) if persist else None
         resume_id, row, generation = None, None, 1
         if persist:
             row = self.sessions.get(t.scope_kind, t.scope_id, self.engine, self.runtime_key)
@@ -316,6 +343,8 @@ class AntigravityAcpDriver:
                 raise _failure("cli_missing", "agy CLI not found on PATH.", "launch", "not-submitted")
             plan = self._plan(s)
             completion = await self._attempt(s, plan)
+            if s.violation is not None:  # drift/denial violation seen after the prompt result: never succeed
+                raise s.violation
         except (_Cancelled, asyncio.CancelledError):
             s.cancelled = True
         except DriverTurnError as exc:
@@ -372,6 +401,7 @@ class AntigravityAcpDriver:
         s.items, s.cur_msg, s.cur_think, s.epoch = [], None, None, 0
         s.tools, s.unkeyed, s.tool_status, s.tool_updates = {}, [], {}, 0
         s.denied, s.denied_count, s.rejected_count = set(), 0, 0
+        s.denied_unkeyed, s.completed_ok, s.violation = False, set(), None
         s.text_chars = s.reasoning_chars = s.usage_events = 0
         s.last_context, s.final_ids, s.auth_link = None, [], False
 
@@ -434,7 +464,7 @@ class AntigravityAcpDriver:
                     exited.cancel()
                 s.conn = None
                 await conn.close()
-                await self._release(s, proc, graceful=s.prompt_done and s.cancelled is False)
+                await self._release(s, proc, graceful=s.prompt_done and s.cancelled is False and s.violation is None)
 
     def _acceptance(self, s: _Turn) -> str:
         return "output-seen" if s.output_seen else ("unknown" if s.submitted else "not-submitted")
@@ -463,13 +493,12 @@ class AntigravityAcpDriver:
         info = None
         prompt = plan["prompt"]
         if plan["resume_id"]:
-            method = "session/resume" if caps.resume else ("session/load" if caps.load_session else None)
             reopened = None
-            if method is None:
+            if not caps.resume:  # session/load is never used: only an advertised session/resume restores a session
                 await self._send(s, "runtime.notice", {"code": "session_resume_unsupported", "message":
                                  "This agy build does not advertise session resume; a new session was started from the conversation history."})
             else:
-                reopened = await self._reopen(s, plan, cwd, conn, method)
+                reopened = await self._reopen(s, plan, cwd, conn, "session/resume")
             if reopened is None:
                 prompt = self._fresh_plan(s, plan)
             else:
@@ -515,7 +544,7 @@ class AntigravityAcpDriver:
         return plan["full_prompt"]
 
     async def _reopen(self, s: _Turn, plan: dict, cwd: str, conn: AcpConnection, method: str):
-        """Resume/load the stored session. Returns its result, or None when it is missing/unsupported (new session next)."""
+        """``session/resume`` the stored session. Returns its result, or None when it is missing/unsupported (new session next)."""
         sid = plan["resume_id"]
         s.session_id = sid
         conn.bind_session(sid, lambda u, p: self._on_update(s, u, p))
@@ -526,8 +555,7 @@ class AntigravityAcpDriver:
             s.session_id = None
             hint = exc.hint()
             auth = exc.code == -32000 or any(k in hint for k in ("unauthor", "login", "401", "sign in", "unauthenticated"))
-            missing = (not auth) and (_MISSING_RE.search(hint) is not None
-                                      or (exc.code == -32602 and exc.data_keys() == ("sessionId",)))
+            missing = (not auth) and _MISSING_RE.search(hint) is not None
             if exc.code == -32601 and not auth:
                 await self._send(s, "runtime.notice", {"code": "session_resume_unsupported", "message":
                                  "agy refused session resume as unsupported; a new session was started from the conversation history."})
@@ -538,6 +566,11 @@ class AntigravityAcpDriver:
                                  "The previous Antigravity session could not be resumed; a new session was started from the conversation history."})
                 return None
             raise
+        returned = result.get("sessionId")
+        if returned is not None and returned != sid:  # updates for another id would never be routed to the policy checks
+            conn.unbind_session(sid)
+            s.session_id = None
+            raise _failure("protocol_error", "agy acp protocol violation: resumed a different session.", "resume", "not-submitted")
         return result
 
     async def _new_session(self, s: _Turn, cwd: str, conn: AcpConnection) -> dict:
@@ -600,17 +633,39 @@ class AntigravityAcpDriver:
         s.model_seen = model
 
     # -- agent -> client ----------------------------------------------------------------------------------------------
+    def _violate(self, s: _Turn, message: str, phase: str = "running") -> DriverTurnError:
+        """Record a turn-level failure that _finish and the terminal section both honour (first one wins)."""
+        if s.violation is None:
+            s.violation = _failure("runtime_error" if "denied" in message else "unsupported_capability", message, phase,
+                                   self._acceptance(s))
+        return s.violation
+
     async def _on_request(self, s: _Turn, method: str, params: Any, rid: Any) -> tuple:
-        """Deny-only policy for every agent request."""
+        """Deny-only policy for every agent request. The cancelled reply is returned WITHOUT awaiting anything, so the
+        transport writes it before the sink is touched; the notice (and any violation) run afterwards."""
         if method == "session/request_permission":
             s.denied_count += 1
             call = params.get("toolCall") if isinstance(params, dict) and isinstance(params.get("toolCall"), dict) else {}
+            violation = None
             if safe_id(call.get("toolCallId")):
                 s.denied.add(call["toolCallId"])
-            if s.denied_count <= MAX_DENIAL_NOTICES:
-                await self._send(s, "runtime.notice", {"code": "permission_denied",
-                                                       "message": "A tool permission request was denied."})
-            return "result", {"outcome": {"outcome": "cancelled"}}
+                if call["toolCallId"] in s.completed_ok:  # it already finished before asking: it acted without permission
+                    violation = self._violate(s, _ACTED_AFTER_DENIAL)
+            else:
+                s.denied_unkeyed = True  # no id to match: any tool that reaches a terminal status afterwards is suspect
+            notify = s.denied_count <= MAX_DENIAL_NOTICES
+
+            async def after():
+                if notify:
+                    try:
+                        await self._send(s, "runtime.notice", {"code": "permission_denied",
+                                                               "message": "A tool permission request was denied."})
+                    except Exception as exc:  # the reply is already written; a sink failure must not undo or stop it
+                        logger.warning("antigravity driver could not deliver permission notice (%s)", type(exc).__name__)
+                if violation is not None:
+                    raise violation
+
+            return "result", {"outcome": {"outcome": "cancelled"}}, after
         s.rejected_count += 1
         return "error", {"code": -32601, "message": "Method not supported by client"}
 
@@ -629,9 +684,11 @@ class AntigravityAcpDriver:
     async def _on_update(self, s: _Turn, update: dict, params: dict):
         kind = update.get("sessionUpdate")
         if kind == "current_mode_update":
-            if s.plan_set and update.get("currentModeId") != REQUIRED_MODE:
-                raise _failure("unsupported_capability", "agy acp left plan mode; aborting (fail closed).", "running",
-                               self._acceptance(s))
+            if s.plan_set and update.get("currentModeId") != REQUIRED_MODE:  # also AFTER the prompt result: fails the turn
+                raise self._violate(s, "agy acp left plan mode; aborting (fail closed).")
+            return
+        if kind == "config_option_update":
+            self._config_update(s, update)
             return
         if not s.prompt_sent or s.prompt_done or s.terminal:
             return  # pre-prompt transcript, late frames after the prompt response
@@ -643,14 +700,15 @@ class AntigravityAcpDriver:
             await self._tool_update(s, update)
         elif kind == "usage_update":
             await self._usage_update(s, update)
-        elif kind == "config_option_update":
-            self._config_update(s, update)
 
     def _config_update(self, s: _Turn, update: dict):
+        if s.model_seen is None:  # before the requested model was applied: resume transcript / initial state, not drift
+            return
         for option in update.get("configOptions") or ():
             if isinstance(option, dict) and (option.get("category") == "model" or option.get("id") == "model") \
                     and isinstance(option.get("currentValue"), str):
-                s.model_seen = option["currentValue"]
+                if option["currentValue"] != s.turn.model_id:
+                    raise self._violate(s, "agy acp switched to a different model than requested; aborting (fail closed).")
 
     def _close_items(self, s: _Turn):
         for item in (s.cur_msg, s.cur_think):
@@ -692,9 +750,9 @@ class AntigravityAcpDriver:
 
     @staticmethod
     def _tool_title(u: dict) -> str:
-        raw = u.get("rawInput")
-        title = (raw.get("command") if isinstance(raw, dict) and isinstance(raw.get("command"), str) else None) or u.get("title")
-        return str(title if isinstance(title, str) and title else "tool")[:80]
+        """Generic title from the tool kind: neither the raw command nor the agent's free-text title reach renderer events."""
+        kind = u.get("kind")
+        return _TOOL_TITLES.get(kind, "Tool call") if isinstance(kind, str) else "Tool call"
 
     async def _tool_call(self, s: _Turn, u: dict):
         self._close_items(s)
@@ -744,9 +802,10 @@ class AntigravityAcpDriver:
             return
         s.tools[tid] = True
         ok = u.get("status") == "completed"
-        if ok and tid in s.denied:
-            raise _failure("runtime_error", "agy performed an action after its permission request was denied; aborting (fail closed).",
-                           "running", "output-seen")
+        if ok:
+            s.completed_ok.add(tid)
+        if tid in s.denied or s.denied_unkeyed:  # ANY terminal status after a denial means the agent went on regardless
+            raise self._violate(s, _ACTED_AFTER_DENIAL)
         data = {"item_type": "tool", "status": "completed" if ok else "failed", "ok": ok}
         out = u.get("rawOutput")
         if out is None and isinstance(u.get("content"), list):
@@ -760,7 +819,8 @@ class AntigravityAcpDriver:
         for tid, done in list(s.tools.items()):
             if not done:
                 s.tools[tid] = True
-                await self._send(s, "item.completed", {"item_type": "tool", "status": status, "ok": False}, item_id=tid)
+                await self._send(s, "item.completed", {"item_type": "tool", "status": status, "ok": False}, item_id=tid,
+                                 settle=True)
 
     async def _usage_update(self, s: _Turn, u: dict):
         used, size = u.get("used"), u.get("size")
@@ -805,6 +865,8 @@ class AntigravityAcpDriver:
             label = "".join(c for c in stop[:40] if c.isalnum() or c in "_-")
             raise _failure("runtime_error", f"agy acp stopped abnormally (stopReason={label}); partial text was discarded.",
                            "running", self._acceptance(s))
+        if s.violation is not None:
+            raise s.violation
         await self._flush_items(s)
         if not s.final_ids:
             message = ("agy finished without a text reply (tool-only turn)." if s.tools else "agy returned no text content.")
@@ -813,7 +875,11 @@ class AntigravityAcpDriver:
         usage = self._usage(result)
         if usage["tokens"]:
             await self._send(s, "usage", {"scope": "turn", "measurement_id": s.turn.turn_id, "final": True, **usage})
-        self._save_session(s, plan, "ready", s.turn.turn_id)
+        if s.denied & s.completed_ok:  # rescan: a completion recorded before its denial arrived
+            self._violate(s, _ACTED_AFTER_DENIAL)
+        if s.violation is not None:  # drift seen while the tail events above were being delivered
+            raise s.violation
+        self._save_session(s, plan, "ready", s.turn.turn_id)  # no await between the final check and the save
         s.completion_data = {"status": "succeeded", "stop_reason": "end_turn", "final_item_ids": list(s.final_ids),
                              "model_id": s.model_seen or s.turn.model_id, "variant": None, "usage": usage,
                              "session_id": s.session_id}
@@ -895,6 +961,7 @@ class AntigravityAcpDriver:
                 await asyncio.wait({s.task}, timeout=self.interrupt_grace_s)
         if not s.terminal:
             await self._started(s)
+            await self._settle_tools(s, "cancelled")
             await self._send(s, "turn.completed", {"status": "cancelled", "stop_reason": "cancelled", "duration_ms": 0,
                                                    "final_item_ids": []})
 
