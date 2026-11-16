@@ -96,6 +96,19 @@ class Cdp:
         async with asyncio.timeout(20):
             while True:
                 message = await self.receive()
+                if message.get("method") == "Fetch.requestPaused":
+                    paused = message["params"]
+                    try:
+                        await asyncio.to_thread(_check_public_url, paused["request"]["url"])
+                        method = "Fetch.continueRequest"
+                    except BrowserError:
+                        method = "Fetch.failRequest"
+                    self.next_id += 1
+                    params = {"requestId": paused["requestId"]}
+                    if method == "Fetch.failRequest":
+                        params["errorReason"] = "BlockedByClient"
+                    await self.send(json.dumps({"id": self.next_id, "method": method, "params": params}).encode())
+                    continue
                 if message.get("id") != request_id:
                     continue
                 if "error" in message:
@@ -152,6 +165,7 @@ class BrowserSession:
             raise BrowserError("Browser page unavailable.")
         self.cdp = Cdp()
         await self.cdp.connect(page["webSocketDebuggerUrl"])
+        await self.cdp.call("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
 
     async def evaluate(self, expression):
         result = await self.cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})

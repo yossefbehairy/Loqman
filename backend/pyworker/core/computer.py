@@ -159,6 +159,11 @@ class ComputerSession:
                 self.user.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
                 if not self.user.ScreenToClient(target, ctypes.byref(client)):
                     raise ComputerError("Could not map click to the selected window.")
+                client_rect = wintypes.RECT()
+                if (not self.user.GetClientRect(target, ctypes.byref(client_rect))
+                        or not (0 <= client.x < client_rect.right and 0 <= client.y < client_rect.bottom)
+                        or client.x > 32767 or client.y > 32767):
+                    raise ComputerError("Click point is outside the target client area.")
                 if self.user.GetForegroundWindow() != self.handle:
                     raise ComputerError("Foreground window changed before the click.")
                 self.user.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,

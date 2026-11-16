@@ -19,7 +19,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -176,16 +176,17 @@ def _check_schema_objects(con, current: bool) -> None:
         raise RestoreError(f"Backup contains an unexpected schema object ({kind} {name})")
 
 
-def validate_backup_file(path: Path) -> int:
+def validate_backup_file(path: Path, *, _connection=None) -> int:
     """Validate integrity and schema of a backup. Returns its user_version."""
     from backend.pyworker.db.schema import SCHEMA_VERSION, TABLES
     from backend.pyworker.core.workspace_fs import canonical_workspace_dir, _norm, WorkspaceFsError
     from backend.pyworker.core.skills_fs import validate_source_dir
 
-    if not path.is_file():
+    if _connection is None and not path.is_file():
         raise RestoreError("Backup file not found")
     try:
-        with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as con:
+        connection = closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) if _connection is None else nullcontext(_connection)
+        with connection as con:
             con.execute("PRAGMA trusted_schema=OFF")
             if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RestoreError("Backup failed integrity_check")
@@ -235,6 +236,7 @@ def restore_database(backup: Path, target: Path) -> Path:
 
     con = sqlite3.connect(str(target), timeout=0.2, isolation_level=None)
     try:
+        con.execute("PRAGMA trusted_schema=OFF")
         try:
             # EXCLUSIVE locking mode in WAL needs the shm lock exclusively, which
             # fails while any other connection (e.g. a running app) is open.
@@ -253,11 +255,7 @@ def restore_database(backup: Path, target: Path) -> Path:
         with closing(sqlite3.connect(f"{backup.resolve().as_uri()}?mode=ro", uri=True)) as src:
             src.execute("PRAGMA trusted_schema=OFF")
             # Re-check on the connection that is actually copied (the file could have been swapped since validation).
-            from backend.pyworker.db.schema import SCHEMA_VERSION as _CURRENT
-            _version = src.execute("PRAGMA user_version").fetchone()[0]
-            if not 1 <= _version <= _CURRENT:
-                raise RestoreError("Unsupported schema version")
-            _check_schema_objects(src, _version == _CURRENT)
+            validate_backup_file(backup, _connection=src)
             try:
                 src.backup(con)
             except sqlite3.Error as exc:

@@ -260,6 +260,11 @@ def test_click_rechecks_foreground_before_every_message(flip_at, sent_messages):
         ref._obj.x, ref._obj.y = 5, 5
         return 1
 
+    def client_rect(_hwnd, ref):
+        ref._obj.right, ref._obj.bottom = 800, 600
+        return 1
+
+    user.GetClientRect.side_effect = client_rect
     user.GetCursorPos.side_effect = cursor
     with pytest.raises(computer.ComputerError, match="[Ff]oreground"):
         session.call("computer_click", {"x": 5, "y": 5})

@@ -2,7 +2,7 @@
 
 import hashlib
 import os
-import tempfile
+import secrets
 
 from backend.pyworker.core import workspace_fs as fs
 from backend.pyworker.db.core import ts
@@ -54,6 +54,8 @@ def _dir_identity(root):
 
 def _require_same_dir(root, identity):
     try:
+        if getattr(os.lstat(root), "st_file_attributes", 0) & 0x400 or os.path.islink(root):
+            raise WriteConflict("Workspace directory changed during publication.")
         if _dir_identity(root) != identity or fs._norm(fs.canonical_workspace_dir(root)) != fs._norm(root):
             raise WriteConflict("Workspace directory changed during publication.")
     except (OSError, fs.WorkspaceFsError):
@@ -81,8 +83,43 @@ def apply(db, proposal):
         raise WriteConflict("Proposal is not approved.")
     if os.path.lexists(target):
         raise WriteConflict("A file appeared at this path after the proposal.")
-    # A crash may leave a temp file, but never inside the workspace.
-    fd, temporary = tempfile.mkstemp(prefix="agentos-report-", dir=os.path.dirname(proposal["root"]))
+    root = proposal["root"]
+    name = fs._clean_relative(proposal["path"])[0]
+    # POSIX: every step goes through a pinned directory fd, so a swap cannot redirect it.
+    # Windows (no dir_fd): paths are used, but the directory identity and reparse-point
+    # status are re-verified immediately before and after the no-overwrite link.
+    use_fd = os.link in os.supports_dir_fd and os.open in os.supports_dir_fd and os.unlink in os.supports_dir_fd
+    directory = None
+    if use_fd:
+        directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        identity = _dir_identity(root)
+        if directory is not None and (os.fstat(directory).st_dev, os.fstat(directory).st_ino) != identity:
+            raise WriteConflict("Workspace directory changed during publication.")
+        _require_same_dir(root, identity)
+        temporary = ".agentos-report-" + secrets.token_hex(16)
+        temp_path = os.path.join(root, temporary)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+        if directory is not None:
+            fd = os.open(temporary, flags, 0o600, dir_fd=directory)
+        else:
+            fd = os.open(temp_path, flags, 0o600)
+    except BaseException:
+        if directory is not None:
+            os.close(directory)
+        raise
+
+    def unlink(rel, full):
+        if directory is not None:
+            os.unlink(rel, dir_fd=directory)
+        else:
+            os.unlink(full)
+
+    def same_as_temp(rel, full):
+        if directory is not None:
+            return os.path.samestat(temp_stat, os.stat(rel, dir_fd=directory, follow_symlinks=False))
+        return os.path.samestat(temp_stat, os.lstat(full))
+
     temp_stat = os.fstat(fd)
     try:
         with os.fdopen(fd, "wb") as output:
@@ -94,32 +131,43 @@ def apply(db, proposal):
                                 "id=? AND status='approved'", (proposal["id"],))
             if not changed:
                 raise WriteConflict("Proposal state changed.")
-        target_path(proposal["root"], proposal["path"])
-        # The workspace directory could be swapped for a junction/symlink between the
-        # checks above and the link below, so pin its identity (volume + file id) and
-        # re-check it immediately before and after creating the destination.
-        identity = _dir_identity(proposal["root"])
-        _require_same_dir(proposal["root"], identity)
-        os.link(temporary, target, follow_symlinks=False)
+        target_path(root, proposal["path"])
+        # Re-check the directory immediately before and after creating the destination.
+        _require_same_dir(root, identity)
         try:
-            _require_same_dir(proposal["root"], identity)
-            target_path(proposal["root"], proposal["path"])
-            if not os.path.samestat(temp_stat, os.lstat(target)):
+            if directory is not None:
+                os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+            else:
+                os.link(temp_path, target, follow_symlinks=False)
+        except OSError:
+            raise WriteConflict("Could not publish the report safely.") from None
+        try:
+            _require_same_dir(root, identity)
+            target_path(root, proposal["path"])
+            if not same_as_temp(name, target):
                 raise WriteConflict("Published file is not the one that was created.")
-            os.unlink(temporary)
-            real, _ = fs.resolve_in_workspace(proposal["root"], proposal["path"])
-            if digest(fs.read_limited(real, proposal["root"])) != proposal["content_sha256"]:
+            unlink(temporary, temp_path)
+            real, _ = fs.resolve_in_workspace(root, proposal["path"])
+            if digest(fs.read_limited(real, root)) != proposal["content_sha256"]:
                 raise WriteConflict("Published file did not pass verification.")
         except BaseException:
-            _remove_created(target, temp_stat)
+            try:
+                if same_as_temp(name, target):
+                    unlink(name, target)
+            except OSError:
+                pass
             raise
         # Verified. From here on a failure to record it must NOT remove the report:
         # recover() finds the published, hash-matching file and marks it applied.
         db.update("workspace_writes", {"status": "applied", "finished_at": ts()},
                   "id=? AND status='publishing'", (proposal["id"],))
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        try:
+            unlink(temporary, temp_path)
+        except OSError:
+            pass
+        if directory is not None:
+            os.close(directory)
     return {"path": proposal["path"], "sha256": proposal["content_sha256"], "verified": True}
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import select
 import signal
 import subprocess
 import threading
@@ -78,6 +79,18 @@ class _WindowsJob:
         finally:
             self.k.CloseHandle(process)
 
+    def resume(self, pid):
+        """Resume every thread of a CREATE_SUSPENDED process (Popen hides the thread handle)."""
+        process = self.k.OpenProcess(0x0800, False, pid)  # PROCESS_SUSPEND_RESUME
+        if not process:
+            raise self.c.WinError(self.c.get_last_error())
+        try:
+            status = self.c.WinDLL("ntdll").NtResumeProcess(self.c.c_void_p(process))
+            if status != 0:
+                raise OSError(f"NtResumeProcess failed (0x{status & 0xffffffff:08x})")
+        finally:
+            self.k.CloseHandle(process)
+
     def close(self):
         if self.handle:
             if not self.k.CloseHandle(self.handle):
@@ -113,6 +126,7 @@ class SupervisedProcess:
         self._drains = [asyncio.create_task(asyncio.to_thread(self._read, stream))
                         for stream in (proc.stdout, proc.stderr)]
         self._closing = None
+        self._writer = None
 
     @classmethod
     async def start(cls, argv, *, cwd=None, env=None, max_bytes=MAX_PROCESS_OUTPUT_BYTES):
@@ -129,19 +143,31 @@ class SupervisedProcess:
         try:
             proc = subprocess.Popen(argv, cwd=cwd, env=env, shell=False,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                # Start suspended so the Job Object owns the process before it runs (no escaping children).
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | (0x4 if job else 0),
                 start_new_session=os.name != "nt")
         except BaseException:
             if job:
                 job.close()
             raise
         if job:
+            suspended = job
             try:
                 job.assign(proc.pid)
             except OSError:
-                job.close()
+                try:
+                    job.close()
+                except OSError:
+                    pass
                 job = None
                 issues.append("Job Object assignment failed; taskkill fallback cannot guarantee worker-crash cleanup.")
+            try:
+                # `job` is None after a failed assignment, but the process is still suspended.
+                suspended.resume(proc.pid)
+            except OSError:
+                proc.kill()
+                proc.wait()
+                raise
         return cls(proc, job, max_bytes, issues)
 
     @property
@@ -161,7 +187,13 @@ class SupervisedProcess:
                 peek.restype = w.BOOL
                 handle = msvcrt.get_osfhandle(stream.fileno())
                 available = w.DWORD()
+            stop_deadline = None
             while True:
+                if self._read_stop.is_set():
+                    if stop_deadline is None:
+                        stop_deadline = time.monotonic() + 0.1
+                    elif time.monotonic() >= stop_deadline:
+                        break
                 count = 65536
                 if peek is not None:
                     if not peek(handle, None, 0, None, c.byref(available), None):
@@ -174,6 +206,11 @@ class SupervisedProcess:
                             break
                         continue
                     count = min(count, available.value)
+                else:
+                    if not select.select([stream], [], [], 0.1)[0]:
+                        if self._read_stop.is_set():
+                            break
+                        continue
                 chunk = stream.read1(count)
                 if not chunk:
                     break
@@ -201,6 +238,12 @@ class SupervisedProcess:
                     self.job = None
             except (OSError, TimeoutError):
                 self.issues.append("Job Object termination or closure could not be verified.")
+                if self.job is not None:
+                    try:
+                        self.job.close()
+                        self.job = None
+                    except OSError:
+                        self.issues.append("Job Object handle closure failed on retry.")
         if os.name == "nt" and self.proc.poll() is None:
             try:
                 killer = await asyncio.create_subprocess_exec("taskkill", "/PID", str(self.pid), "/T", "/F",
@@ -233,7 +276,9 @@ class SupervisedProcess:
     async def _close(self):
         await self._kill()
         self._read_stop.set()
-        if self.proc.stdin:
+        if self._writer is not None:
+            await asyncio.gather(self._writer, return_exceptions=True)
+        elif self.proc.stdin:
             await asyncio.to_thread(self.proc.stdin.close)
         # Readers drain to EOF after the owned tree exits. Never abandon to_thread readers.
         results = await asyncio.gather(*self._drains, return_exceptions=True)
@@ -264,9 +309,10 @@ class SupervisedProcess:
             except (BrokenPipeError, OSError, ValueError):
                 pass
             finally:
-                self.proc.stdin.close()
+                await asyncio.to_thread(self.proc.stdin.close)
 
         writer = asyncio.create_task(write())
+        self._writer = writer
         exited = asyncio.create_task(asyncio.to_thread(self.proc.wait))
         overflow = asyncio.create_task(self._overflow.wait())
         try:

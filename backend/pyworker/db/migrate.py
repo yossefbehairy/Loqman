@@ -169,6 +169,7 @@ def init_db(db: Database) -> None:
                 "usage_events": ("ix_usage_events_run_id",),
                 "conversation_runs": ("uq_runs_request_key", "uq_conversation_runs_one_active"),
                 "conversation_run_events": ("uq_run_driver_event",),
+                "runtime_sessions": ("uq_runtime_sessions_native",),
                 "approvals": ("uq_approval_runtime_request",)}
     for table, names in explicit.items():
         if table in existing and table not in created:
