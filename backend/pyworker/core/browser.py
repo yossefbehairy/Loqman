@@ -8,11 +8,13 @@ import ipaddress
 import os
 import socket
 import secrets
+import signal
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -139,7 +141,9 @@ class BrowserSession:
             raise BrowserError("Install Chromium, Chrome or Edge to enable browser tools.")
         self.profile = tempfile.TemporaryDirectory(prefix="agentos-browser-")
         self._log = Path(self.profile.name + ".log")
-        kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
+        # POSIX: own process group, so close() can stop Chromium's renderer/zygote children too.
+        kwargs = ({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32"
+                  else {"start_new_session": True})
         with self._log.open("wb") as log:
             self.process = await asyncio.create_subprocess_exec(
                 executable, "--headless=new", "--no-first-run", "--no-default-browser-check",
@@ -148,7 +152,7 @@ class BrowserSession:
                 stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
                 stderr=log, **kwargs)
         active_port = Path(self.profile.name) / "DevToolsActivePort"
-        for _ in range(100):
+        for _ in range(300):  # cold starts on shared CI runners can take well over 10s
             if active_port.exists():
                 break
             if self.process.returncode is not None:
@@ -169,6 +173,21 @@ class BrowserSession:
         self.cdp = Cdp()
         await self.cdp.connect(page["webSocketDebuggerUrl"])
         await self.cdp.call("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+
+    def _remove_profile(self):
+        # Chromium children may still be flushing files for a moment after the main process dies.
+        for attempt in range(20):
+            try:
+                shutil.rmtree(self.profile.name)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                if attempt == 19:
+                    shutil.rmtree(self.profile.name, ignore_errors=True)
+                else:
+                    time.sleep(.1)
+        self.profile.cleanup()
 
     def _log_tail(self):
         try:
@@ -272,9 +291,12 @@ class BrowserSession:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             else:
-                self.process.kill()
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    self.process.kill()
             await self.process.wait()
         if self.profile is not None:
-            self.profile.cleanup()
+            await asyncio.to_thread(self._remove_profile)
         if self._log is not None:
             self._log.unlink(missing_ok=True)
