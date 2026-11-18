@@ -9,6 +9,8 @@ export interface Company {
   ceo: Agent | null;
   /** True once the first profiles request has settled. */
   loaded: boolean;
+  /** Why the last profiles request failed; the agents shown are then the last ones that loaded. Null when it worked. */
+  error: string | null;
   reload: () => Promise<void>;
 }
 
@@ -46,9 +48,17 @@ export function agentOf(profile: Profile): Agent {
 export function useCompany(): Company {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const reload = useCallback(async () => {
-    setProfiles(await listProfiles().catch(() => [] as Profile[]));
-    setLoaded(true);
+    try {
+      setProfiles(await listProfiles());
+      setError(null);
+    } catch (e) {
+      // A failed read never empties the team: the last agents that loaded stay on screen.
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoaded(true);
+    }
   }, []);
   useEffect(() => {
     void reload();
@@ -58,5 +68,5 @@ export function useCompany(): Company {
   const names = new Map<string, string>();
   for (const a of agents) if (a.team && !names.has(a.team)) names.set(a.team, a.team === 'agents' ? 'Agents' : a.team);
   const teams: Team[] = [...names].map(([id, name]) => ({ id, name, desc: '', mgr: null, color: '' }));
-  return { profiles, agents, teams, ceo: agents.find((a) => a.mgr) ?? null, loaded, reload };
+  return { profiles, agents, teams, ceo: agents.find((a) => a.mgr) ?? null, loaded, error, reload };
 }

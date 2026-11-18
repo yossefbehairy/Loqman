@@ -12,7 +12,7 @@ function runtime({ lock = true, isPackaged = false, ready = Promise.resolve(), s
   const windows = [], workers = [], timers = [], handlers = {};
   const app = new EventEmitter();
   Object.assign(app, {
-    isPackaged, setAppUserModelId() {}, setName() {}, getPath: (name) => `/user/${name}`,
+    isPackaged, setAppUserModelId(id) { this.aumid = id; }, setName() {}, getPath: (name) => `/user/${name}`,
     requestSingleInstanceLock: () => lock, whenReady: () => Promise.resolve(),
     quit() { this.quits = (this.quits || 0) + 1; },
   });
@@ -62,6 +62,13 @@ function runtime({ lock = true, isPackaged = false, ready = Promise.resolve(), s
   });
   return { app, windows, workers, timers, handlers };
 }
+
+test('the AppUserModelID equals the installer appId, so the taskbar groups the window with its shortcut', async () => {
+  const { build } = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  const r = runtime(); await flush();
+  assert.equal(typeof build.appId, 'string');
+  assert.equal(r.app.aumid, build.appId);
+});
 
 test('a second process does not start a worker or register IPC', async () => {
   const r = runtime({ lock: false }); await flush();

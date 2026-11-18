@@ -44,8 +44,11 @@ def _restrict_windows_directory(directory: Path) -> None:
     if os.name != "nt":
         return
     # Remove inherited ACEs and grant only the current user's SID full access.
-    identity = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, check=True)
-    match = re.search(r'S-1-(?:\d+-)+\d+', identity.stdout)
+    # whoami prints the account name in the console code page, so an Arabic (or any non-ASCII)
+    # Windows user name is not valid in the locale encoding. Only the ASCII SID is needed:
+    # read raw bytes and never decode the rest strictly.
+    identity = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, check=True)
+    match = re.search(r'S-1-(?:\d+-)+\d+', identity.stdout.decode("ascii", errors="ignore"))
     if not match:
         raise BackupError("Could not determine current user SID")
     subprocess.run(["icacls", str(directory), "/inheritance:r", "/grant:r", f"*{match.group()}:(OI)(CI)F"],

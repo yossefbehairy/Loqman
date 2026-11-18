@@ -248,3 +248,26 @@ def test_restore_refuses_bad_backups_and_same_file(tmp_path):
     con.close()
     with pytest.raises(backup_mod.RestoreError, match="Unsupported schema"):
         backup_mod.restore_database(future, target)
+
+
+def test_backup_acl_survives_non_ascii_windows_username(monkeypatch, tmp_path):
+    """whoami prints the account name in the console code page. An Arabic user name must not
+    break the SID lookup (it used to be decoded strictly with the locale encoding)."""
+    import subprocess
+    from types import SimpleNamespace
+
+    sid = "S-1-5-21-1111111111-2222222222-3333333333-1001"
+    arabic_cp1256 = '"PC\أحمد","%s"\r\n' % sid
+    raw = arabic_cp1256.encode("cp1256") + b"\xff\x81"  # also bytes no locale codec can decode
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        assert "text" not in kwargs and "encoding" not in kwargs  # raw bytes, never a strict locale decode
+        return SimpleNamespace(stdout=raw if argv[0] == "whoami" else b"", returncode=0)
+
+    monkeypatch.setattr(backup_mod.os, "name", "nt")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backup_mod._restrict_windows_directory(tmp_path)
+    icacls = calls[1][0]
+    assert icacls[0] == "icacls" and f"*{sid}:(OI)(CI)F" in icacls

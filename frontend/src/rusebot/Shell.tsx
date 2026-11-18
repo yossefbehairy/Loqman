@@ -58,6 +58,19 @@ export function Shell() {
   const [missions, setMissions] = useState<Mission[]>([]);
   const [ceoActions, setCeoActions] = useState<CeoAction[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
+  // What failed to load (key -> message). The last data that did load stays on screen; Retry reads it all again.
+  const [failures, setFailures] = useState<Record<string, string>>({});
+  const note = useCallback((key: string, message: string | null) => {
+    setFailures((prev) => {
+      if (message === null) {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return prev[key] === message ? prev : { ...prev, [key]: message };
+    });
+  }, []);
   const fits = useMediaQuery(SIDEBAR_AND_PANEL_FIT, true);
 
   // Every missions request takes a number; only the newest one may update the list, so a slow older answer
@@ -66,15 +79,20 @@ export function Shell() {
 
   const refreshCompany = useCallback(async () => {
     const ticket = ++missionsRequest.current;
-    const [p, m, c] = await Promise.all([
-      listProfiles().catch(() => [] as Profile[]),
-      listMissions().catch(() => null),
-      listCeoActions().catch(() => [] as CeoAction[]),
-    ]);
-    setProfiles(p);
-    if (ticket === missionsRequest.current) setMissions(m ?? []);
-    setCeoActions(c);
-  }, []);
+    const [p, m, c] = await Promise.allSettled([listProfiles(), listMissions(), listCeoActions()]);
+    if (p.status === 'fulfilled') {
+      setProfiles(p.value);
+      note('team', null);
+    } else note('team', messageOf(p.reason));
+    if (m.status === 'fulfilled') {
+      if (ticket === missionsRequest.current) setMissions(m.value);
+      note('missions', null);
+    } else note('missions', messageOf(m.reason));
+    if (c.status === 'fulfilled') {
+      setCeoActions(c.value);
+      note('proposals', null);
+    } else note('proposals', messageOf(c.reason));
+  }, [note]);
 
   /** Resolves when the request settles, so the caller can schedule the next poll after it. */
   const refreshMissions = useCallback(async () => {
@@ -82,16 +100,20 @@ export function Shell() {
     try {
       const list = await listMissions();
       if (ticket === missionsRequest.current) setMissions(list);
-    } catch {
-      /* keep the last known list; the next poll retries */
+      note('missions', null);
+    } catch (e) {
+      // Keep the last known list on screen and say so; the next poll retries.
+      note('missions', messageOf(e));
     }
-  }, []);
+  }, [note]);
 
   useEffect(() => {
     void refreshCompany();
     void reloadAgents();
   }, [refreshCompany, reloadAgents, view]);
 
+  const failedParts = [...(company.error ? ['agents'] : []), ...Object.keys(failures)];
+  const failureDetail = company.error ?? Object.values(failures)[0] ?? '';
   const collapsed = rail || (panelOpen && !fits);
 
   const conversation = chat.conversations.find((c) => c.id === chat.selectedId) ?? null;
@@ -225,6 +247,28 @@ export function Shell() {
           />
         )}
         {view === 'results' && <ResultsView chat={chat} ceoActions={ceoActions} onCeoDecide={decideCeo} />}
+        {failedParts.length > 0 && (
+          <div
+            role="alert"
+            data-load-error
+            className="absolute left-1/2 top-3 z-40 flex max-w-[min(640px,calc(100%-24px))] -translate-x-1/2 items-start gap-2 rounded-lg border border-danger/30 bg-card px-3 py-2 text-[13px] text-danger shadow-lg"
+          >
+            <p dir="auto" className="min-w-0 break-words">
+              Could not refresh {failedParts.join(', ')}. Showing the last data that loaded. {failureDetail}
+            </p>
+            <button
+              type="button"
+              data-load-retry
+              className="shrink-0 font-medium underline"
+              onClick={() => {
+                void refreshCompany();
+                void company.reload();
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        )}
         {notice && (
           <div role="alert" className="absolute bottom-4 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[13px] text-danger">
             {notice}{' '}

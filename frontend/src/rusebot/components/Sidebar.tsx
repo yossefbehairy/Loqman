@@ -8,6 +8,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, FileText, Loader2, MessageSquarePlus, PackageCheck, Plus, Search, Settings, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { GlassBar, GlassScrollFrame, GlassScroller } from './GlassScrollFrame';
+import { AgentAvatar } from './AgentAvatar';
 import { CEO_PROFILE_ID, type Conversation } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
@@ -136,8 +137,15 @@ export function Sidebar(props: SidebarProps) {
     [props.legacy, q]
   );
 
-  const row = (id: string, title: string, when: string, preview: string, working: boolean) => {
+  const agentsById = useMemo(() => new Map(props.agents.map((a) => [a.id, a])), [props.agents]);
+  const agentIndex = useMemo(() => new Map(props.agents.map((a, i) => [a.id, i])), [props.agents]);
+
+  const row = (id: string, title: string, when: string, preview: string, working: boolean, profileId?: string | null) => {
     const current = view === 'chat' && props.selectedId === id;
+    // The badge shows who the chat is with: the agent's colour and initial, so chats with
+    // different agents read apart at a glance. Unknown agent (or an older chat): the title's initial, neutral.
+    const agent = profileId ? agentsById.get(profileId) : undefined;
+    const avatarLabel = agent?.name || title;
     if (rail) {
       return (
         <button
@@ -149,11 +157,11 @@ export function Sidebar(props: SidebarProps) {
           aria-current={current ? 'page' : undefined}
           onClick={() => props.onSelect(id)}
           className={cn(
-            'mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium',
+            'mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-focus',
             current ? 'bg-raised text-ink' : 'text-ink-secondary hover:bg-raised/50 hover:text-ink'
           )}
         >
-          {title.trim().charAt(0).toUpperCase() || '?'}
+          <AgentAvatar identity={profileId} index={profileId ? agentIndex.get(profileId) : undefined} label={avatarLabel} />
         </button>
       );
     }
@@ -161,9 +169,10 @@ export function Sidebar(props: SidebarProps) {
       <div
         key={id}
         className={cn(
-          'group/thread relative flex min-w-0 items-center rounded-xl',
+          'sidebar-row group/thread relative flex min-w-0 items-center rounded-xl',
           current ? 'bg-raised' : 'hover:bg-raised/50'
         )}
+        data-current={current ? 'true' : undefined}
       >
         <button
           type="button"
@@ -171,17 +180,15 @@ export function Sidebar(props: SidebarProps) {
           aria-current={current ? 'page' : undefined}
           title={title}
           onClick={() => props.onSelect(id)}
-          className="flex min-h-[46px] min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+          className="flex min-h-[46px] min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-raised text-[13px] font-medium text-ink-secondary">
-            {title.trim().charAt(0).toUpperCase() || '?'}
-          </span>
+          <AgentAvatar identity={profileId} index={profileId ? agentIndex.get(profileId) : undefined} label={avatarLabel} />
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="flex items-baseline gap-2">
               <span dir="auto" className={cn('min-w-0 flex-1 truncate text-[14px] font-medium leading-5', current ? 'text-ink' : 'text-ink')}>
                 {title}
               </span>
-              {when && <time className="shrink-0 tabular-nums text-[10px] text-ink-secondary">{when}</time>}
+              {when && <time className="shrink-0 tabular-nums text-[11px] text-ink-tertiary">{when}</time>}
             </span>
             <span className="flex items-center gap-1">
               <span dir="auto" className="min-w-0 flex-1 truncate text-[12.5px] leading-4 text-ink-secondary">
@@ -348,11 +355,12 @@ export function Sidebar(props: SidebarProps) {
                 c.title,
                 stamp(c.updated_at),
                 props.previews[c.id] ?? '',
-                Boolean(props.activeRunIds[c.id])
+                Boolean(props.activeRunIds[c.id]),
+                c.profile_id
               )
             )}
             {idleAgents.length > 0 && !rail && (
-              <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              <div role="heading" aria-level={2} className="mx-1 mt-2 border-t border-hairline/50 px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">
                 Agents
               </div>
             )}
@@ -365,9 +373,9 @@ export function Sidebar(props: SidebarProps) {
                   title={a.name}
                   aria-label={a.name}
                   onClick={() => props.onOpenAgent(a)}
-                  className="mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium text-ink-secondary hover:bg-raised/50 hover:text-ink"
+                  className="mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium text-ink-secondary outline-none hover:bg-raised/50 hover:text-ink focus-visible:ring-2 focus-visible:ring-focus"
                 >
-                  {a.name.trim().charAt(0).toUpperCase() || '?'}
+                  <AgentAvatar identity={a.id} index={agentIndex.get(a.id)} label={a.name} />
                 </button>
               ) : (
                 <button
@@ -376,11 +384,9 @@ export function Sidebar(props: SidebarProps) {
                   data-sidebar-agent-row={a.id}
                   title={a.name}
                   onClick={() => props.onOpenAgent(a)}
-                  className="flex min-h-[46px] min-w-0 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none hover:bg-raised/50 focus-visible:ring-1 focus-visible:ring-accent/60"
+                  className="flex min-h-[46px] min-w-0 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none hover:bg-raised/50 focus-visible:ring-2 focus-visible:ring-focus"
                 >
-                  <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-raised text-[13px] font-medium text-ink-secondary">
-                    {a.name.trim().charAt(0).toUpperCase() || '?'}
-                  </span>
+                  <AgentAvatar identity={a.id} index={agentIndex.get(a.id)} label={a.name} />
                   <span className="flex min-w-0 flex-1 flex-col">
                     <span dir="auto" className="truncate text-[14px] font-medium leading-5 text-ink">{a.name}</span>
                     <span dir="auto" className="truncate text-[12.5px] leading-4 text-ink-secondary">{a.role}</span>
@@ -389,7 +395,7 @@ export function Sidebar(props: SidebarProps) {
               )
             )}
             {legacyRows.length > 0 && !rail && (
-              <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              <div role="heading" aria-level={2} className="mx-1 mt-2 border-t border-hairline/50 px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">
                 Earlier chats
               </div>
             )}

@@ -159,6 +159,15 @@ export interface ChatState {
   drafts: Record<string, Draft[]>;
   error: string | null;
   dismissError: () => void;
+  /** Runs the failed step again (resend the message, reload the chat or the list); null when there is nothing to retry. */
+  retry: (() => void) | null;
+  /** The selected chat's messages could not be read: it is not empty, it just did not load. */
+  threadError: string | null;
+  retryThread: () => void;
+  /** Stop was pressed and the worker has not confirmed yet. */
+  stopping: boolean;
+  /** The selected run can be cancelled (a Loqman answer cannot once it has started). */
+  canStop: boolean;
   draft: string;
   setDraft: (text: string) => void;
   send: (text: string) => Promise<void>;
@@ -180,6 +189,30 @@ export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * The agent a chat belongs to. The conversation's own profile_id (stored in SQLite by the worker) decides; the
+ * browser-side map only covers chats made before conversations were bound, and Loqman is the last resort.
+ */
+export function resolveAgent(
+  profileId: string | null | undefined,
+  mappedId: string | null | undefined,
+  agents: Agent[],
+  ceo: Agent | null
+): Agent | null {
+  const bound = profileId ? agents.find((a) => a.id === profileId) : undefined;
+  const mapped = mappedId ? agents.find((a) => a.id === mappedId) : undefined;
+  return bound ?? mapped ?? ceo;
+}
+
+/** An error shown in the chat, with what "Retry" does about it. */
+interface ChatErrorEntry {
+  message: string;
+  retry: 'send' | 'load' | null;
+}
+
+const NO_MESSAGES: ConvMessage[] = [];
+const NO_RUNS: Record<number, RunSnapshot> = {};
+
 function cacheRuns(conversationId: string, ids: string[]): void {
   const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
   all[conversationId] = ids.slice(-30);
@@ -190,7 +223,9 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [legacy] = useState<LegacyThread[]>(() => readLegacyThreads());
   const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
-  const [messages, setMessages] = useState<ConvMessage[]>([]);
+  // The messages and runs of ONE chat, tagged with it: after a switch the old chat's text is never shown in the new one.
+  const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
+  const [runsThread, setRunsThread] = useState<{ cid: string | null; map: Record<number, RunSnapshot> }>({ cid: null, map: NO_RUNS });
   const [pendingUser, setPendingUser] = useState<string | null>(null);
   const [ceoStep, setCeoStep] = useState<{ cid: string; text: string } | null>(null);
   const mounted = useRef(true);
@@ -260,10 +295,24 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     },
     []
   );
-  const [runsBySeq, setRunsBySeq] = useState<Record<number, RunSnapshot>>({});
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
-  const [error, setError] = useState<string | null>(null);
+  // Errors belong to the chat they happened in ('' = no chat open yet or the list itself); another chat never shows them.
+  const [errors, setErrors] = useState<Record<string, ChatErrorEntry>>({});
+  const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
+  const [stoppingRuns, setStoppingRuns] = useState<Record<string, true>>({});
+  const failedSend = useRef<{ cid: string | null; prompt: string } | null>(null);
+  const raise = useCallback((cid: string | null, message: string, retry: ChatErrorEntry['retry'] = null) => {
+    setErrors((prev) => ({ ...prev, [cid ?? '']: { message, retry } }));
+  }, []);
+  const clearError = useCallback((cid: string | null) => {
+    setErrors((prev) => {
+      if (!((cid ?? '') in prev)) return prev;
+      const next = { ...prev };
+      delete next[cid ?? ''];
+      return next;
+    });
+  }, []);
   const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
   const [loaded, setLoaded] = useState(false);
   const [draftAgentId, setDraftAgentId] = useState<string | null>(null);
@@ -281,8 +330,10 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   }, []);
   const agentFor = useCallback(
     (cid: string | null) =>
-      cid ? (agents.find((a) => a.id === agentMap[cid]) ?? ceo) : (agents.find((a) => a.id === draftAgentId) ?? ceo),
-    [agents, agentMap, ceo, draftAgentId]
+      cid
+        ? resolveAgent(conversations.find((c) => c.id === cid)?.profile_id, agentMap[cid], agents, ceo)
+        : (agents.find((a) => a.id === draftAgentId) ?? ceo),
+    [agents, agentMap, ceo, draftAgentId, conversations]
   );
   const streams = useRef(new Map<string, StreamHandle>());
   const selectedRef = useRef(selectedId);
@@ -305,9 +356,34 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     setConversations(await withoutEmptyHistory(await listConversations()));
   }, [withoutEmptyHistory]);
 
-  const loadThread = useCallback(async (conversationId: string) => {
+  // Every read of a chat takes a number; an older answer that arrives after a newer one is dropped,
+  // and an answer for a chat that is no longer open is never shown.
+  const readSeq = useRef(new Map<string, number>());
+  const nextRead = (cid: string) => {
+    const n = (readSeq.current.get(cid) ?? 0) + 1;
+    readSeq.current.set(cid, n);
+    return n;
+  };
+  const fetchMessages = useCallback(async (conversationId: string): Promise<ConvMessage[] | null> => {
+    const ticket = nextRead(conversationId);
     const list = await listMessages(conversationId);
-    if (selectedRef.current === conversationId) setMessages(list);
+    if (readSeq.current.get(conversationId) !== ticket) return null;
+    if (selectedRef.current === conversationId) setThread({ cid: conversationId, list });
+    return list;
+  }, []);
+
+  const loadThread = useCallback(async (conversationId: string) => {
+    const ticket = nextRead(conversationId);
+    setThreadErrors((prev) => {
+      if (!(conversationId in prev)) return prev;
+      const next = { ...prev };
+      delete next[conversationId];
+      return next;
+    });
+    const list = await listMessages(conversationId);
+    if (readSeq.current.get(conversationId) === ticket && selectedRef.current === conversationId) {
+      setThread({ cid: conversationId, list });
+    }
     // The worker knows this conversation's runs; the browser index is only a fallback when it is unreachable.
     let snaps: Array<RunSnapshot | null> | null = await listRuns(conversationId, 30).catch(() => null);
     if (snaps) {
@@ -323,8 +399,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       if (snap.assistant_message_seq != null) bySeq[snap.assistant_message_seq] = snap;
       if (snap.status === 'succeeded') nextDrafts[snap.id] = await listDrafts(snap.id).catch(() => []);
     }
-    if (selectedRef.current === conversationId) {
-      setRunsBySeq(bySeq);
+    if (selectedRef.current === conversationId && readSeq.current.get(conversationId) === ticket) {
+      setRunsThread({ cid: conversationId, map: bySeq });
       setDrafts((prev) => ({ ...prev, ...nextDrafts }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
@@ -345,8 +421,14 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         handle?.close();
         streams.current.delete(runId);
         setRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error: err } }));
-        setPendingUser(null);
-        if (err && status !== 'cancelled' && selectedRef.current === conversationId) setError(err);
+        setStoppingRuns((prev) => {
+          if (!(runId in prev)) return prev;
+          const next = { ...prev };
+          delete next[runId];
+          return next;
+        });
+        if (selectedRef.current === conversationId) setPendingUser(null);
+        if (err && status !== 'cancelled') raise(conversationId, err);
         const partial = liveRuns.current.get(runId);
         if (status === 'cancelled' && hasLiveContent(partial)) {
           // Keep what was written, marked as stopped; a reload shows only what the worker stored.
@@ -355,8 +437,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           setLive((prev) => ({ ...prev, [conversationId]: kept }));
         } else {
           // The stored reply replaces the live one in the same render, so the text never shows twice or disappears.
-          const stored = status === 'succeeded' ? await listMessages(conversationId).catch(() => null) : null;
-          if (stored && selectedRef.current === conversationId) setMessages(stored);
+          if (status === 'succeeded') await fetchMessages(conversationId).catch(() => null);
           dropLive(conversationId, runId);
         }
         await refreshConversations().catch(() => undefined);
@@ -391,10 +472,10 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         })
         .catch((e) => {
           streams.current.delete(runId);
-          setError(messageOf(e));
+          raise(conversationId, messageOf(e));
         });
     },
-    [loadThread, refreshConversations, applyLive, dropLive]
+    [loadThread, fetchMessages, refreshConversations, applyLive, dropLive, raise]
   );
 
   useEffect(() => {
@@ -431,7 +512,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         setRuns(active);
         setApprovals(await listApprovals().catch(() => []));
       } catch (e) {
-        if (alive) setError(messageOf(e));
+        if (alive) raise(null, `Could not load your chats. ${messageOf(e)}`, 'load');
       } finally {
         if (alive) setLoaded(true);
       }
@@ -442,16 +523,18 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       for (const handle of open.values()) handle.close();
       open.clear();
     };
-  }, [follow, withoutEmptyHistory]);
+  }, [follow, withoutEmptyHistory, raise]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
-      setMessages([]);
-      setRunsBySeq({});
+      setThread({ cid: null, list: NO_MESSAGES });
+      setRunsThread({ cid: null, map: NO_RUNS });
       return;
     }
     let alive = true;
-    loadThread(selectedId).catch((e) => alive && setError(messageOf(e)));
+    loadThread(selectedId).catch((e) => {
+      if (alive) setThreadErrors((prev) => ({ ...prev, [selectedId]: messageOf(e) }));
+    });
     return () => {
       alive = false;
     };
@@ -472,7 +555,6 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     setDraftAgentId(null);
     setSelectedId(id);
     writeJson(KEY_SELECTED, id);
-    setError(null);
     setPendingUser(null);
   }, []);
 
@@ -495,23 +577,33 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       const prompt = text.trim();
       if (!prompt) return;
       if (!engine?.model) {
-        setError('No AI provider is ready. Open Settings > AI to sign in or pick a model.');
+        raise(selectedRef.current, 'No AI provider is ready. Open Settings > AI to sign in or pick a model.');
         return;
       }
-      setError(null);
       let cid = selectedRef.current;
+      clearError(cid);
+      failedSend.current = null;
       const draftKey = cid ?? '';
       const known = cid && !cid.startsWith('legacy:') ? cid : null;
       const target = known
-        ? (agents.find((a) => a.id === agentMapRef.current[known]) ?? ceo)
+        ? resolveAgent(conversations.find((c) => c.id === known)?.profile_id, agentMapRef.current[known], agents, ceo)
         : (agents.find((a) => a.id === draftAgentRef.current) ?? ceo);
       if ((!target || target.id === CEO_PROFILE_ID) && prompt.length > CEO_MAX_CHARS) {
-        setError(
+        raise(
+          cid,
           `Loqman reads messages of up to ${CEO_MAX_CHARS.toLocaleString('en-US')} characters; this one has ${prompt.length.toLocaleString('en-US')}. Shorten it and send again.`
         );
         return;
       }
       let boundProfile: string | null | undefined = cid ? conversations.find((c) => c.id === cid)?.profile_id : null;
+      const keepDraft = (key: string) =>
+        setDraftMap((prev) => {
+          // A failed send gives the text back in the chat it belongs to, and never over something typed since.
+          const next = { ...prev, [key]: prev[key] || prompt };
+          if (draftKey !== key) delete next[draftKey];
+          writeJson(KEY_DRAFTS, next);
+          return next;
+        });
       try {
         if (!cid || cid.startsWith('legacy:')) {
           const created = await createConversation(
@@ -527,7 +619,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           const starter = agents.find((a) => a.id === draftAgentRef.current) ?? ceo;
           if (starter) bindAgent(cid, starter.id);
         }
-        const agent = agents.find((a) => a.id === agentMapRef.current[cid!]) ?? ceo;
+        const chatId = cid;
+        const agent = resolveAgent(boundProfile, agentMapRef.current[chatId], agents, ceo);
         const clearDraft = () =>
           setDraftMap((prev) => {
             const next = { ...prev };
@@ -537,46 +630,44 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           });
         if (!agent || agent.id === CEO_PROFILE_ID) {
           // Loqman (the CEO) answers through the CEO loop, which is the path that can create agents.
-          const conversationId = cid;
           const ticket = `ceo-${crypto.randomUUID()}`;
           setPendingUser(prompt);
           clearDraft();
-          setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'running', error: null } }));
+          setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null } }));
           // Ask the worker where the answer has got to. One request at a time; it ends with the ask, a chat switch or unmount.
           let polling = true;
           void (async () => {
             while (polling) {
               await new Promise((r) => window.setTimeout(r, CEO_PROGRESS_MS));
-              if (!polling || !mounted.current || selectedRef.current !== conversationId) return;
+              if (!polling || !mounted.current || selectedRef.current !== chatId) return;
               const p = await ceoAskProgress(ticket).catch(() => null);
-              if (!polling || !mounted.current || selectedRef.current !== conversationId) return;
+              if (!polling || !mounted.current || selectedRef.current !== chatId) return;
               if (p) {
-                const text = progressText(p);
-                if (text) setCeoStep({ cid: conversationId, text });
+                const step = progressText(p);
+                if (step) setCeoStep({ cid: chatId, text: step });
                 if (p.done) return;
               }
             }
           })();
+          let failure: string | null = null;
           try {
             // The worker stores both sides of the exchange in this chat (the question before generating, the
             // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
-            const answer = await askCeo(prompt, engine.engine, engine.model, ticket, conversationId);
+            const answer = await askCeo(prompt, engine.engine, engine.model, ticket, chatId);
             if (answer.agents_created.length) onAgentsChanged?.();
           } catch (e) {
-            setError(messageOf(e));
-            setDraftMap((prev) => {
-              const next = { ...prev, [conversationId]: prev[conversationId] || prompt };
-              writeJson(KEY_DRAFTS, next);
-              return next;
-            });
+            failure = messageOf(e);
+            failedSend.current = { cid: chatId, prompt };
+            raise(chatId, failure, 'send');
+            keepDraft(chatId);
           } finally {
             polling = false;
             setCeoStep(null);
-            setPendingUser(null);
-            setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'succeeded', error: null } }));
+            if (selectedRef.current === chatId) setPendingUser(null);
+            // A failed answer is a failed run, not a finished one.
+            setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: failure ? 'failed' : 'succeeded', error: failure } }));
             await refreshConversations().catch(() => undefined);
-            const list = await listMessages(conversationId).catch(() => null);
-            if (list && selectedRef.current === conversationId) setMessages(list);
+            await fetchMessages(chatId).catch(() => null);
           }
           return;
         }
@@ -584,10 +675,10 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         // worker applies the agent's instructions; only if that fails does the first message carry the contract.
         let outgoing = prompt;
         if (agent && !boundProfile) {
-          const bound = await bindConversationProfile(cid, agent.id).catch(() => null);
+          const bound = await bindConversationProfile(chatId, agent.id).catch(() => null);
           if (bound) {
             setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
-          } else if (agent.prompt && (await listMessages(cid).catch(() => [{}])).length === 0) {
+          } else if (agent.prompt && (await listMessages(chatId).catch(() => [{}])).length === 0) {
             outgoing = `${CONTRACT_OPEN}
 ${agent.prompt}
 ${CONTRACT_CLOSE}
@@ -597,36 +688,39 @@ ${prompt}`;
         }
         setPendingUser(prompt);
         setLive((prev) => {
-          if (!(cid! in prev)) return prev;
+          if (!(chatId in prev)) return prev;
           const next = { ...prev };
-          delete next[cid!];
+          delete next[chatId];
           return next;
         });
-        const snap = await startTurn({
-          conversationId: cid,
-          engine: engine.engine,
-          modelId: engine.model,
-          prompt: outgoing,
-          requestKey: `ui-${crypto.randomUUID()}`,
-        });
-        remember(cid, snap.id);
-        setDraftMap((prev) => {
-          const next = { ...prev };
-          delete next[draftKey];
-          writeJson(KEY_DRAFTS, next);
-          return next;
-        });
-        setRuns((prev) => ({ ...prev, [cid!]: { runId: snap.id, status: snap.status, error: null } }));
-        const list = await listMessages(cid).catch(() => null);
-        if (list && selectedRef.current === cid) setMessages(list);
-        follow(cid, snap.id);
+        try {
+          const snap = await startTurn({
+            conversationId: chatId,
+            engine: engine.engine,
+            modelId: engine.model,
+            prompt: outgoing,
+            requestKey: `ui-${crypto.randomUUID()}`,
+          });
+          remember(chatId, snap.id);
+          clearDraft();
+          setRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
+          await fetchMessages(chatId).catch(() => null);
+          follow(chatId, snap.id);
+        } catch (e) {
+          if (selectedRef.current === chatId) setPendingUser(null);
+          failedSend.current = { cid: chatId, prompt };
+          raise(chatId, messageOf(e), 'send');
+          keepDraft(chatId);
+        }
       } catch (e) {
+        // Creating the chat or binding it failed before anything was sent.
         setPendingUser(null);
-        setError(messageOf(e));
-        throw e;
+        failedSend.current = { cid, prompt };
+        raise(cid, messageOf(e), 'send');
+        keepDraft(cid ?? '');
       }
     },
-    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations, conversations]
+    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, raise, clearError]
   );
 
   const openAgentChat = useCallback(
@@ -653,11 +747,13 @@ ${prompt}`;
   const stop = useCallback(async () => {
     const cid = selectedRef.current;
     const run = cid ? runs[cid] : undefined;
-    if (!run || run.runId.startsWith('ceo-')) return; // a CEO answer cannot be cancelled midway
+    // A Loqman answer is one request to the worker that cannot be cancelled midway; the button is disabled for it.
+    if (!cid || !run || run.runId.startsWith('ceo-') || isTerminal(run.status) || stoppingRuns[run.runId]) return;
     // The text stops changing the moment Stop is pressed, before the worker confirms.
     stoppedRuns.current.add(run.runId);
+    setStoppingRuns((prev) => ({ ...prev, [run.runId]: true }));
     const turn = liveRuns.current.get(run.runId);
-    if (turn && cid) {
+    if (turn) {
       const frozen = freezeLive(turn);
       liveRuns.current.set(run.runId, frozen);
       setLive((prev) => ({ ...prev, [cid]: frozen }));
@@ -666,13 +762,18 @@ ${prompt}`;
       await cancelRun(run.runId);
     } catch (e) {
       stoppedRuns.current.delete(run.runId);
-      if (turn && cid) {
+      setStoppingRuns((prev) => {
+        const next = { ...prev };
+        delete next[run.runId];
+        return next;
+      });
+      if (turn) {
         liveRuns.current.set(run.runId, turn);
         setLive((prev) => ({ ...prev, [cid]: turn }));
       }
-      setError(messageOf(e));
+      raise(cid, `Could not stop the reply. ${messageOf(e)}`);
     }
-  }, [runs]);
+  }, [runs, stoppingRuns, raise]);
 
   const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny') => {
     try {
@@ -686,11 +787,11 @@ ${prompt}`;
     try {
       await createDraft(runId);
     } catch (e) {
-      setError(messageOf(e));
+      raise(selectedRef.current, messageOf(e));
     }
     const list = await listDrafts(runId).catch(() => []);
     setDrafts((prev) => ({ ...prev, [runId]: list }));
-  }, []);
+  }, [raise]);
 
   const loadAllDrafts = useCallback(async () => {
     const next: Record<string, Draft[]> = {};
@@ -712,11 +813,11 @@ ${prompt}`;
     try {
       await decideDraft(draft.run_id, draft.id, decision, draft.content_sha256);
     } catch (e) {
-      setError(messageOf(e));
+      raise(selectedRef.current, messageOf(e));
     }
     const list = await listDrafts(draft.run_id).catch(() => []);
     setDrafts((prev) => ({ ...prev, [draft.run_id]: list }));
-  }, []);
+  }, [raise]);
 
   const downloadDraft = useCallback(async (draft: Draft) => {
     try {
@@ -730,9 +831,35 @@ ${prompt}`;
       link.remove();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setError(messageOf(e));
+      raise(selectedRef.current, messageOf(e));
     }
-  }, []);
+  }, [raise]);
+
+  const messages = thread.cid !== null && thread.cid === selectedId ? thread.list : NO_MESSAGES;
+  const runsBySeq = runsThread.cid !== null && runsThread.cid === selectedId ? runsThread.map : NO_RUNS;
+  const shownError = (selectedId && errors[selectedId]) || errors[''] || null;
+  const errorKey = selectedId && errors[selectedId] ? selectedId : '';
+  const threadError = selectedId ? (threadErrors[selectedId] ?? null) : null;
+
+  const retry = useMemo(() => {
+    if (!shownError?.retry) return null;
+    const kind = shownError.retry;
+    return () => {
+      if (kind === 'send') {
+        const failed = failedSend.current;
+        if (failed) void send(failed.prompt);
+        return;
+      }
+      clearError(errorKey || null);
+      void refreshConversations().catch((e) => raise(null, `Could not load your chats. ${messageOf(e)}`, 'load'));
+    };
+  }, [shownError, send, clearError, errorKey, refreshConversations, raise]);
+
+  const retryThread = useCallback(() => {
+    const cid = selectedRef.current;
+    if (!cid || cid.startsWith('legacy:')) return;
+    loadThread(cid).catch((e) => setThreadErrors((prev) => ({ ...prev, [cid]: messageOf(e) })));
+  }, [loadThread]);
 
   const currentRun = selectedId ? (runs[selectedId] ?? null) : null;
   const activeRunIds = useMemo(() => {
@@ -754,8 +881,13 @@ ${prompt}`;
     runsBySeq,
     approvals,
     drafts,
-    error,
-    dismissError: () => setError(null),
+    error: shownError?.message ?? null,
+    dismissError: () => clearError(errorKey || null),
+    retry,
+    threadError,
+    retryThread,
+    stopping: Boolean(currentRun && stoppingRuns[currentRun.runId]),
+    canStop: Boolean(currentRun && !currentRun.runId.startsWith('ceo-') && !isTerminal(currentRun.status)),
     draft: draftMap[selectedId ?? ''] ?? '',
     setDraft,
     send,

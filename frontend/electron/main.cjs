@@ -31,7 +31,9 @@ const RENDERER_METHODS = new Set([
   'usage.summary',
 ]);
 
-app.setAppUserModelId('app.loqman.desktop');
+// Must equal build.appId in package.json: the NSIS installer stamps its shortcuts with that id, and Windows
+// groups the running window (taskbar pin, notifications) only when the app reports the same one.
+app.setAppUserModelId('com.agentos.desktop');
 // Keep userData deterministic across dev and packaged builds: %APPDATA%\Loqman
 // (must run before the first getPath('userData') call).
 app.setName('Loqman');

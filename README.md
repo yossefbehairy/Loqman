@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml/badge.svg)](https://github.com/yossefbehairy/Loqman/actions/workflows/ci.yml)
 ![Version](https://img.shields.io/badge/version-0.2.2-blue)
-![Tests](https://img.shields.io/badge/tests-304%20backend%20%7C%2059%20E2E-brightgreen)
+![Tests](https://img.shields.io/badge/tests-586%20backend%20%7C%2044%20Node%20%7C%2089%20E2E-brightgreen)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![Node](https://img.shields.io/badge/node-22-green)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
@@ -35,7 +35,7 @@ flowchart LR
         Renderer["Renderer: React 19 + TypeScript"]
     end
     subgraph Sidecar["Python worker (stdlib only, frozen)"]
-        API["87 JSON Lines methods (incl. shutdown) + event streams"]
+        API["70 JSON Lines methods (incl. shutdown) + event streams"]
         DB[("SQLite (WAL)")]
         API --- DB
     end
@@ -168,16 +168,16 @@ Copy `.env.example` to `.env` in the repository root and adjust what you need:
 
 Counts below are static counts of test definitions, taken when this section was written. They are not run results.
 
-- Backend: 304 test functions in `backend/tests` (34 files, including `backend/tests/pw`).
-- Node: 11 tests in `frontend/electron/*.test.cjs`.
-- End to end: 59 Playwright tests in one spec, `frontend/e2e/rusebot_ui.spec.ts`.
+- Backend: 586 pytest cases in `backend/tests` (including `backend/tests/pw`), 2 skipped.
+- Node: 44 tests in the 9 files `frontend/electron/*.test.cjs`.
+- End to end: 89 Playwright tests in one spec, `frontend/e2e/rusebot_ui.spec.ts`.
 
 ```powershell
 # Backend
 backend\.venv\Scripts\python.exe -m pytest backend\tests -q
 
-# Node: transport, worker client, dev bridge
-node --test frontend/electron/transport.test.cjs frontend/electron/worker-client.test.cjs frontend/electron/bridge.test.cjs
+# Node: every Electron-layer test (main process, worker client, transport, bridge, security, backup...)
+node --test "frontend/electron/*.test.cjs"
 
 # Frontend gates: types, lint, production build
 cd frontend

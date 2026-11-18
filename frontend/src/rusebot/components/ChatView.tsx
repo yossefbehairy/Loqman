@@ -7,6 +7,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Copy, Cpu, X } from 'lucide-react';
+import { CEO_PROFILE_ID } from '../data/worker';
 import { cn } from '../lib/cn';
 import { useComposerDockPad } from '../lib/composer-dock';
 import { userBubbleStyle } from '../lib/user-bubble-tone';
@@ -168,7 +169,7 @@ function EmptyChat({ name, role, description }: { name: string; role?: string; d
   );
 }
 
-export function ChatErrorBanner({ message, onDismiss }: { message: string | null; onDismiss: () => void }) {
+export function ChatErrorBanner({ message, onDismiss, onRetry }: { message: string | null; onDismiss: () => void; onRetry?: (() => void) | null }) {
   if (!message) return null;
   return (
     <div className="w-full px-5">
@@ -176,6 +177,11 @@ export function ChatErrorBanner({ message, onDismiss }: { message: string | null
         <div className="min-w-0 flex-1 break-words">
           <p dir="auto">{message}</p>
         </div>
+        {onRetry && (
+          <button type="button" data-chat-retry onClick={onRetry} className="shrink-0 rounded px-1.5 font-medium underline hover:bg-danger/10">
+            Retry
+          </button>
+        )}
         <button type="button" onClick={onDismiss} aria-label="Dismiss" title="Dismiss" className="shrink-0 rounded p-0.5 hover:bg-danger/10">
           <X size={13} />
         </button>
@@ -218,6 +224,12 @@ export function ChatView({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [lastKey, chat.selectedId]);
+
+  // A chat runs on the provider and model picked in the composer; the model saved on the agent is used for delegated tasks.
+  const choice = engines.choice;
+  const chatModel = choice ? (engines.models.find((m) => m.id === choice.model)?.name ?? choice.model) : '';
+  const savedModel = agent && agent.id !== CEO_PROFILE_ID ? agent.model : '';
+  const overridden = Boolean(choice && savedModel && savedModel !== choice.model);
 
   const live = hasLiveContent(chat.live) ? chat.live : null;
   const liveSize = live ? live.items.reduce((n, i) => n + i.text.length + 1, 0) : 0;
@@ -299,6 +311,21 @@ export function ChatView({
                       </span>
                     </span>
                   )}
+                  {choice && (
+                    <span
+                      data-chathead-model
+                      data-model-override={overridden ? 'true' : 'false'}
+                      title={
+                        overridden
+                          ? `This chat runs on ${choice.model}, chosen in the + menu. ${ASSISTANT_NAME} is saved with ${savedModel}, which is used for delegated tasks.`
+                          : `This chat runs on ${choice.model}, chosen in the + menu.`
+                      }
+                      className="hidden min-w-0 max-w-[180px] items-center gap-1 truncate whitespace-nowrap text-[11px] text-ink-secondary @4xl/chathead:flex"
+                    >
+                      <span className="truncate">{chatModel}</span>
+                      {overridden && <span className="shrink-0 rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning">override</span>}
+                    </span>
+                  )}
                 </button>
                 <span aria-hidden="true" className="shrink-0 text-[14px] text-ink-tertiary">
                   /
@@ -340,7 +367,17 @@ export function ChatView({
               ))
             ) : (
               <>
-                {ready && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
+                {chat.threadError && (
+                  <div role="alert" data-thread-error className="flex flex-col items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-3 text-[13px] text-danger">
+                    <p dir="auto" className="break-words">
+                      This chat could not be loaded, so its messages are not shown. {chat.threadError}
+                    </p>
+                    <button type="button" data-thread-retry onClick={chat.retryThread} className="ui-button ui-button-sm">
+                      Retry
+                    </button>
+                  </div>
+                )}
+                {ready && !chat.threadError && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
                   <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description="Send a message to start the conversation." />
                 )}
                 {rows}
@@ -375,7 +412,7 @@ export function ChatView({
         <div ref={dockRef} className="pointer-events-none absolute inset-x-0 bottom-0 z-[2] chat-column-dock">
           <div className="pointer-events-none relative px-5 pb-3">
             <div className="pointer-events-auto">
-              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} />
+              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} onRetry={chat.retry} />
             </div>
             <div className="pointer-events-auto relative w-full">
               <div className="relative">
@@ -385,6 +422,8 @@ export function ChatView({
                   onChange={chat.setDraft}
                   onSend={chat.send}
                   onStop={chat.stop}
+                  canStop={chat.canStop}
+                  stopping={chat.stopping}
                   running={running}
                   disabled={engines.loading || !ready}
                   engines={engines}

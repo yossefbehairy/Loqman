@@ -18,6 +18,10 @@ export interface ComposerProps {
   onChange: (text: string) => void;
   onSend: (text: string) => Promise<void>;
   onStop: () => Promise<void>;
+  /** False while the running answer cannot be cancelled (a Loqman answer once it has started). */
+  canStop?: boolean;
+  /** Stop was pressed and the worker has not confirmed yet. */
+  stopping?: boolean;
   running: boolean;
   disabled?: boolean;
   engines: EngineState;
@@ -26,7 +30,7 @@ export interface ComposerProps {
   onManageProviders?: () => void;
 }
 
-export function Composer({ placeholder, value, onChange, onSend, onStop, running, disabled, engines, onNewAgent, onManageProviders }: ComposerProps) {
+export function Composer({ placeholder, value, onChange, onSend, onStop, canStop = true, stopping = false, running, disabled, engines, onNewAgent, onManageProviders }: ComposerProps) {
   const choice = engines.choice;
   const ref = useRef<HTMLTextAreaElement>(null);
   const [menu, setMenu] = useState(false);
@@ -205,9 +209,10 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, running
             <button
               type="button"
               onClick={() => void onStop()}
+              disabled={!canStop || stopping}
               aria-label="Stop"
-              title="Stop"
-              className="flex size-8 items-center justify-center rounded-full bg-ink text-app hover:opacity-90"
+              title={!canStop ? 'This answer cannot be stopped once it has started' : stopping ? 'Stopping…' : 'Stop'}
+              className="flex size-8 items-center justify-center rounded-full bg-ink text-app hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <Square size={13} fill="currentColor" aria-hidden="true" />
             </button>

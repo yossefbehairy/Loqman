@@ -37,6 +37,7 @@ function PageHeader({ icon, title, count, subtitle, action }: { icon: React.Reac
 }
 
 const MISSION_POLL_MS = 3000;
+const MISSIONS_SHOWN = 8;
 
 /** A stored output or summary is plain text, a `{ result }` object, or some other JSON. */
 function resultText(value: unknown): string {
@@ -339,7 +340,12 @@ export function AgentPanel({
         <dt className="text-ink-secondary">Status</dt>
         <dd>{agent.status}</dd>
         <dt className="text-ink-secondary">Model</dt>
-        <dd className="break-all">{drawerModel.label}</dd>
+        <dd className="break-all">
+          {drawerModel.label}
+          <span data-model-note className="mt-0.5 block text-[11px] text-ink-secondary">
+            Used for delegated tasks. A chat runs on the provider and model picked in the chat&apos;s + menu.
+          </span>
+        </dd>
         <dt className="text-ink-secondary">Effort</dt>
         <dd>{agent.reason}</dd>
         <dt className="text-ink-secondary">Timeout</dt>
@@ -450,8 +456,11 @@ export function TeamView(props: TeamViewProps) {
 
   const contracts = props.mode === 'contracts';
   const [openMission, setOpenMission] = useState<string | null>(null);
-  const shownMissions = missions.slice(0, 8);
-  const anyActive = shownMissions.some((m) => !isMissionTerminal(m.status));
+  const [allMissions, setAllMissions] = useState(false);
+  // The eight newest missions, plus every one still running however old it is; the rest wait behind "Show older".
+  const shownMissions = missions.filter((m, i) => allMissions || i < MISSIONS_SHOWN || !isMissionTerminal(m.status));
+  const hiddenMissions = missions.length - shownMissions.length;
+  const anyActive = missions.some((m) => !isMissionTerminal(m.status));
   const { onPollMissions } = props;
   useEffect(() => {
     if (!anyActive) return;
@@ -554,6 +563,11 @@ export function TeamView(props: TeamViewProps) {
                   />
                 ))}
               </ul>
+              {(hiddenMissions > 0 || (allMissions && missions.length > MISSIONS_SHOWN)) && (
+                <button type="button" data-missions-older onClick={() => setAllMissions((v) => !v)} className="ui-button ui-button-sm mt-2">
+                  {allMissions ? 'Show fewer' : `Show ${hiddenMissions} older ${hiddenMissions === 1 ? 'mission' : 'missions'}`}
+                </button>
+              )}
             </section>
           )}
         </div>

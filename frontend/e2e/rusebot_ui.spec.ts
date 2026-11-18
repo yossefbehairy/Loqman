@@ -51,7 +51,9 @@ async function open(page: Page, path = '/?ui=rusebot', { asAgent = true } = {}) 
     await expect(page.getByRole('textbox', { name: `Message ${agentName}` })).toBeVisible();
     await page.waitForTimeout(350); // let the drawer finish closing
   }
-  await expect(page.locator('[data-chathead-pill]')).toContainText('mock');
+  // The provider list comes from the worker's engine discovery, which is slow on a cold worker (the first test
+  // to reach it in a full run waited more than the 5 s default and failed); a longer wait fixes the timing without hiding a real fault.
+  await expect(page.locator('[data-chathead-pill]')).toContainText('mock', { timeout: 30000 });
   await expect(page.getByRole('button', { name: 'Send' })).toBeDisabled();
 }
 
@@ -2132,5 +2134,206 @@ test.describe('chat: streaming replies', () => {
     await expect(live(page).locator('[data-live-item]')).toHaveText('x'.repeat(400));
     expect(mutations).toBeLessThan(400);
     await run.finish('succeeded');
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// Review fixes (Nour): the agent comes from SQLite, chats never show another chat's text, failures are visible
+// with a way to retry, Stop and the Loqman failure state, model override, missions beyond eight, load errors.
+// ---------------------------------------------------------------------------------------
+const failJson = (route: Route, status: number, detail: string) =>
+  route.fulfill({ status, contentType: 'application/json', body: JSON.stringify({ status, detail }) });
+
+test.describe('review fixes: chat state', () => {
+  async function seedAgentChat(page: Page, model: string | null) {
+    const name = `Bound${uid()}`;
+    const profile = await call<{ id: string }>(page, 'profiles.create', {
+      name, role_type: 'custom', description: 'Bound agent', instructions: 'Answer briefly.', ...(model ? { default_model_id: model } : {}),
+    });
+    const conv = await call<{ id: string }>(page, 'conversations.create', { title: `chat-${name}`, profile_id: profile.id });
+    await call(page, 'conversations.add_message', { conversation_id: conv.id, role: 'user', content: `hello ${name}` });
+    return { name, profileId: profile.id, cid: conv.id };
+  }
+  const selectOnLoad = (page: Page, cid: string) =>
+    page.addInitScript((id) => localStorage.setItem('agentos.rusebot.selected.v1', JSON.stringify(id)), cid);
+
+  test('the agent of a chat comes from the stored profile_id, not from the browser cache', async ({ page }) => {
+    const { name, cid } = await seedAgentChat(page, null);
+    await selectOnLoad(page, cid); // no agentos.rusebot.convAgents.v1 entry exists
+    await page.goto('/?ui=rusebot');
+    await expect(page.getByRole('textbox', { name: `Message ${name}` })).toBeVisible();
+    await expect(page.locator('[data-chathead-pill]')).toContainText(name);
+  });
+
+  test("the header names the model the chat runs on and flags an override of the agent's saved model", async ({ page }) => {
+    const over = await seedAgentChat(page, 'saved-model-xyz');
+    await selectOnLoad(page, over.cid);
+    await page.goto('/?ui=rusebot');
+    const chip = page.locator('[data-chathead-model]');
+    await expect(chip).toBeVisible({ timeout: 30000 });
+    await expect(chip).toHaveAttribute('data-model-override', 'true');
+    await expect(chip).toHaveAttribute('title', /saved-model-xyz/);
+    await expect(chip).toContainText('override');
+  });
+
+  test('switching chats empties the transcript at once and a slow load never shows the previous chat', async ({ page }) => {
+    const a = `a-${uid()}`;
+    const b = `b-${uid()}`;
+    await seedChat(page, a, `text of ${a}`);
+    const idB = await seedChat(page, b, `text of ${b}`);
+    let hold = false;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (hold && req.method === 'conversations.messages' && req.params?.conversation_id === idB) await gate;
+      return route.continue();
+    });
+    await open(page, '/?ui=rusebot', { asAgent: false });
+    await openChatByTitle(page, a);
+    await expect(page.locator('[data-message-row]').filter({ hasText: `text of ${a}` })).toHaveCount(1);
+    hold = true;
+    await openChatByTitle(page, b);
+    await expect(page.locator('[data-chathead-conversation]')).toHaveText(b);
+    await expect(page.locator('[data-message-row]').filter({ hasText: `text of ${a}` })).toHaveCount(0);
+    release();
+    await expect(page.locator('[data-message-row]').filter({ hasText: `text of ${b}` })).toHaveCount(1);
+  });
+
+  test('a chat that fails to load says so and can be retried; it is not shown as empty', async ({ page }) => {
+    const title = `broken-${uid()}`;
+    const id = await seedChat(page, title, `text of ${title}`);
+    let failing = true;
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (failing && req.method === 'conversations.messages' && req.params?.conversation_id === id) return failJson(route, 500, 'disk read failed');
+      return route.continue();
+    });
+    await open(page, '/?ui=rusebot', { asAgent: false });
+    await openChatByTitle(page, title);
+    const failed = page.locator('[data-thread-error]');
+    await expect(failed).toContainText('could not be loaded');
+    await expect(failed).toContainText('disk read failed');
+    await expect(page.getByText('Send a message to start the conversation.')).toHaveCount(0);
+    failing = false;
+    await page.locator('[data-thread-retry]').click();
+    await expect(failed).toHaveCount(0);
+    await expect(page.locator('[data-message-row]').filter({ hasText: `text of ${title}` })).toHaveCount(1);
+  });
+
+  test('a failed agent send keeps the text in its own chat, offers Retry, and leaves no ghost draft in New chat', async ({ page }) => {
+    let failures = 1;
+    const started: string[] = [];
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (req.method === 'runs.start_turn') {
+        started.push(String(req.params?.prompt));
+        if (failures-- > 0) return failJson(route, 500, 'engine is down');
+      }
+      return route.continue();
+    });
+    await open(page);
+    const text = `retry-${uid()}`;
+    await send(page, text);
+    const alert = page.getByRole('alert').filter({ hasText: 'engine is down' });
+    await expect(alert).toBeVisible();
+    await expect(page.getByRole('textbox', { name: `Message ${agentName}` })).toHaveValue(text);
+    // The failed first message created the chat; a fresh "New chat" must not still hold the text.
+    await openDrawerIfNarrow(page);
+    await page.locator('[data-sidebar-new]').click();
+    await page.locator('[data-new-chat]').click();
+    await expect(page.getByRole('textbox', { name: `Message ${agentName}` })).toHaveValue('');
+    await openChatByTitle(page, text);
+    await expect(page.getByRole('textbox', { name: `Message ${agentName}` })).toHaveValue(text);
+    await page.getByRole('alert').filter({ hasText: 'engine is down' }).getByRole('button', { name: 'Retry' }).click();
+    await expect(page.locator('[data-chat-bubble]').filter({ hasText: MOCK_REPLY })).toBeVisible({ timeout: 20000 });
+    expect(started).toHaveLength(2);
+    expect(started[1]).toContain(text);
+  });
+
+  test('Loqman: Stop is disabled while he answers, a failed answer is a failed run with Retry, and the retry works', async ({ page }) => {
+    await open(page, '/?ui=rusebot', { asAgent: false });
+    let asks = 0;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (req.method === 'ceo.ask') {
+        asks++;
+        if (asks === 1) {
+          await gate;
+          return failJson(route, 502, 'CEO ask failed.');
+        }
+        return route.continue(); // the retry reaches the real (mock-mode) worker, which stores the exchange
+      }
+      return route.continue();
+    });
+    const text = `ceo-${uid()}`;
+    const box = page.getByRole('textbox', { name: 'Message Loqman' });
+    await box.fill(text);
+    await box.press('Enter');
+    const stop = page.getByRole('button', { name: 'Stop', exact: true });
+    await expect(stop).toBeVisible();
+    await expect(stop).toBeDisabled();
+    await expect(stop).toHaveAttribute('title', /cannot be stopped/);
+    release();
+    const alert = page.getByRole('alert').filter({ hasText: 'CEO ask failed.' });
+    await expect(alert).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stop', exact: true })).toHaveCount(0); // the run ended: Send is back
+    await alert.getByRole('button', { name: 'Retry' }).click();
+    await expect(page.locator('[data-message-row]')).toHaveCount(2, { timeout: 20000 }); // the question and Loqman's answer
+    await expect(page.locator('[data-message-row]').filter({ hasText: text })).toHaveCount(1);
+    await expect(page.getByRole('alert').filter({ hasText: 'CEO ask failed.' })).toHaveCount(0);
+    expect(asks).toBe(2);
+  });
+});
+
+test.describe('review fixes: missions and load errors', () => {
+  const mission = (id: string, status: string) => ({ id, title: `Mission ${id}`, objective: 'x', status, tasks: [] });
+
+  test('a running mission older than the eight newest stays visible, and the rest sit behind Show older', async ({ page }) => {
+    const list = Array.from({ length: 12 }, (_, i) => mission(`m${i}`, i === 9 ? 'running' : 'succeeded'));
+    await page.route('**/__agentos/call', async (route: Route) => {
+      if (reqOf(route).method === 'missions.list') return okJson(route, { missions: list });
+      return route.continue();
+    });
+    await openBare(page);
+    await openDrawerIfNarrow(page);
+    await page.locator('[data-sidebar-nav=team]').click();
+    await expect(page.locator('[data-mission]')).toHaveCount(9); // 8 newest + the running one (m9)
+    await expect(page.locator('[data-mission=m9]')).toBeVisible();
+    await expect(page.locator('[data-mission=m10]')).toHaveCount(0);
+    const older = page.locator('[data-missions-older]');
+    await expect(older).toHaveText('Show 3 older missions');
+    await older.click();
+    await expect(page.locator('[data-mission]')).toHaveCount(12);
+    await expect(older).toHaveText('Show fewer');
+  });
+
+  test('when the team or missions cannot be refreshed the last data stays on screen and an error with Retry is shown', async ({ page }) => {
+    let failing = false;
+    await page.route('**/__agentos/call', async (route: Route) => {
+      const req = reqOf(route);
+      if (req.method === 'missions.list') return failing ? failJson(route, 500, 'missions store is locked') : okJson(route, { missions: [mission('keep-1', 'succeeded')] });
+      if (failing && req.method === 'profiles.list') return failJson(route, 500, 'profiles store is locked');
+      return route.continue();
+    });
+    await openBare(page);
+    await openDrawerIfNarrow(page);
+    await page.locator('[data-sidebar-nav=team]').click();
+    await expect(page.locator('[data-mission=keep-1]')).toBeVisible();
+    await expect(page.locator('[data-agent-card]').first()).toBeVisible();
+    failing = true;
+    await openDrawerIfNarrow(page);
+    await page.locator('[data-sidebar-nav=contracts]').click(); // a view change reads everything again
+    const banner = page.locator('[data-load-error]');
+    await expect(banner).toContainText('Could not refresh');
+    await expect(banner).toContainText('locked');
+    await expect(page.locator('[data-mission=keep-1]')).toBeVisible(); // last list kept, not emptied
+    await expect(page.locator('[data-contract-row]').first()).toBeVisible(); // last agents kept
+    failing = false;
+    await banner.locator('[data-load-retry]').click();
+    await expect(banner).toHaveCount(0);
+    await expect(page.locator('[data-mission=keep-1]')).toBeVisible();
   });
 });

@@ -33,8 +33,8 @@ npm run desktop
 # Backend
 backend\.venv\Scripts\pytest.exe backend\tests -v
 
-# Node: Electron transport, worker client, dev bridge
-node --test frontend/electron/transport.test.cjs frontend/electron/worker-client.test.cjs frontend/electron/bridge.test.cjs
+# Node: all Electron-layer tests
+node --test "frontend/electron/*.test.cjs"
 
 # Frontend
 cd frontend

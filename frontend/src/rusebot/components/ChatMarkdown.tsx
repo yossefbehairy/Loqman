@@ -306,7 +306,7 @@ const MARKDOWN_COMPONENTS: Components = {
     );
   },
   th({ children }: { children?: ReactNode }) {
-    return <th className="border-b border-hairline/40 px-2 py-1.5 text-start font-semibold">{children}</th>;
+    return <th className="border-b border-hairline/40 bg-ink/[0.04] px-2 py-1.5 text-start font-semibold">{children}</th>;
   },
   td({ children }: { children?: ReactNode }) {
     return <td className="border-b border-hairline/20 px-2 py-1.5 align-top">{children}</td>;
@@ -330,21 +330,21 @@ const MARKDOWN_COMPONENTS: Components = {
   },
   h1({ node, children }: BlockProps) {
     return (
-      <div dir={blockDirection(node)} className="mt-2 text-[16px] font-semibold">
+      <div dir={blockDirection(node)} role="heading" aria-level={1} className="md-heading mt-3 text-[17px] font-bold">
         {children}
       </div>
     );
   },
   h2({ node, children }: BlockProps) {
     return (
-      <div dir={blockDirection(node)} className="mt-2 text-[15.5px] font-semibold">
+      <div dir={blockDirection(node)} role="heading" aria-level={2} className="md-heading mt-3 text-[16px] font-bold">
         {children}
       </div>
     );
   },
   h3({ node, children }: BlockProps) {
     return (
-      <div dir={blockDirection(node)} className="mt-1.5 font-semibold">
+      <div dir={blockDirection(node)} role="heading" aria-level={3} className="md-heading mt-2 font-semibold">
         {children}
       </div>
     );

@@ -35,12 +35,12 @@ Live checks with real CLIs and accounts are run by hand and are not part of CI.
 
 ### Tier 3: Playwright End-to-End UI Tests
 - **Scope**: the React UI in Chromium, driven through the Vite dev bridge against the mock runtime.
-- **Execution Target**: `frontend/e2e/rusebot_ui.spec.ts` (one spec file, 59 tests).
+- **Execution Target**: `frontend/e2e/rusebot_ui.spec.ts` (one spec file, 89 tests).
 - **Guarantees**: layout and navigation, chat send and stop, conversation isolation, approvals and deliverables, the team map and delegation, agent creation, the AI providers page, and UTC timestamps.
 
 ### Tier 4: Node Tests for the Electron Layer
-- **Scope**: the stream lifecycle in the renderer transport, the worker client that spawns and talks to the Python worker, and the dev bridge's origin and content-type checks.
-- **Execution Target**: `node --test` on `frontend/electron/transport.test.cjs`, `frontend/electron/worker-client.test.cjs` and `frontend/electron/bridge.test.cjs`.
+- **Scope**: the Electron layer: main-process IPC allow-list and lifecycle, the stream lifecycle in the renderer transport, the worker client that spawns and talks to the Python worker, the preload bridge, navigation and session security, backup saving, the launcher, and the dev bridge's origin and content-type checks.
+- **Execution Target**: `node --test "frontend/electron/*.test.cjs"` (all nine test files).
 
 ### Tier 5: Static Gates
 - **Scope**: TypeScript project build, lint, production build, and secret scanning.
@@ -52,9 +52,9 @@ Live checks with real CLIs and accounts are run by hand and are not part of CI.
 
 | Area | Location | Runner | Count (static, at time of writing) |
 |------|----------|--------|------------------------------------|
-| Worker | `backend/tests/`, `backend/tests/pw/` | pytest | 304 test functions in 34 files |
-| Electron layer | `frontend/electron/*.test.cjs` | `node --test` | 11 tests in 3 files |
-| UI end to end | `frontend/e2e/rusebot_ui.spec.ts` | Playwright | 59 tests in 13 `describe` groups |
+| Worker | `backend/tests/`, `backend/tests/pw/` | pytest | 586 pytest cases (2 skipped) |
+| Electron layer | `frontend/electron/*.test.cjs` | `node --test` | 44 tests in 9 files |
+| UI end to end | `frontend/e2e/rusebot_ui.spec.ts` | Playwright | 89 tests |
 
 ### E2E coverage by group
 - **Layout**: wide, narrow and mid-size windows; sidebar as a drawer or icon rail; appearance settings (theme, font, chat width) persist.
@@ -98,7 +98,7 @@ The scenarios that matter most to users are the groups listed in section 3. Each
 |--------|--------|----------------------|
 | **Playwright pass rate** | 100% (0 failures, 0 skipped) | `npx playwright test` in CI (`e2e` job) |
 | **Pytest pass rate** | 100%; skips must be explained | `python -m pytest backend/tests -q` in CI (`backend` job) |
-| **Node tests** | 100% | `node --test` on the three `frontend/electron` files (`backend` and `frontend` jobs) |
+| **Node tests** | 100% | `node --test "frontend/electron/*.test.cjs"` (`frontend` job; the worker client test also runs in the `backend` job) |
 | **TypeScript typecheck** | 0 errors | `npx tsc -b` (`frontend` job) |
 | **Linter** | 0 errors (warnings are reported, not blocking) | `npm run lint` (`oxlint`) |
 | **Flakiness** | 0 flaky tests | Deterministic mock runtime and explicit Playwright waits |
