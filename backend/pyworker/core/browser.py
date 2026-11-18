@@ -124,6 +124,7 @@ class BrowserSession:
     def __init__(self):
         self.process = None
         self.profile = None
+        self._log = None
         self.cdp = None
         self.human_control = False
 
@@ -137,22 +138,24 @@ class BrowserSession:
         if not executable:
             raise BrowserError("Install Chromium, Chrome or Edge to enable browser tools.")
         self.profile = tempfile.TemporaryDirectory(prefix="agentos-browser-")
+        self._log = Path(self.profile.name + ".log")
         kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
-        self.process = await asyncio.create_subprocess_exec(
-            executable, "--headless=new", "--no-first-run", "--no-default-browser-check",
-            # CDP currently uses WebSockets, so local processes can still connect.
-            "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", f"--user-data-dir={self.profile.name}", "about:blank",
-            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL, **kwargs)
+        with self._log.open("wb") as log:
+            self.process = await asyncio.create_subprocess_exec(
+                executable, "--headless=new", "--no-first-run", "--no-default-browser-check",
+                # CDP currently uses WebSockets, so local processes can still connect.
+                "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", f"--user-data-dir={self.profile.name}", "about:blank",
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+                stderr=log, **kwargs)
         active_port = Path(self.profile.name) / "DevToolsActivePort"
         for _ in range(100):
             if active_port.exists():
                 break
             if self.process.returncode is not None:
-                raise BrowserError("Chromium failed to start.")
+                raise BrowserError("Chromium failed to start. " + self._log_tail())
             await asyncio.sleep(.1)
         if not active_port.exists():
-            raise BrowserError("Chromium debugging endpoint did not become ready.")
+            raise BrowserError("Chromium debugging endpoint did not become ready. " + self._log_tail())
         port = int(active_port.read_text().splitlines()[0])
 
         def targets():
@@ -166,6 +169,12 @@ class BrowserSession:
         self.cdp = Cdp()
         await self.cdp.connect(page["webSocketDebuggerUrl"])
         await self.cdp.call("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+
+    def _log_tail(self):
+        try:
+            return self._log.read_text("utf-8", "replace")[-1500:]
+        except OSError:
+            return ""
 
     async def evaluate(self, expression):
         result = await self.cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
@@ -267,3 +276,5 @@ class BrowserSession:
             await self.process.wait()
         if self.profile is not None:
             self.profile.cleanup()
+        if self._log is not None:
+            self._log.unlink(missing_ok=True)
