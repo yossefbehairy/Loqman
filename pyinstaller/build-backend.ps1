@@ -3,7 +3,7 @@
     Builds the AgentOS Python worker (stdlib-only backend) into a single-file Windows executable.
 
 .DESCRIPTION
-    Idempotent build: clears previous outputs, runs PyInstaller (ONEFILE spec)
+    Runs PyInstaller (ONEFILE spec)
     from the repo root with the backend venv interpreter, then copies the exe
     to frontend\build-resources\ (where the Electron packaging step picks it up).
 
@@ -26,13 +26,7 @@ $DestExe   = Join-Path $Resources "agentos-backend.exe"
 if (-not (Test-Path $VenvPy))   { throw "venv python not found: $VenvPy" }
 if (-not (Test-Path $SpecFile)) { throw "spec file not found: $SpecFile" }
 
-# --- Clean previous outputs (idempotent rebuilds) ----------------------------
-foreach ($dir in @($DistDir, $BuildDir)) {
-    if (Test-Path $dir) {
-        Write-Host "Cleaning $dir ..."
-        Remove-Item -Recurse -Force $dir
-    }
-}
+# Do not recursively delete output directories: they may contain user data.
 New-Item -ItemType Directory -Path $Resources -Force | Out-Null
 
 # --- Build (from repo root; absolute --distpath/--workpath) ------------------

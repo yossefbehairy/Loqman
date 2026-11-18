@@ -24,8 +24,9 @@ class WorkerError extends Error {
  * `ready` resolves with the worker's ready message, or rejects on fatal/exit.
  */
 class WorkerClient extends EventEmitter {
-  constructor() {
+  constructor({ spawnChild = spawn } = {}) {
     super();
+    this.spawnChild = spawnChild;
     this.child = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -38,12 +39,24 @@ class WorkerClient extends EventEmitter {
   start({ command, args, options }) {
     this.exited = false;
     this.readyInfo = null;
-    this.child = spawn(command, args, { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
     let settle;
     this.ready = new Promise((resolve, reject) => {
       settle = { resolve, reject };
     });
     this.ready.catch(() => {}); // callers handle it; avoid an unhandled rejection
+    const fail = (err) => {
+      this.exited = true;
+      settle.reject(err);
+      this._failAll(err);
+    };
+    try {
+      this.child = this.spawnChild(command, args, { ...options, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      fail(error);
+      return this.ready;
+    }
+    // Writable streams emit errors in addition to invoking write callbacks.
+    this.child.stdin.on('error', (err) => this._failAll(err));
 
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', (chunk) => {
@@ -65,8 +78,7 @@ class WorkerClient extends EventEmitter {
     });
     this.child.once('error', (err) => {
       this.emit('log', `failed to spawn worker: ${err.message}`);
-      settle.reject(err);
-      this._failAll(err);
+      fail(err);
     });
     this.child.once('exit', (code, signal) => {
       this.exited = true;
@@ -139,19 +151,30 @@ class WorkerClient extends EventEmitter {
       return Promise.reject(new Error('Backend is not running'));
     }
     const id = this.nextId++;
+    let line;
+    try {
+      line = JSON.stringify({ id, method, params }) + '\n';
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Backend request timed out: ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer, onResult });
-      this.child.stdin.write(JSON.stringify({ id, method, params }) + '\n', (err) => {
+      const onWrite = (err) => {
         if (err) {
           this.pending.delete(id);
           clearTimeout(timer);
           reject(err);
         }
-      });
+      };
+      try {
+        this.child.stdin.write(line, onWrite);
+      } catch (error) {
+        onWrite(error);
+      }
     });
   }
 
@@ -159,24 +182,36 @@ class WorkerClient extends EventEmitter {
   async stop(graceMs = 6000) {
     const child = this.child;
     if (!child || this.exited) return;
-    const done = new Promise((resolve) => child.once('exit', resolve));
+    let onExit;
+    const done = new Promise((resolve) => {
+      onExit = resolve;
+      child.once('exit', onExit);
+    });
     try {
       this.request('shutdown', {}, 3000).catch(() => {});
       child.stdin.end();
     } catch {
       /* already closed */
     }
-    const timer = setTimeout(() => this.kill(), graceMs);
-    await done;
-    clearTimeout(timer);
+    let timer;
+    try {
+      await Promise.race([done, new Promise((resolve) => {
+        timer = setTimeout(() => { this.kill(); resolve(); }, graceMs);
+      })]);
+    } finally {
+      clearTimeout(timer);
+      child.removeListener('exit', onExit);
+    }
   }
 
   kill() {
+    this._failAll(new Error('Backend stopped'));
     const child = this.child;
     if (!child || this.exited) return;
     if (process.platform === 'win32' && child.pid) {
       try {
-        spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
+        spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true })
+          .on('error', (error) => this.emit('log', `taskkill failed: ${error.message}`));
       } catch {
         /* fall through */
       }

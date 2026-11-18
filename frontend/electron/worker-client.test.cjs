@@ -3,6 +3,77 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { WorkerClient } = require('./worker-client.cjs');
+const { EventEmitter } = require('node:events');
+
+function fakeChild() {
+  const child = new EventEmitter();
+  for (const name of ['stdin', 'stdout', 'stderr']) {
+    child[name] = new EventEmitter();
+    child[name].setEncoding = () => {};
+  }
+  child.stdin.writable = true;
+  child.stdin.write = (_line, callback) => callback();
+  child.stdin.end = () => {};
+  child.kill = () => {};
+  return child;
+}
+
+test('spawn failures reject readiness, mark exited, and cannot stall stop', async () => {
+  for (const synchronous of [false, true]) {
+    const child = fakeChild();
+    const client = new WorkerClient({ spawnChild() {
+      if (synchronous) throw new Error('spawn failed');
+      return child;
+    } });
+    const ready = client.start({ command: 'fake', args: [] });
+    if (!synchronous) child.emit('error', new Error('spawn failed'));
+    await assert.rejects(ready, /spawn failed/);
+    assert.equal(client.exited, true);
+    await assert.rejects(client.request('health'), /not running/);
+    await client.stop(5);
+  }
+});
+
+test('crash rejects every pending request', async () => {
+  const child = fakeChild();
+  const client = new WorkerClient({ spawnChild: () => child });
+  client.start({ command: 'fake', args: [] });
+  const pending = [client.request('health'), client.request('settings.get')];
+  child.emit('exit', 1, null);
+  for (const request of pending) await assert.rejects(request, /Worker exited/);
+  assert.equal(client.pending.size, 0);
+});
+
+test('stdin errors reject requests without an unhandled error event', async () => {
+  const child = fakeChild();
+  const client = new WorkerClient({ spawnChild: () => child });
+  client.start({ command: 'fake', args: [] });
+  const request = client.request('health');
+  child.stdin.emit('error', new Error('EPIPE'));
+  await assert.rejects(request, /EPIPE/);
+  assert.equal(client.pending.size, 0);
+});
+
+test('quit with in-flight requests is bounded even when kill emits no exit', async () => {
+  const child = fakeChild();
+  const client = new WorkerClient({ spawnChild: () => child });
+  client.start({ command: 'fake', args: [] });
+  const rejected = assert.rejects(client.request('health'), /Backend stopped/);
+  await client.stop(5);
+  await rejected;
+  assert.equal(client.pending.size, 0);
+});
+
+test('serialization and synchronous write failures leave no pending request', async () => {
+  const child = fakeChild();
+  const client = new WorkerClient({ spawnChild: () => child });
+  client.start({ command: 'fake', args: [] });
+  const params = {}; params.self = params;
+  await assert.rejects(client.request('health', params), /circular/i);
+  child.stdin.write = () => { throw new Error('write failed'); };
+  await assert.rejects(client.request('health'), /write failed/);
+  assert.equal(client.pending.size, 0);
+});
 
 test('registers the owner before events and stream_end in the same chunk', async () => {
   const client = new WorkerClient();

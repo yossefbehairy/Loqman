@@ -34,3 +34,10 @@ def make_app(tmp_path, monkeypatch):
 @pytest.fixture
 def api(make_app):
     return Api(make_app())
+
+
+@pytest.fixture(autouse=True)
+def _legacy_claude_routing(monkeypatch):
+    """Tests stub runtimes under the engine id 'claude-code'; the stream driver is the product
+    default, so route them through the wrapper unless a test sets the flag itself."""
+    monkeypatch.setenv("AGENTOS_CLAUDE_DRIVER", "wrapper")

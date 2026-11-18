@@ -3,15 +3,17 @@
  * src/components/TeamMapPage.tsx and TeamCanvas.tsx (Apache-2.0, Copyright
  * 2026 Milind Soni and OpenMausBot contributors): page header, dotted canvas,
  * department sections and 236x126 bot cards. The canvas is static (no pan,
- * zoom or drag-to-arrange). Structure comes from the classic AgentOS company
- * storage; profiles, missions and delegation use the AgentOS worker.
+ * zoom or drag-to-arrange). Structure comes from the classic Loqman company
+ * storage; profiles, missions and delegation use the Loqman worker.
  */
-import { useMemo, useState } from 'react';
-import { FileText, MessageCircle, Send, Trash2, UserPlus, UsersRound, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronDown, FileText, MessageCircle, Send, Trash2, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { Agent, Team } from '../../types/agentos';
-import { CEO_PROFILE_ID, createMission, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
+import type { Agent, Team } from '../types';
+import { CEO_PROFILE_ID, cancelMission, isMissionTerminal, delegateToAgent, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
+import { useProviders } from '../state/useProviders';
+import { effectiveModel } from '../state/effectiveModel';
 
 const DOTS = {
   backgroundImage: 'radial-gradient(circle, color-mix(in srgb, var(--color-ink) 14%, transparent) 1px, transparent 1px)',
@@ -34,11 +36,169 @@ function PageHeader({ icon, title, count, subtitle, action }: { icon: React.Reac
   );
 }
 
+const MISSION_POLL_MS = 3000;
+const MISSIONS_SHOWN = 8;
+
+/** A stored output or summary is plain text, a `{ result }` object, or some other JSON. */
+function resultText(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && typeof (value as { result?: unknown }).result === 'string') return (value as { result: string }).result;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function MissionRow({
+  mission,
+  open,
+  onToggle,
+  onCancelled,
+}: {
+  mission: Mission;
+  open: boolean;
+  onToggle: () => void;
+  /** Resolves when the mission list has been read again. */
+  onCancelled: () => Promise<void>;
+}) {
+  const summary = resultText(mission.final_summary);
+  const failure = typeof mission.error_summary === 'string' ? mission.error_summary : '';
+  const tasks = mission.tasks ?? [];
+  const active = !isMissionTerminal(mission.status);
+  const [confirming, setConfirming] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const cancel = async () => {
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await cancelMission(mission.id);
+      await onCancelled();
+      if (alive.current) setConfirming(false);
+    } catch (e) {
+      if (alive.current) setCancelError(messageOf(e));
+    } finally {
+      if (alive.current) setCancelling(false);
+    }
+  };
+
+  return (
+    <li data-mission={mission.id} className="rounded-lg border border-hairline/40 bg-card text-[12.5px]">
+      <div className="flex items-center">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 items-center gap-3 rounded-lg px-3 py-2 text-left hover:bg-raised focus-visible:outline-2 focus-visible:outline-accent"
+        >
+          <ChevronDown size={14} className={cn('shrink-0 text-ink-secondary transition-transform', !open && '-rotate-90')} />
+          <span dir="auto" className="min-w-0 flex-1 truncate">
+            {mission.title}
+          </span>
+          <span className="shrink-0 text-ink-secondary">{tasks.length} tasks</span>
+          <span className="shrink-0 rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-secondary">{mission.status}</span>
+        </button>
+        {active && !confirming && (
+          <button
+            type="button"
+            data-mission-cancel={mission.id}
+            aria-label={`Cancel mission ${mission.title}`}
+            onClick={() => setConfirming(true)}
+            className="ui-button ui-button-sm mr-2 shrink-0"
+          >
+            Cancel
+          </button>
+        )}
+      </div>
+      {active && confirming && (
+        <div data-mission-confirm className="flex flex-wrap items-center gap-2 border-t border-hairline/30 px-3 py-2">
+          <span className="min-w-0 flex-1 text-ink-secondary">Stop this mission? Work already done is kept.</span>
+          <button type="button" disabled={cancelling} onClick={() => void cancel()} className="ui-button ui-button-sm text-danger">
+            {cancelling ? 'Cancelling…' : 'Yes, cancel mission'}
+          </button>
+          <button
+            type="button"
+            disabled={cancelling}
+            onClick={() => {
+              setConfirming(false);
+              setCancelError(null);
+            }}
+            className="ui-button ui-button-sm"
+          >
+            Keep running
+          </button>
+        </div>
+      )}
+      {cancelError && (
+        <p role="alert" dir="auto" className="break-words border-t border-hairline/30 px-3 py-2 text-danger">
+          Could not cancel. {cancelError}
+        </p>
+      )}
+      {open && (
+        <div data-mission-detail className="flex flex-col gap-2 border-t border-hairline/30 px-3 py-2.5">
+          {summary && (
+            <div>
+              <div className="text-[11px] font-semibold text-ink-secondary">Summary</div>
+              <p dir="auto" className="mt-1 whitespace-pre-wrap break-words text-ink">
+                {summary}
+              </p>
+            </div>
+          )}
+          {failure && (
+            <p role="alert" dir="auto" className="whitespace-pre-wrap break-words text-danger">
+              {failure}
+            </p>
+          )}
+          {tasks.map((t) => {
+            const out = resultText(t.output);
+            const err = typeof t.error_message === 'string' ? t.error_message : '';
+            return (
+              <div key={t.id} data-mission-task={t.id} className="rounded-md bg-inset px-2.5 py-2">
+                <div className="flex items-center gap-2">
+                  <span dir="auto" className="min-w-0 flex-1 truncate font-medium">
+                    {t.title ?? 'Task'}
+                  </span>
+                  <span className="shrink-0 text-[11px] text-ink-secondary">{t.status}</span>
+                </div>
+                {out && (
+                  <pre dir="auto" className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-[12px] text-ink">
+                    {out}
+                  </pre>
+                )}
+                {err && (
+                  <p dir="auto" className="mt-1 whitespace-pre-wrap break-words text-danger">
+                    {err}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+          {!summary && !failure && tasks.length === 0 && <p className="text-ink-secondary">Nothing to show yet.</p>}
+          {!summary && !failure && tasks.length > 0 && !isMissionTerminal(mission.status) && (
+            <p className="text-ink-secondary">Still working. This updates by itself.</p>
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
 function initials(name: string): string {
   return name.trim().charAt(0).toUpperCase() || '?';
 }
 
-function AgentCard({ agent, selected, onOpen, onChat }: { agent: Agent; selected: boolean; onOpen: () => void; onChat: () => void }) {
+function AgentCard({ agent, profile, selected, onOpen, onChat }: { agent: Agent; profile: Profile | null; selected: boolean; onOpen: () => void; onChat: () => void }) {
+  const eff = effectiveModel(useProviders(), profile?.engine, agent.model);
   return (
     <article
       data-agent-card={agent.id}
@@ -79,8 +239,9 @@ function AgentCard({ agent, selected, onOpen, onChat }: { agent: Agent; selected
         >
           <MessageCircle size={15} />
         </button>
-        <span title={`Default model: ${agent.model}`} className="ml-auto flex h-8 min-w-0 max-w-[130px] items-center rounded-md px-2 text-[10px] text-ink-secondary">
-          <span className="truncate">{agent.model}</span>
+        <span
+          title={eff.inherited ? `Uses the default model chosen in Settings${eff.saved ? ` (saved model "${eff.saved}" is not offered by this provider)` : ''}` : `Model: ${eff.label}`} className="ml-auto flex h-8 min-w-0 max-w-[130px] items-center rounded-md px-2 text-[10px] text-ink-secondary">
+          <span className="truncate">{eff.label}</span>
         </span>
       </div>
     </article>
@@ -92,16 +253,15 @@ export function AgentPanel({
   profile,
   onClose,
   onChat,
-  defaultModel,
   onChanged,
 }: {
   agent: Agent;
   profile: Profile | null;
   onClose: () => void;
   onChat: () => void;
-  defaultModel: string;
   onChanged: () => void;
 }) {
+  const drawerModel = effectiveModel(useProviders(), profile?.engine, profile?.default_model_id ?? agent.model);
   const [task, setTask] = useState('');
   const [instructions, setInstructions] = useState(profile?.instructions ?? '');
   const [note, setNote] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
@@ -112,7 +272,9 @@ export function AgentPanel({
     setBusy(true);
     setNote(null);
     try {
-      const mission = await createMission(task.trim(), task.trim().slice(0, 80), [profile?.role_type ?? agent.role], defaultModel || undefined);
+      if (!profile) throw new Error('This agent has no profile to run the work under.');
+      // The worker resolves the engine and model: the agent's own engine, else the default chosen in Settings.
+      const mission = await delegateToAgent(profile, task.trim());
       setNote({ kind: 'ok', text: `Delegated. Mission ${mission.status}.` });
       setTask('');
       onChanged();
@@ -178,7 +340,12 @@ export function AgentPanel({
         <dt className="text-ink-secondary">Status</dt>
         <dd>{agent.status}</dd>
         <dt className="text-ink-secondary">Model</dt>
-        <dd className="break-all">{profile?.default_model_id ?? agent.model}</dd>
+        <dd className="break-all">
+          {drawerModel.label}
+          <span data-model-note className="mt-0.5 block text-[11px] text-ink-secondary">
+            Used for delegated tasks. A chat runs on the provider and model picked in the chat&apos;s + menu.
+          </span>
+        </dd>
         <dt className="text-ink-secondary">Effort</dt>
         <dd>{agent.reason}</dd>
         <dt className="text-ink-secondary">Timeout</dt>
@@ -260,9 +427,11 @@ export interface TeamViewProps {
   agents: Agent[];
   profiles: Profile[];
   missions: Mission[];
-  defaultModel: string;
   onOpenChat: (agent: Agent) => void;
   onChanged: () => void;
+  /** Re-read only the mission list (cheap); used while missions are active. */
+  /** Resolves when the request has settled; polling waits for it before scheduling the next one. */
+  onPollMissions: () => Promise<void>;
   onPanelChange: (open: boolean) => void;
   onNewAgent: () => void;
 }
@@ -286,6 +455,28 @@ export function TeamView(props: TeamViewProps) {
   }, [agents, teams]);
 
   const contracts = props.mode === 'contracts';
+  const [openMission, setOpenMission] = useState<string | null>(null);
+  const [allMissions, setAllMissions] = useState(false);
+  // The eight newest missions, plus every one still running however old it is; the rest wait behind "Show older".
+  const shownMissions = missions.filter((m, i) => allMissions || i < MISSIONS_SHOWN || !isMissionTerminal(m.status));
+  const hiddenMissions = missions.length - shownMissions.length;
+  const anyActive = missions.some((m) => !isMissionTerminal(m.status));
+  const { onPollMissions } = props;
+  useEffect(() => {
+    if (!anyActive) return;
+    let alive = true;
+    let timer: number | undefined;
+    // The next poll is scheduled only after the previous one settles, so slow requests never overlap.
+    const tick = async () => {
+      if (document.visibilityState === 'visible') await onPollMissions().catch(() => undefined);
+      if (alive) timer = window.setTimeout(() => void tick(), MISSION_POLL_MS);
+    };
+    timer = window.setTimeout(() => void tick(), MISSION_POLL_MS);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [anyActive, onPollMissions]);
 
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app" data-view={props.mode}>
@@ -350,7 +541,7 @@ export function TeamView(props: TeamViewProps) {
                   </header>
                   <div className="flex flex-col gap-4 px-5 pb-5">
                     {g.members.map((a) => (
-                      <AgentCard key={a.id} agent={a} selected={selected === a.id} onOpen={() => setSelected(a.id)} onChat={() => props.onOpenChat(a)} />
+                      <AgentCard key={a.id} agent={a} profile={profiles.find((p) => p.id === a.profileId) ?? null} selected={selected === a.id} onOpen={() => setSelected(a.id)} onChat={() => props.onOpenChat(a)} />
                     ))}
                     {g.members.length === 0 && <p className="w-[236px] text-[12px] text-ink-secondary">No members yet.</p>}
                   </div>
@@ -362,16 +553,21 @@ export function TeamView(props: TeamViewProps) {
             <section aria-label="Delegated missions" className="mx-auto max-w-3xl px-6 pb-8">
               <h2 className="mb-2 text-[13px] font-semibold">Delegated missions</h2>
               <ul className="flex flex-col gap-1.5">
-                {missions.slice(0, 8).map((m) => (
-                  <li key={m.id} data-mission={m.id} className="flex items-center gap-3 rounded-lg border border-hairline/40 bg-card px-3 py-2 text-[12.5px]">
-                    <span dir="auto" className="min-w-0 flex-1 truncate">
-                      {m.title}
-                    </span>
-                    <span className="shrink-0 text-ink-secondary">{m.tasks?.length ?? 0} tasks</span>
-                    <span className="shrink-0 rounded-full bg-raised px-2 py-0.5 text-[11px] text-ink-secondary">{m.status}</span>
-                  </li>
+                {shownMissions.map((m) => (
+                  <MissionRow
+                    key={m.id}
+                    mission={m}
+                    open={openMission === m.id}
+                    onToggle={() => setOpenMission(openMission === m.id ? null : m.id)}
+                    onCancelled={onPollMissions}
+                  />
                 ))}
               </ul>
+              {(hiddenMissions > 0 || (allMissions && missions.length > MISSIONS_SHOWN)) && (
+                <button type="button" data-missions-older onClick={() => setAllMissions((v) => !v)} className="ui-button ui-button-sm mt-2">
+                  {allMissions ? 'Show fewer' : `Show ${hiddenMissions} older ${hiddenMissions === 1 ? 'mission' : 'missions'}`}
+                </button>
+              )}
             </section>
           )}
         </div>
@@ -380,7 +576,6 @@ export function TeamView(props: TeamViewProps) {
             key={agent.id}
             agent={agent}
             profile={profile}
-            defaultModel={props.defaultModel}
             onClose={() => setSelected(null)}
             onChat={() => props.onOpenChat(agent)}
             onChanged={props.onChanged}

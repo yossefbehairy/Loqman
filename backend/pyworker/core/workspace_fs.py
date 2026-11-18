@@ -53,6 +53,9 @@ def canonical_workspace_dir(raw: str) -> str:
         raise WorkspaceFsError(422, "path is not a directory")
     if _norm(os.path.dirname(real)) == _norm(real):
         raise WorkspaceFsError(422, "filesystem roots cannot be registered as workspaces")
+    profile = os.environ.get("USERPROFILE")
+    if profile and _norm(real) == _norm(os.path.realpath(profile)):
+        raise WorkspaceFsError(422, "user profile cannot be registered as a workspace")
     return real
 
 
@@ -81,7 +84,7 @@ def resolve_in_workspace(workspace_path: str, rel: str) -> tuple[str, str]:
     """
     parts = _clean_relative(rel)
     try:
-        root = os.path.realpath(workspace_path, strict=True)
+        root = canonical_workspace_dir(workspace_path)
     except OSError:
         raise WorkspaceFsError(404, "workspace directory is no longer available")
     if _norm(root) != _norm(workspace_path):
@@ -148,6 +151,8 @@ def read_limited(real_path: str, workspace_path: str | None = None) -> bytes:
     try:
         with open(real_path, "rb") as fh:
             opened = os.fstat(fh.fileno())
+            if opened.st_nlink > 1:
+                raise WorkspaceFsError(403, "hard-linked files are not allowed")
             if not stat.S_ISREG(opened.st_mode):
                 raise WorkspaceFsError(422, "not a regular file")
             if _is_reparse(os.lstat(real_path)) or not os.path.samestat(opened, os.stat(real_path)):

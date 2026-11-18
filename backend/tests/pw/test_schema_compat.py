@@ -20,7 +20,7 @@ def test_fresh_database_has_every_table_and_version(tmp_path):
     db = fresh(tmp_path / "n.db")
     names = {r["name"] for r in db.all("SELECT name FROM sqlite_master WHERE type='table'")}
     assert set(TABLES) <= names
-    assert db.scalar("PRAGMA user_version") == SCHEMA_VERSION == 17
+    assert db.scalar("PRAGMA user_version") == SCHEMA_VERSION == 18
     assert db.scalar("PRAGMA foreign_keys") == 1
     assert db.scalar("PRAGMA journal_mode") == "wal"
     # the partial unique index that guarantees one active run per conversation

@@ -154,8 +154,28 @@ class ComputerSession:
                 self.user.GetCursorPos(ctypes.byref(actual))
                 if (actual.x, actual.y) != (point.x, point.y) or self.user.GetForegroundWindow() != self.handle:
                     raise ComputerError("Pointer or foreground window changed before the click.")
-                self.user.mouse_event(2, 0, 0, 0, 0)
-                self.user.mouse_event(4, 0, 0, 0, 0)
+                # Deliver to the checked window rather than the global input stream.
+                client = wintypes.POINT(point.x, point.y)
+                self.user.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+                if not self.user.ScreenToClient(target, ctypes.byref(client)):
+                    raise ComputerError("Could not map click to the selected window.")
+                client_rect = wintypes.RECT()
+                if (not self.user.GetClientRect(target, ctypes.byref(client_rect))
+                        or not (0 <= client.x < client_rect.right and 0 <= client.y < client_rect.bottom)
+                        or client.x > 32767 or client.y > 32767):
+                    raise ComputerError("Click point is outside the target client area.")
+                if self.user.GetForegroundWindow() != self.handle:
+                    raise ComputerError("Foreground window changed before the click.")
+                self.user.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                                         wintypes.LPARAM, wintypes.UINT, wintypes.UINT,
+                                                         ctypes.POINTER(ctypes.c_size_t)]
+                position = (client.x & 0xffff) | ((client.y & 0xffff) << 16)
+                sent = ctypes.c_size_t()
+                for message, buttons in ((0x201, 1), (0x202, 0)):
+                    if self.user.GetForegroundWindow() != self.handle:
+                        raise ComputerError("Foreground window changed during the click.")
+                    if not self.user.SendMessageTimeoutW(target, message, buttons, position, 2, 500, ctypes.byref(sent)):
+                        raise ComputerError("Selected application did not accept the click.")
             else:
                 text = args.get("text")
                 if not isinstance(text, str) or len(text) > 2000:

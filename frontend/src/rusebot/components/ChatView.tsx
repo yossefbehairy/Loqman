@@ -7,6 +7,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Copy, Cpu, X } from 'lucide-react';
+import { CEO_PROFILE_ID } from '../data/worker';
 import { cn } from '../lib/cn';
 import { useComposerDockPad } from '../lib/composer-dock';
 import { userBubbleStyle } from '../lib/user-bubble-tone';
@@ -16,9 +17,11 @@ import { Composer } from './Composer';
 import { ApprovalCard } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
 import { stripContract, type ChatState, type EngineState } from '../state/useChat';
-import type { Agent } from '../../types/agentos';
+import { hasLiveContent, type LiveTurn } from '../state/liveTurn';
+import type { Agent } from '../types';
 import { useKeepDecided } from '../state/useKeepDecided';
 import type { Conversation } from '../data/worker';
+import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
 
 const FALLBACK_NAME = 'Loqman';
@@ -64,12 +67,12 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
 }
 
 function clock(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
 function dayLabel(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   if (Number.isNaN(d.getTime())) return '';
   const when = clock(iso);
   return d.toDateString() === new Date().toDateString()
@@ -96,7 +99,7 @@ function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string;
             mine ? 'bg-bubble-user whitespace-pre-wrap text-ink user-bubble-colored antialiased' : 'bg-card text-ink'
           )}
           style={mine ? USER_BUBBLE_STYLE : undefined}
-          title={new Date(iso).toLocaleString()}
+          title={parseWorkerTime(iso).toLocaleString()}
         >
           {mine ? <div className="chat-text">{text}</div> : <ChatMarkdown text={text} />}
         </div>
@@ -118,6 +121,41 @@ function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string;
   );
 }
 
+/** The reply while it streams in: live text per item, tool steps as compact chips. The stored message replaces it when the turn ends. */
+function LiveReply({ turn }: { turn: LiveTurn }) {
+  const last = turn.items.length - 1;
+  return (
+    <div data-live-bubble="" data-stopped={turn.stopped ? 'true' : 'false'} className="flex w-full flex-col items-start">
+      <div className="w-fit max-w-[min(var(--chat-bubble-max),var(--chat-bubble-pct))] rounded-[23px] bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink">
+        {turn.items.map((item, i) => {
+          if (item.kind === 'tool') {
+            const state = item.status === 'running' ? 'running' : item.status === 'failed' ? 'failed' : 'done';
+            return (
+              <div key={item.id} data-live-tool="" data-status={state} className="my-1 flex items-center gap-1.5 text-[12.5px] text-ink-secondary">
+                <Cpu size={12} aria-hidden="true" />
+                <span className="font-medium">{item.title}</span>
+                <span>{state === 'running' ? 'running' : state === 'failed' ? 'failed' : 'done'}</span>
+              </div>
+            );
+          }
+          if (!item.streamed || !item.text) return null;
+          const commentary = item.done && item.phase === 'commentary';
+          return (
+            <div key={item.id} data-live-item="" data-phase={item.phase ?? 'streaming'} className={cn(commentary && 'text-ink-secondary opacity-70')}>
+              <ChatMarkdown text={item.text} live={!item.done && !turn.stopped && i <= last} />
+            </div>
+          );
+        })}
+        {turn.stopped && (
+          <div data-live-stopped="" className="mt-1 text-[12.5px] text-ink-tertiary">
+            Stopped
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function EmptyChat({ name, role, description }: { name: string; role?: string; description: string }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-3 py-24 text-center">
@@ -131,7 +169,7 @@ function EmptyChat({ name, role, description }: { name: string; role?: string; d
   );
 }
 
-export function ChatErrorBanner({ message, onDismiss }: { message: string | null; onDismiss: () => void }) {
+export function ChatErrorBanner({ message, onDismiss, onRetry }: { message: string | null; onDismiss: () => void; onRetry?: (() => void) | null }) {
   if (!message) return null;
   return (
     <div className="w-full px-5">
@@ -139,6 +177,11 @@ export function ChatErrorBanner({ message, onDismiss }: { message: string | null
         <div className="min-w-0 flex-1 break-words">
           <p dir="auto">{message}</p>
         </div>
+        {onRetry && (
+          <button type="button" data-chat-retry onClick={onRetry} className="shrink-0 rounded px-1.5 font-medium underline hover:bg-danger/10">
+            Retry
+          </button>
+        )}
         <button type="button" onClick={onDismiss} aria-label="Dismiss" title="Dismiss" className="shrink-0 rounded p-0.5 hover:bg-danger/10">
           <X size={13} />
         </button>
@@ -155,6 +198,8 @@ export function ChatView({
   agent,
   onOpenProfile,
   onNewAgent,
+  onManageProviders,
+  ready = true,
 }: {
   chat: ChatState;
   engines: EngineState;
@@ -163,19 +208,36 @@ export function ChatView({
   agent: Agent | null;
   onOpenProfile: () => void;
   onNewAgent: () => void;
+  onManageProviders?: () => void;
+  /** False until the conversation list and the agents are loaded, so the remembered chat is not shown as Loqman first. */
+  ready?: boolean;
 }) {
   const dockRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const dock = useComposerDockPad(dockRef);
-  const ASSISTANT_NAME = agent?.name ?? FALLBACK_NAME;
+  const ASSISTANT_NAME = ready ? (agent?.name ?? FALLBACK_NAME) : '';
   const running = Boolean(chat.run && (chat.run.status === 'queued' || chat.run.status === 'running'));
-  const title = conversation?.title ?? legacyThread?.title ?? 'New chat';
+  const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? 'New chat');
 
   const lastKey = `${chat.messages.length}:${chat.pendingUser ?? ''}:${running}:${legacyThread?.turns.length ?? 0}`;
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [lastKey, chat.selectedId]);
+
+  // A chat runs on the provider and model picked in the composer; the model saved on the agent is used for delegated tasks.
+  const choice = engines.choice;
+  const chatModel = choice ? (engines.models.find((m) => m.id === choice.model)?.name ?? choice.model) : '';
+  const savedModel = agent && agent.id !== CEO_PROFILE_ID ? agent.model : '';
+  const overridden = Boolean(choice && savedModel && savedModel !== choice.model);
+
+  const live = hasLiveContent(chat.live) ? chat.live : null;
+  const liveSize = live ? live.items.reduce((n, i) => n + i.text.length + 1, 0) : 0;
+  const stick = useRef(true);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [liveSize]);
 
   const runApprovals = useMemo(
     () => chat.approvals.filter((a) => chat.run && a.run_id === chat.run.runId),
@@ -185,7 +247,7 @@ export function ChatView({
 
   const rows = chat.messages.map((m, i) => {
     const prev = chat.messages[i - 1];
-    const showDay = !prev || new Date(prev.created_at).toDateString() !== new Date(m.created_at).toDateString();
+    const showDay = !prev || parseWorkerTime(prev.created_at).toDateString() !== parseWorkerTime(m.created_at).toDateString();
     const run = m.role === 'assistant' ? chat.runsBySeq[m.seq] : undefined;
     const drafts = run ? (chat.drafts[run.id] ?? []) : [];
     return (
@@ -244,7 +306,24 @@ export function ChatView({
                       className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent @max-4xl/chathead:px-1.5"
                     >
                       <Cpu size={11} aria-hidden="true" />
-                      <span className="@max-4xl/chathead:sr-only">{engines.choice.engine}</span>
+                      <span className="@max-4xl/chathead:sr-only">
+                        {engines.engines.find((e) => e.id === engines.choice?.engine)?.title ?? engines.choice.engine}
+                      </span>
+                    </span>
+                  )}
+                  {choice && (
+                    <span
+                      data-chathead-model
+                      data-model-override={overridden ? 'true' : 'false'}
+                      title={
+                        overridden
+                          ? `This chat runs on ${choice.model}, chosen in the + menu. ${ASSISTANT_NAME} is saved with ${savedModel}, which is used for delegated tasks.`
+                          : `This chat runs on ${choice.model}, chosen in the + menu.`
+                      }
+                      className="hidden min-w-0 max-w-[180px] items-center gap-1 truncate whitespace-nowrap text-[11px] text-ink-secondary @4xl/chathead:flex"
+                    >
+                      <span className="truncate">{chatModel}</span>
+                      {overridden && <span className="shrink-0 rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning">override</span>}
                     </span>
                   )}
                 </button>
@@ -260,7 +339,13 @@ export function ChatView({
           </div>
         </GlassBar>
 
-        <div ref={scrollRef} className="glass-scroller h-full overflow-x-hidden overflow-y-auto overscroll-y-contain px-5 [overflow-anchor:none]">
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+          }}
+          className="glass-scroller h-full overflow-x-hidden overflow-y-auto overscroll-y-contain px-5 [overflow-anchor:none]">
           <div
             className="glass-scroller-content chat-column relative flex w-full flex-col gap-3"
             style={{ paddingBottom: dock.pad }}
@@ -282,7 +367,17 @@ export function ChatView({
               ))
             ) : (
               <>
-                {chat.messages.length === 0 && !chat.pendingUser && !running && (
+                {chat.threadError && (
+                  <div role="alert" data-thread-error className="flex flex-col items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-3 text-[13px] text-danger">
+                    <p dir="auto" className="break-words">
+                      This chat could not be loaded, so its messages are not shown. {chat.threadError}
+                    </p>
+                    <button type="button" data-thread-retry onClick={chat.retryThread} className="ui-button ui-button-sm">
+                      Retry
+                    </button>
+                  </div>
+                )}
+                {ready && !chat.threadError && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
                   <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description="Send a message to start the conversation." />
                 )}
                 {rows}
@@ -299,10 +394,11 @@ export function ChatView({
                     onDecide={(decision) => decideApproval(a, () => chat.decide(a, decision))}
                   />
                 ))}
-                {running && (
+                {live && <LiveReply turn={live} />}
+                {running && !live && (
                   <div data-working className="flex items-center gap-2 px-1 text-[13px] text-ink-secondary" role="status">
                     <WorkingDots size={5} className="text-ink-tertiary" />
-                    <span>{chat.run?.status === 'queued' ? 'Queued' : 'Working'}</span>
+                    <span>{chat.run?.status === 'queued' ? 'Queued' : (chat.progress ?? 'Working')}</span>
                   </div>
                 )}
               </>
@@ -316,20 +412,23 @@ export function ChatView({
         <div ref={dockRef} className="pointer-events-none absolute inset-x-0 bottom-0 z-[2] chat-column-dock">
           <div className="pointer-events-none relative px-5 pb-3">
             <div className="pointer-events-auto">
-              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} />
+              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} onRetry={chat.retry} />
             </div>
             <div className="pointer-events-auto relative w-full">
               <div className="relative">
                 <Composer
-                  placeholder={`Message ${ASSISTANT_NAME}`}
+                  placeholder={ready ? `Message ${ASSISTANT_NAME}` : 'Loading…'}
                   value={chat.draft}
                   onChange={chat.setDraft}
                   onSend={chat.send}
                   onStop={chat.stop}
+                  canStop={chat.canStop}
+                  stopping={chat.stopping}
                   running={running}
-                  disabled={engines.loading}
+                  disabled={engines.loading || !ready}
                   engines={engines}
                   onNewAgent={onNewAgent}
+                  onManageProviders={onManageProviders}
                 />
               </div>
             </div>

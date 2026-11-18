@@ -1,5 +1,6 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import './fonts.css';
 import './styles.css';
 import { applySkin, readSkin } from './lib/skins';
 import { applyFont, readFont } from './lib/fonts';

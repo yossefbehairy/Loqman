@@ -10,6 +10,8 @@ import textwrap
 
 import pytest
 
+from backend.pyworker.runtime import child_env
+
 from backend.pyworker.runtime.base import ExecuteAgentTask
 from backend.pyworker.runtime import codex_runtime as cx
 from backend.pyworker.runtime.codex_runtime import CodexCliRuntime, RuntimeUnsupported
@@ -71,6 +73,8 @@ def fake(tmp_path, monkeypatch):
     script.write_text(FAKE, encoding="utf-8")
     log = tmp_path / "log.json"
     monkeypatch.setenv("FAKE_LOG", str(log))
+    # The child env is an allowlist (S2); let only the fake CLI's own control vars through.
+    monkeypatch.setattr(child_env, "_NAMES", child_env._NAMES | {"FAKE_LOG", "FAKE_MODE", "PYTHONUTF8"})
     monkeypatch.setenv("OPENAI_API_KEY", "sk-should-be-stripped")
 
     def make(mode="ok", **kw):
@@ -82,7 +86,7 @@ def fake(tmp_path, monkeypatch):
 
 
 def task(**kw):
-    base = dict(prompt="ping", model_id="m-a", session_title="t1", timeout=30)
+    base = dict(prompt="ping", model_id="m-a", provider_id="openai", session_title="t1", timeout=30)
     base.update(kw)
     return ExecuteAgentTask(**base)
 
@@ -224,7 +228,6 @@ def test_factory_selection_and_default(monkeypatch):
     monkeypatch.setattr(rtpkg, "_runtime_instance", None)
     monkeypatch.setattr(rtpkg.settings, "RUNTIME_MODE", "real")
     assert isinstance(rtpkg.get_runtime(), RealOpenCodeRuntime)   # default untouched
-    monkeypatch.setattr(rtpkg, "_runtime_instance", None)
-    monkeypatch.setattr(rtpkg.settings, "RUNTIME_MODE", "codex")
-    assert isinstance(rtpkg.get_runtime(), CodexCliRuntime)
+    monkeypatch.setattr(rtpkg, "_engine_instances", {})
+    assert isinstance(rtpkg.get_runtime("codex"), CodexCliRuntime)   # chosen by engine id, not by RUNTIME_MODE
     monkeypatch.setattr(rtpkg, "_runtime_instance", None)

@@ -1,25 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CEO_PROFILE_ID,
-  addMessage,
+  bindConversationProfile,
   askCeo,
+  ceoAskProgress,
+  type CeoProgress,
   cancelRun,
   createConversation,
   decideApproval,
   decideDraft,
   draftContent,
-  engineCapabilities,
-  engineModels,
-  engineStatuses,
   createDraft,
   followRun,
-  freeModels,
   getRun,
   importLegacyCeo,
   isTerminal,
   listApprovals,
   listConversations,
+  listAllDrafts,
   listDrafts,
+  listRuns,
   listMessages,
   startTurn,
   type Approval,
@@ -28,18 +28,52 @@ import {
   type Draft,
   type EngineCapabilities,
   type EngineModel,
+  type EngineStateId,
   type EngineStatus,
   type RunSnapshot,
 } from '../data/worker';
 import type { StreamHandle } from '../../api/transport';
+import { emptyLive, freezeLive, hasLiveContent, reduceLive, type LiveTurn } from './liveTurn';
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
-import type { Agent } from '../../types/agentos';
+import type { Agent } from '../types';
+import {
+  loadProviderModels,
+  selectProviderEngine,
+  setProviderChoice,
+  useProviders,
+  type EngineChoice,
+} from './useProviders';
 
 const KEY_DRAFTS = 'agentos.rusebot.drafts.v1';
 const KEY_RUNS = 'agentos.rusebot.runs.v1';
 const KEY_SELECTED = 'agentos.rusebot.selected.v1';
-const KEY_ENGINE = 'agentos.rusebot.engine.v1';
 const KEY_AGENTS = 'agentos.rusebot.convAgents.v1';
+
+/** ceo.ask refuses longer questions (backend/pyworker/api/ceo.py), so refuse them before anything is saved. */
+export const CEO_MAX_CHARS = 2000;
+
+/** The conversation the legacy import creates for old CEO exchanges; hidden while it has nothing in it. */
+const CEO_HISTORY_ID = 'legacy-ceo-history';
+const CEO_PROGRESS_MS = 1500;
+
+/** One short line for the pending reply area, from what ceo.ask_progress reports. */
+export function progressText(p: CeoProgress): string | null {
+  const step = p.iteration > 1 ? ` (step ${p.iteration})` : '';
+  switch (p.stage) {
+    case 'starting':
+      return 'Starting';
+    case 'fast':
+      return 'Answering';
+    case 'thinking':
+      return `Thinking${step}`;
+    case 'tool':
+      return p.detail ? `Using ${p.detail.slice(0, 40)}${step}` : `Working${step}`;
+    case 'final':
+      return 'Writing the answer';
+    default:
+      return null;
+  }
+}
 
 export const CONTRACT_OPEN = '[[contract]]';
 export const CONTRACT_CLOSE = '[[/contract]]';
@@ -67,75 +101,40 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
-export interface EngineChoice {
-  engine: string;
-  model: string;
-}
+export type { EngineChoice } from './useProviders';
 
 export interface EngineState {
-  engines: Array<{ id: string; status: EngineStatus | null; caps: EngineCapabilities }>;
+  engines: Array<{ id: string; status: EngineStatus | null; caps: EngineCapabilities; state: EngineStateId; title: string }>;
+  /** Models of the current provider. */
   models: EngineModel[];
   choice: EngineChoice | null;
   loading: boolean;
   setChoice: (choice: EngineChoice) => void;
+  /** Switch provider and use its preferred model. */
+  selectEngine: (engine: string) => Promise<void>;
   loadModels: (engine: string) => Promise<EngineModel[]>;
 }
 
+/** Thin adapter over the shared provider store (see useProviders.ts). */
 export function useEngines(): EngineState {
-  const [engines, setEngines] = useState<EngineState['engines']>([]);
-  const [models, setModels] = useState<EngineModel[]>([]);
-  const [choice, setChoiceState] = useState<EngineChoice | null>(() => readJson<EngineChoice | null>(KEY_ENGINE, null));
-  const [loading, setLoading] = useState(true);
-
-  const loadModels = useCallback(async (engine: string) => {
-    try {
-      const list = engine === 'mock' ? await freeModels() : await engineModels(engine);
-      setModels(list);
-      return list;
-    } catch {
-      setModels([]);
-      return [];
-    }
-  }, []);
-
-  const setChoice = useCallback((next: EngineChoice) => {
-    setChoiceState(next);
-    writeJson(KEY_ENGINE, next);
-  }, []);
-
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      const [caps, statuses] = await Promise.all([
-        engineCapabilities().catch(() => ({}) as Record<string, EngineCapabilities>),
-        engineStatuses().catch(() => [] as EngineStatus[]),
-      ]);
-      if (!alive) return;
-      const usable = Object.entries(caps)
-        .filter(([, c]) => c.conversation_runs)
-        .map(([id, c]) => ({ id, caps: c, status: statuses.find((s) => s.engine_id === id) ?? null }));
-      setEngines(usable);
-      const stored = readJson<EngineChoice | null>(KEY_ENGINE, null);
-      const pick =
-        usable.find((e) => e.id === stored?.engine) ??
-        usable.find((e) => e.id === 'mock') ??
-        usable.find((e) => e.status?.install_state === 'installed') ??
-        usable[0];
-      if (pick) {
-        const list = await loadModels(pick.id);
-        if (!alive) return;
-        const model = list.find((m) => m.id === stored?.model && pick.id === stored?.engine)?.id ?? list[0]?.id ?? '';
-        if (model) setChoiceState({ engine: pick.id, model });
-      }
-      setLoading(false);
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [loadModels]);
-
-  return { engines, models, choice, loading, setChoice, loadModels };
+  const s = useProviders();
+  const engines = useMemo(
+    () => s.selectable.map((e) => ({ id: e.id, status: e.status, caps: e.caps, state: e.state, title: e.title })),
+    [s.selectable]
+  );
+  const models = s.choice ? (s.models[s.choice.engine]?.list ?? NO_MODELS) : NO_MODELS;
+  return {
+    engines,
+    models,
+    choice: s.choice,
+    loading: s.loading,
+    setChoice: setProviderChoice,
+    selectEngine: selectProviderEngine,
+    loadModels: loadProviderModels,
+  };
 }
+
+const NO_MODELS: EngineModel[] = [];
 
 export interface RunState {
   runId: string;
@@ -150,12 +149,25 @@ export interface ChatState {
   select: (id: string | null) => void;
   messages: ConvMessage[];
   pendingUser: string | null;
+  /** What Loqman is doing right now in the selected chat, while he answers; null otherwise. */
+  progress: string | null;
   run: RunState | null;
+  /** The reply as it streams in (normalised driver events) in the selected chat; null when nothing is streaming. */
+  live: LiveTurn | null;
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
   drafts: Record<string, Draft[]>;
   error: string | null;
   dismissError: () => void;
+  /** Runs the failed step again (resend the message, reload the chat or the list); null when there is nothing to retry. */
+  retry: (() => void) | null;
+  /** The selected chat's messages could not be read: it is not empty, it just did not load. */
+  threadError: string | null;
+  retryThread: () => void;
+  /** Stop was pressed and the worker has not confirmed yet. */
+  stopping: boolean;
+  /** The selected run can be cancelled (a Loqman answer cannot once it has started). */
+  canStop: boolean;
   draft: string;
   setDraft: (text: string) => void;
   send: (text: string) => Promise<void>;
@@ -177,17 +189,130 @@ export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * The agent a chat belongs to. The conversation's own profile_id (stored in SQLite by the worker) decides; the
+ * browser-side map only covers chats made before conversations were bound, and Loqman is the last resort.
+ */
+export function resolveAgent(
+  profileId: string | null | undefined,
+  mappedId: string | null | undefined,
+  agents: Agent[],
+  ceo: Agent | null
+): Agent | null {
+  const bound = profileId ? agents.find((a) => a.id === profileId) : undefined;
+  const mapped = mappedId ? agents.find((a) => a.id === mappedId) : undefined;
+  return bound ?? mapped ?? ceo;
+}
+
+/** An error shown in the chat, with what "Retry" does about it. */
+interface ChatErrorEntry {
+  message: string;
+  retry: 'send' | 'load' | null;
+}
+
+const NO_MESSAGES: ConvMessage[] = [];
+const NO_RUNS: Record<number, RunSnapshot> = {};
+
+function cacheRuns(conversationId: string, ids: string[]): void {
+  const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+  all[conversationId] = ids.slice(-30);
+  writeJson(KEY_RUNS, all);
+}
+
 export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAgentsChanged?: () => void): ChatState {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [legacy] = useState<LegacyThread[]>(() => readLegacyThreads());
   const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
-  const [messages, setMessages] = useState<ConvMessage[]>([]);
+  // The messages and runs of ONE chat, tagged with it: after a switch the old chat's text is never shown in the new one.
+  const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
+  const [runsThread, setRunsThread] = useState<{ cid: string | null; map: Record<number, RunSnapshot> }>({ cid: null, map: NO_RUNS });
   const [pendingUser, setPendingUser] = useState<string | null>(null);
+  const [ceoStep, setCeoStep] = useState<{ cid: string; text: string } | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const historyUsed = useRef(false);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
-  const [runsBySeq, setRunsBySeq] = useState<Record<number, RunSnapshot>>({});
+  const [live, setLive] = useState<Record<string, LiveTurn>>({});
+  const liveRuns = useRef(new Map<string, LiveTurn>());
+  const stoppedRuns = useRef(new Set<string>());
+  const liveDirty = useRef(new Map<string, string>());
+  const liveFrame = useRef<number | null>(null);
+  const liveLastFlush = useRef(0);
+  /** Publish the streamed text to React at most about every 60 ms and once per frame, however many deltas arrived. */
+  const scheduleLive = useCallback((conversationId: string, runId: string) => {
+    liveDirty.current.set(conversationId, runId);
+    if (liveFrame.current !== null) return;
+    const tick = () => {
+      if (performance.now() - liveLastFlush.current < 60) {
+        liveFrame.current = requestAnimationFrame(tick);
+        return;
+      }
+      liveFrame.current = null;
+      liveLastFlush.current = performance.now();
+      const entries = [...liveDirty.current];
+      liveDirty.current.clear();
+      setLive((prev) => {
+        const next = { ...prev };
+        for (const [cid, rid] of entries) {
+          const turn = liveRuns.current.get(rid);
+          if (turn) next[cid] = turn;
+        }
+        return next;
+      });
+    };
+    liveFrame.current = requestAnimationFrame(tick);
+  }, []);
+  const applyLive = useCallback(
+    (conversationId: string, runId: string, type: string, data: Record<string, unknown>) => {
+      if (stoppedRuns.current.has(runId)) return;
+      const cur = liveRuns.current.get(runId) ?? emptyLive(runId);
+      const next = reduceLive(cur, type, data);
+      if (next === cur) return;
+      liveRuns.current.set(runId, next);
+      scheduleLive(conversationId, runId);
+    },
+    [scheduleLive]
+  );
+  const dropLive = useCallback((conversationId: string, runId: string) => {
+    liveRuns.current.delete(runId);
+    stoppedRuns.current.delete(runId);
+    if (liveDirty.current.get(conversationId) === runId) liveDirty.current.delete(conversationId);
+    setLive((prev) => {
+      if (!(conversationId in prev)) return prev;
+      const next = { ...prev };
+      delete next[conversationId];
+      return next;
+    });
+  }, []);
+  useEffect(
+    () => () => {
+      if (liveFrame.current !== null) cancelAnimationFrame(liveFrame.current);
+    },
+    []
+  );
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
-  const [error, setError] = useState<string | null>(null);
+  // Errors belong to the chat they happened in ('' = no chat open yet or the list itself); another chat never shows them.
+  const [errors, setErrors] = useState<Record<string, ChatErrorEntry>>({});
+  const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
+  const [stoppingRuns, setStoppingRuns] = useState<Record<string, true>>({});
+  const failedSend = useRef<{ cid: string | null; prompt: string } | null>(null);
+  const raise = useCallback((cid: string | null, message: string, retry: ChatErrorEntry['retry'] = null) => {
+    setErrors((prev) => ({ ...prev, [cid ?? '']: { message, retry } }));
+  }, []);
+  const clearError = useCallback((cid: string | null) => {
+    setErrors((prev) => {
+      if (!((cid ?? '') in prev)) return prev;
+      const next = { ...prev };
+      delete next[cid ?? ''];
+      return next;
+    });
+  }, []);
   const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
   const [loaded, setLoaded] = useState(false);
   const [draftAgentId, setDraftAgentId] = useState<string | null>(null);
@@ -205,22 +330,68 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   }, []);
   const agentFor = useCallback(
     (cid: string | null) =>
-      cid ? (agents.find((a) => a.id === agentMap[cid]) ?? ceo) : (agents.find((a) => a.id === draftAgentId) ?? ceo),
-    [agents, agentMap, ceo, draftAgentId]
+      cid
+        ? resolveAgent(conversations.find((c) => c.id === cid)?.profile_id, agentMap[cid], agents, ceo)
+        : (agents.find((a) => a.id === draftAgentId) ?? ceo),
+    [agents, agentMap, ceo, draftAgentId, conversations]
   );
   const streams = useRef(new Map<string, StreamHandle>());
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
 
+  /** The CEO history conversation is hidden while it is empty (it is created for every user by the import). Nothing is deleted. */
+  const withoutEmptyHistory = useCallback(async (list: Conversation[]) => {
+    const history = list.find((c) => c.id === CEO_HISTORY_ID);
+    if (!history || historyUsed.current) return list;
+    const msgs = await listMessages(history.id).catch(() => null);
+    if (msgs === null) return list;
+    if (msgs.length > 0) {
+      historyUsed.current = true;
+      return list;
+    }
+    return list.filter((c) => c.id !== history.id);
+  }, []);
+
   const refreshConversations = useCallback(async () => {
-    setConversations(await listConversations());
+    setConversations(await withoutEmptyHistory(await listConversations()));
+  }, [withoutEmptyHistory]);
+
+  // Every read of a chat takes a number; an older answer that arrives after a newer one is dropped,
+  // and an answer for a chat that is no longer open is never shown.
+  const readSeq = useRef(new Map<string, number>());
+  const nextRead = (cid: string) => {
+    const n = (readSeq.current.get(cid) ?? 0) + 1;
+    readSeq.current.set(cid, n);
+    return n;
+  };
+  const fetchMessages = useCallback(async (conversationId: string): Promise<ConvMessage[] | null> => {
+    const ticket = nextRead(conversationId);
+    const list = await listMessages(conversationId);
+    if (readSeq.current.get(conversationId) !== ticket) return null;
+    if (selectedRef.current === conversationId) setThread({ cid: conversationId, list });
+    return list;
   }, []);
 
   const loadThread = useCallback(async (conversationId: string) => {
+    const ticket = nextRead(conversationId);
+    setThreadErrors((prev) => {
+      if (!(conversationId in prev)) return prev;
+      const next = { ...prev };
+      delete next[conversationId];
+      return next;
+    });
     const list = await listMessages(conversationId);
-    if (selectedRef.current === conversationId) setMessages(list);
-    const ids = readJson<Record<string, string[]>>(KEY_RUNS, {})[conversationId] ?? [];
-    const snaps = await Promise.all(ids.slice(-30).map((id) => getRun(id).catch(() => null)));
+    if (readSeq.current.get(conversationId) === ticket && selectedRef.current === conversationId) {
+      setThread({ cid: conversationId, list });
+    }
+    // The worker knows this conversation's runs; the browser index is only a fallback when it is unreachable.
+    let snaps: Array<RunSnapshot | null> | null = await listRuns(conversationId, 30).catch(() => null);
+    if (snaps) {
+      cacheRuns(conversationId, snaps.map((s) => s!.id));
+    } else {
+      const ids = readJson<Record<string, string[]>>(KEY_RUNS, {})[conversationId] ?? [];
+      snaps = await Promise.all(ids.slice(-30).map((id) => getRun(id).catch(() => null)));
+    }
     const bySeq: Record<number, RunSnapshot> = {};
     const nextDrafts: Record<string, Draft[]> = {};
     for (const snap of snaps) {
@@ -228,8 +399,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       if (snap.assistant_message_seq != null) bySeq[snap.assistant_message_seq] = snap;
       if (snap.status === 'succeeded') nextDrafts[snap.id] = await listDrafts(snap.id).catch(() => []);
     }
-    if (selectedRef.current === conversationId) {
-      setRunsBySeq(bySeq);
+    if (selectedRef.current === conversationId && readSeq.current.get(conversationId) === ticket) {
+      setRunsThread({ cid: conversationId, map: bySeq });
       setDrafts((prev) => ({ ...prev, ...nextDrafts }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
@@ -250,8 +421,25 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         handle?.close();
         streams.current.delete(runId);
         setRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error: err } }));
-        setPendingUser(null);
-        if (err && status !== 'cancelled' && selectedRef.current === conversationId) setError(err);
+        setStoppingRuns((prev) => {
+          if (!(runId in prev)) return prev;
+          const next = { ...prev };
+          delete next[runId];
+          return next;
+        });
+        if (selectedRef.current === conversationId) setPendingUser(null);
+        if (err && status !== 'cancelled') raise(conversationId, err);
+        const partial = liveRuns.current.get(runId);
+        if (status === 'cancelled' && hasLiveContent(partial)) {
+          // Keep what was written, marked as stopped; a reload shows only what the worker stored.
+          const kept = freezeLive(partial);
+          liveRuns.current.set(runId, kept);
+          setLive((prev) => ({ ...prev, [conversationId]: kept }));
+        } else {
+          // The stored reply replaces the live one in the same render, so the text never shows twice or disappears.
+          if (status === 'succeeded') await fetchMessages(conversationId).catch(() => null);
+          dropLive(conversationId, runId);
+        }
         await refreshConversations().catch(() => undefined);
         if (selectedRef.current === conversationId) await loadThread(conversationId).catch(() => undefined);
         setApprovals(await listApprovals().catch(() => []));
@@ -261,8 +449,11 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       followRun(
         runId,
         (type, data) => {
+          // Only a lifecycle terminal ends the run; driver events feed the live reply; anything else is ignored.
           if (isTerminal(type)) void finish(type, typeof data.error === 'string' ? data.error : null);
-          else setRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
+          else if (type === 'queued' || type === 'running') {
+            setRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
+          } else applyLive(conversationId, runId, type, data);
         },
         () => {
           if (streams.current.has(runId)) {
@@ -271,7 +462,9 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
               else streams.current.delete(runId);
             });
           }
-        }
+        },
+        0,
+        'normalised-v1'
       )
         .then((handle) => {
           if (streams.current.has(runId)) streams.current.set(runId, handle);
@@ -279,10 +472,10 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         })
         .catch((e) => {
           streams.current.delete(runId);
-          setError(messageOf(e));
+          raise(conversationId, messageOf(e));
         });
     },
-    [loadThread, refreshConversations]
+    [loadThread, fetchMessages, refreshConversations, applyLive, dropLive, raise]
   );
 
   useEffect(() => {
@@ -290,13 +483,24 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     (async () => {
       try {
         await importLegacyCeo().catch(() => undefined);
-        const list = await listConversations();
+        const all0 = await listConversations();
+        const list = await withoutEmptyHistory(all0);
         if (!alive) return;
         setConversations(list);
         const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+        // Recover from the cache, and ask the worker about recent chats the cache does not know (cleared storage).
+        const lastRun: Record<string, string | undefined> = {};
+        for (const [cid, ids] of Object.entries(all)) lastRun[cid] = ids[ids.length - 1];
+        const unknown = list.filter((c) => !(c.id in lastRun)).slice(0, 10);
+        await Promise.all(
+          unknown.map(async (c) => {
+            const found = await listRuns(c.id, 1).catch(() => []);
+            if (found[0]) lastRun[c.id] = found[0].id;
+          })
+        );
+        if (!alive) return;
         const active: Record<string, RunState> = {};
-        for (const [cid, ids] of Object.entries(all)) {
-          const last = ids[ids.length - 1];
+        for (const [cid, last] of Object.entries(lastRun)) {
           if (!last) continue;
           const snap = await getRun(last).catch(() => null);
           if (snap && !isTerminal(snap.status)) {
@@ -308,7 +512,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         setRuns(active);
         setApprovals(await listApprovals().catch(() => []));
       } catch (e) {
-        if (alive) setError(messageOf(e));
+        if (alive) raise(null, `Could not load your chats. ${messageOf(e)}`, 'load');
       } finally {
         if (alive) setLoaded(true);
       }
@@ -319,16 +523,18 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       for (const handle of open.values()) handle.close();
       open.clear();
     };
-  }, [follow]);
+  }, [follow, withoutEmptyHistory, raise]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
-      setMessages([]);
-      setRunsBySeq({});
+      setThread({ cid: null, list: NO_MESSAGES });
+      setRunsThread({ cid: null, map: NO_RUNS });
       return;
     }
     let alive = true;
-    loadThread(selectedId).catch((e) => alive && setError(messageOf(e)));
+    loadThread(selectedId).catch((e) => {
+      if (alive) setThreadErrors((prev) => ({ ...prev, [selectedId]: messageOf(e) }));
+    });
     return () => {
       alive = false;
     };
@@ -349,7 +555,6 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     setDraftAgentId(null);
     setSelectedId(id);
     writeJson(KEY_SELECTED, id);
-    setError(null);
     setPendingUser(null);
   }, []);
 
@@ -371,17 +576,42 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     async (text: string) => {
       const prompt = text.trim();
       if (!prompt) return;
-      if (!engine) {
-        setError('No engine is available yet. Open Settings → AI to check your engines.');
+      if (!engine?.model) {
+        raise(selectedRef.current, 'No AI provider is ready. Open Settings > AI to sign in or pick a model.');
         return;
       }
-      setError(null);
       let cid = selectedRef.current;
+      clearError(cid);
+      failedSend.current = null;
       const draftKey = cid ?? '';
+      const known = cid && !cid.startsWith('legacy:') ? cid : null;
+      const target = known
+        ? resolveAgent(conversations.find((c) => c.id === known)?.profile_id, agentMapRef.current[known], agents, ceo)
+        : (agents.find((a) => a.id === draftAgentRef.current) ?? ceo);
+      if ((!target || target.id === CEO_PROFILE_ID) && prompt.length > CEO_MAX_CHARS) {
+        raise(
+          cid,
+          `Loqman reads messages of up to ${CEO_MAX_CHARS.toLocaleString('en-US')} characters; this one has ${prompt.length.toLocaleString('en-US')}. Shorten it and send again.`
+        );
+        return;
+      }
+      let boundProfile: string | null | undefined = cid ? conversations.find((c) => c.id === cid)?.profile_id : null;
+      const keepDraft = (key: string) =>
+        setDraftMap((prev) => {
+          // A failed send gives the text back in the chat it belongs to, and never over something typed since.
+          const next = { ...prev, [key]: prev[key] || prompt };
+          if (draftKey !== key) delete next[draftKey];
+          writeJson(KEY_DRAFTS, next);
+          return next;
+        });
       try {
         if (!cid || cid.startsWith('legacy:')) {
-          const created = await createConversation(prompt.replace(/\s+/g, ' ').slice(0, 60));
+          const created = await createConversation(
+            prompt.replace(/\s+/g, ' ').slice(0, 60),
+            target && target.id !== CEO_PROFILE_ID ? target.id : undefined
+          );
           cid = created.id;
+          boundProfile = created.profile_id;
           setConversations((prev) => [created, ...prev]);
           selectedRef.current = cid;
           setSelectedId(cid);
@@ -389,7 +619,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           const starter = agents.find((a) => a.id === draftAgentRef.current) ?? ceo;
           if (starter) bindAgent(cid, starter.id);
         }
-        const agent = agents.find((a) => a.id === agentMapRef.current[cid!]) ?? ceo;
+        const chatId = cid;
+        const agent = resolveAgent(boundProfile, agentMapRef.current[chatId], agents, ceo);
         const clearDraft = () =>
           setDraftMap((prev) => {
             const next = { ...prev };
@@ -399,64 +630,97 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           });
         if (!agent || agent.id === CEO_PROFILE_ID) {
           // Loqman (the CEO) answers through the CEO loop, which is the path that can create agents.
-          const conversationId = cid;
           const ticket = `ceo-${crypto.randomUUID()}`;
           setPendingUser(prompt);
           clearDraft();
-          setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'running', error: null } }));
+          setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null } }));
+          // Ask the worker where the answer has got to. One request at a time; it ends with the ask, a chat switch or unmount.
+          let polling = true;
+          void (async () => {
+            while (polling) {
+              await new Promise((r) => window.setTimeout(r, CEO_PROGRESS_MS));
+              if (!polling || !mounted.current || selectedRef.current !== chatId) return;
+              const p = await ceoAskProgress(ticket).catch(() => null);
+              if (!polling || !mounted.current || selectedRef.current !== chatId) return;
+              if (p) {
+                const step = progressText(p);
+                if (step) setCeoStep({ cid: chatId, text: step });
+                if (p.done) return;
+              }
+            }
+          })();
+          let failure: string | null = null;
           try {
-            await addMessage(conversationId, 'user', prompt);
-            setMessages(await listMessages(conversationId));
-            const free = await freeModels().catch(() => [] as EngineModel[]);
-            const model = free.find((m) => m.id === engine.model)?.id ?? free[0]?.id ?? engine.model;
-            const answer = await askCeo(prompt, model, ticket);
-            const made = answer.agents_created.map((a) => a.name);
-            const note = made.length ? `
-
-✓ ${made.length === 1 ? 'Agent created' : 'Agents created'}: ${made.join(', ')}` : '';
-            await addMessage(conversationId, 'assistant', `${answer.reply}${note}`);
-            if (made.length) onAgentsChanged?.();
+            // The worker stores both sides of the exchange in this chat (the question before generating, the
+            // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
+            const answer = await askCeo(prompt, engine.engine, engine.model, ticket, chatId);
+            if (answer.agents_created.length) onAgentsChanged?.();
           } catch (e) {
-            setError(messageOf(e));
+            failure = messageOf(e);
+            failedSend.current = { cid: chatId, prompt };
+            raise(chatId, failure, 'send');
+            keepDraft(chatId);
           } finally {
-            setPendingUser(null);
-            setRuns((prev) => ({ ...prev, [conversationId]: { runId: ticket, status: 'succeeded', error: null } }));
+            polling = false;
+            setCeoStep(null);
+            if (selectedRef.current === chatId) setPendingUser(null);
+            // A failed answer is a failed run, not a finished one.
+            setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: failure ? 'failed' : 'succeeded', error: failure } }));
             await refreshConversations().catch(() => undefined);
-            if (selectedRef.current === conversationId) setMessages(await listMessages(conversationId).catch(() => []));
+            await fetchMessages(chatId).catch(() => null);
           }
           return;
         }
-        const first = (await listMessages(cid)).length === 0;
-        const outgoing = first && agent?.prompt ? `${CONTRACT_OPEN}
+        // A chat made before conversations were bound to their agent has no profile: bind it now so the
+        // worker applies the agent's instructions; only if that fails does the first message carry the contract.
+        let outgoing = prompt;
+        if (agent && !boundProfile) {
+          const bound = await bindConversationProfile(chatId, agent.id).catch(() => null);
+          if (bound) {
+            setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
+          } else if (agent.prompt && (await listMessages(chatId).catch(() => [{}])).length === 0) {
+            outgoing = `${CONTRACT_OPEN}
 ${agent.prompt}
 ${CONTRACT_CLOSE}
 
-${prompt}` : prompt;
+${prompt}`;
+          }
+        }
         setPendingUser(prompt);
-        const snap = await startTurn({
-          conversationId: cid,
-          engine: engine.engine,
-          modelId: engine.model,
-          prompt: outgoing,
-          requestKey: `ui-${crypto.randomUUID()}`,
-        });
-        remember(cid, snap.id);
-        setDraftMap((prev) => {
+        setLive((prev) => {
+          if (!(chatId in prev)) return prev;
           const next = { ...prev };
-          delete next[draftKey];
-          writeJson(KEY_DRAFTS, next);
+          delete next[chatId];
           return next;
         });
-        setRuns((prev) => ({ ...prev, [cid!]: { runId: snap.id, status: snap.status, error: null } }));
-        setMessages(await listMessages(cid));
-        follow(cid, snap.id);
+        try {
+          const snap = await startTurn({
+            conversationId: chatId,
+            engine: engine.engine,
+            modelId: engine.model,
+            prompt: outgoing,
+            requestKey: `ui-${crypto.randomUUID()}`,
+          });
+          remember(chatId, snap.id);
+          clearDraft();
+          setRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
+          await fetchMessages(chatId).catch(() => null);
+          follow(chatId, snap.id);
+        } catch (e) {
+          if (selectedRef.current === chatId) setPendingUser(null);
+          failedSend.current = { cid: chatId, prompt };
+          raise(chatId, messageOf(e), 'send');
+          keepDraft(chatId);
+        }
       } catch (e) {
+        // Creating the chat or binding it failed before anything was sent.
         setPendingUser(null);
-        setError(messageOf(e));
-        throw e;
+        failedSend.current = { cid, prompt };
+        raise(cid, messageOf(e), 'send');
+        keepDraft(cid ?? '');
       }
     },
-    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations]
+    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, raise, clearError]
   );
 
   const openAgentChat = useCallback(
@@ -468,7 +732,10 @@ ${prompt}` : prompt;
         select(existing);
         return existing;
       }
-      const created = await createConversation(`${agent.name} — ${agent.role}`.slice(0, 120));
+      const created = await createConversation(
+        `${agent.name} — ${agent.role}`.slice(0, 120),
+        agent.id !== CEO_PROFILE_ID ? agent.id : undefined
+      );
       bindAgent(created.id, agent.id);
       setConversations((prev) => [created, ...prev]);
       select(created.id);
@@ -480,13 +747,33 @@ ${prompt}` : prompt;
   const stop = useCallback(async () => {
     const cid = selectedRef.current;
     const run = cid ? runs[cid] : undefined;
-    if (!run || run.runId.startsWith('ceo-')) return; // a CEO answer cannot be cancelled midway
+    // A Loqman answer is one request to the worker that cannot be cancelled midway; the button is disabled for it.
+    if (!cid || !run || run.runId.startsWith('ceo-') || isTerminal(run.status) || stoppingRuns[run.runId]) return;
+    // The text stops changing the moment Stop is pressed, before the worker confirms.
+    stoppedRuns.current.add(run.runId);
+    setStoppingRuns((prev) => ({ ...prev, [run.runId]: true }));
+    const turn = liveRuns.current.get(run.runId);
+    if (turn) {
+      const frozen = freezeLive(turn);
+      liveRuns.current.set(run.runId, frozen);
+      setLive((prev) => ({ ...prev, [cid]: frozen }));
+    }
     try {
       await cancelRun(run.runId);
     } catch (e) {
-      setError(messageOf(e));
+      stoppedRuns.current.delete(run.runId);
+      setStoppingRuns((prev) => {
+        const next = { ...prev };
+        delete next[run.runId];
+        return next;
+      });
+      if (turn) {
+        liveRuns.current.set(run.runId, turn);
+        setLive((prev) => ({ ...prev, [cid]: turn }));
+      }
+      raise(cid, `Could not stop the reply. ${messageOf(e)}`);
     }
-  }, [runs]);
+  }, [runs, stoppingRuns, raise]);
 
   const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny') => {
     try {
@@ -500,18 +787,24 @@ ${prompt}` : prompt;
     try {
       await createDraft(runId);
     } catch (e) {
-      setError(messageOf(e));
+      raise(selectedRef.current, messageOf(e));
     }
     const list = await listDrafts(runId).catch(() => []);
     setDrafts((prev) => ({ ...prev, [runId]: list }));
-  }, []);
+  }, [raise]);
 
   const loadAllDrafts = useCallback(async () => {
-    const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
     const next: Record<string, Draft[]> = {};
-    for (const id of Object.values(all).flat()) {
-      const list = await listDrafts(id).catch(() => []);
-      if (list.length) next[id] = list;
+    const fromWorker = await listAllDrafts().catch(() => null);
+    if (fromWorker) {
+      for (const d of fromWorker) (next[d.run_id] ??= []).push(d);
+      for (const list of Object.values(next)) list.reverse(); // the worker lists newest first; cards read oldest first
+    } else {
+      const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+      for (const id of Object.values(all).flat()) {
+        const list = await listDrafts(id).catch(() => []);
+        if (list.length) next[id] = list;
+      }
     }
     setDrafts((prev) => ({ ...prev, ...next }));
   }, []);
@@ -520,11 +813,11 @@ ${prompt}` : prompt;
     try {
       await decideDraft(draft.run_id, draft.id, decision, draft.content_sha256);
     } catch (e) {
-      setError(messageOf(e));
+      raise(selectedRef.current, messageOf(e));
     }
     const list = await listDrafts(draft.run_id).catch(() => []);
     setDrafts((prev) => ({ ...prev, [draft.run_id]: list }));
-  }, []);
+  }, [raise]);
 
   const downloadDraft = useCallback(async (draft: Draft) => {
     try {
@@ -538,9 +831,35 @@ ${prompt}` : prompt;
       link.remove();
       URL.revokeObjectURL(url);
     } catch (e) {
-      setError(messageOf(e));
+      raise(selectedRef.current, messageOf(e));
     }
-  }, []);
+  }, [raise]);
+
+  const messages = thread.cid !== null && thread.cid === selectedId ? thread.list : NO_MESSAGES;
+  const runsBySeq = runsThread.cid !== null && runsThread.cid === selectedId ? runsThread.map : NO_RUNS;
+  const shownError = (selectedId && errors[selectedId]) || errors[''] || null;
+  const errorKey = selectedId && errors[selectedId] ? selectedId : '';
+  const threadError = selectedId ? (threadErrors[selectedId] ?? null) : null;
+
+  const retry = useMemo(() => {
+    if (!shownError?.retry) return null;
+    const kind = shownError.retry;
+    return () => {
+      if (kind === 'send') {
+        const failed = failedSend.current;
+        if (failed) void send(failed.prompt);
+        return;
+      }
+      clearError(errorKey || null);
+      void refreshConversations().catch((e) => raise(null, `Could not load your chats. ${messageOf(e)}`, 'load'));
+    };
+  }, [shownError, send, clearError, errorKey, refreshConversations, raise]);
+
+  const retryThread = useCallback(() => {
+    const cid = selectedRef.current;
+    if (!cid || cid.startsWith('legacy:')) return;
+    loadThread(cid).catch((e) => setThreadErrors((prev) => ({ ...prev, [cid]: messageOf(e) })));
+  }, [loadThread]);
 
   const currentRun = selectedId ? (runs[selectedId] ?? null) : null;
   const activeRunIds = useMemo(() => {
@@ -556,12 +875,19 @@ ${prompt}` : prompt;
     select,
     messages,
     pendingUser,
+    progress: ceoStep && ceoStep.cid === selectedId && currentRun && !isTerminal(currentRun.status) ? ceoStep.text : null,
     run: currentRun,
+    live: selectedId ? (live[selectedId] ?? null) : null,
     runsBySeq,
     approvals,
     drafts,
-    error,
-    dismissError: () => setError(null),
+    error: shownError?.message ?? null,
+    dismissError: () => clearError(errorKey || null),
+    retry,
+    threadError,
+    retryThread,
+    stopping: Boolean(currentRun && stoppingRuns[currentRun.runId]),
+    canStop: Boolean(currentRun && !currentRun.runId.startsWith('ceo-') && !isTerminal(currentRun.status)),
     draft: draftMap[selectedId ?? ''] ?? '',
     setDraft,
     send,

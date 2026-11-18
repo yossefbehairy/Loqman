@@ -46,15 +46,29 @@ from backend.pyworker.runtime.base import (
     AgentResult,
 )
 from backend.pyworker.runtime.errors import (
+    RuntimeAuthError,
     RuntimeErrorBase,
     RuntimeOffline,
+    RuntimeRateLimit,
     RuntimeTimeout,
     RuntimeCancelled,
     RuntimeModelUnavailable,
-    normalize_cli_error,
 )
 
 logger = logging.getLogger("agentos.runtime.opencode")
+
+def _normalize_cli_error(stderr: str, returncode: int) -> RuntimeErrorBase:
+    text = (stderr or "").lower()
+    if "unauthorized" in text or "401" in text or "invalid api key" in text or "auth" in text and "oauth" in text:
+        return RuntimeAuthError("OpenCode authentication failed. Check provider login (opencode auth login).")
+    if "429" in text or "rate limit" in text or "too many requests" in text or "quota" in text:
+        return RuntimeRateLimit("OpenCode rate limit or free-tier quota reached. Wait and retry; no paid fallback used.")
+    if "not found" in text or "unknown model" in text or "model not" in text:
+        return RuntimeModelUnavailable("Requested model is not available in the current OpenCode environment.")
+    if "econnrefused" in text or "connect" in text or "no such host" in text or "timed out" in text:
+        return RuntimeOffline("Cannot reach the OpenCode runtime. Ensure `opencode` is installed and reachable.")
+    return RuntimeErrorBase(f"OpenCode execution failed (exit {returncode}).")
+
 
 MAX_PROMPT_CHARS = 24_000
 MAX_OUTPUT_CHARS = 60_000
@@ -208,7 +222,7 @@ class RealOpenCodeRuntime:
         if proc.returncode != 0:
             err = (stderr or stdout or "").strip()
             logger.error("opencode api failed (exit %s)", proc.returncode)
-            raise normalize_cli_error(err, proc.returncode)
+            raise _normalize_cli_error(err, proc.returncode)
         out = stdout.strip()
         if not out:
             return {}
@@ -219,79 +233,6 @@ class RealOpenCodeRuntime:
             return json.loads(out) if out else {}
         except Exception as e:
             raise RuntimeErrorBase(f"Unparseable OpenCode response for {method} {path}: {e}")
-
-    async def request_api(self, method: str, path: str, data: Optional[Dict[str, Any]] = None,
-                          timeout: int = 180) -> Any:
-        """Forward a narrowly allowlisted SDK request through the local OpenCode CLI.
-
-        The renderer SDK speaks the legacy ``/session/{id}/message`` prompt surface,
-        while opencode v2 exposes ``/api/session`` + ``/api/session/{id}/prompt``.
-        We translate the prompt call here (POST message -> prompt + wait) and return
-        a message payload the SDK/front-end can read directly.
-        """
-        method = method.upper()
-        # Validate the complete path, including query strings, before forwarding.
-        # A prefix check lets POST /api/session?x bypass session creation checks.
-        allowed = (
-            method == "POST" and (path == "/api/session" or re.fullmatch(r"/api/session/[A-Za-z0-9_-]+/message", path))
-        ) or (
-            method == "GET" and re.fullmatch(r"/api/session(?:/[A-Za-z0-9_-]+(?:/message)?)?", path)
-        )
-        if not allowed:
-            raise RuntimeModelUnavailable("OpenCode SDK request is not allowed by the local proxy.")
-
-        allowed_agents = {settings.CHAT_AGENT_ID, settings.WORK_AGENT_ID}
-        if method == "POST" and path == "/api/session":
-            # The renderer may only open sessions with AgentOS' locked agents.
-            # "build" (unrestricted tools) is rejected here, not just hidden in the UI.
-            data = dict(data or {})
-            agent_id = str(data.get("agent") or settings.CHAT_AGENT_ID)
-            if agent_id not in allowed_agents:
-                raise RuntimeModelUnavailable(
-                    f"OpenCode agent '{agent_id}' is not allowed by AgentOS. "
-                    f"Allowed agents: {sorted(allowed_agents)}."
-                )
-            data["agent"] = agent_id
-
-        prompt_match = re.fullmatch(r"/api/session/([A-Za-z0-9_-]+)/message", path)
-        if method == "POST" and prompt_match:
-            session_id = prompt_match.group(1)
-            text = ""
-            parts = (data or {}).get("parts")
-            if isinstance(parts, list):
-                for part in parts:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text += part.get("text") or ""
-            if not text.strip():
-                text = str((data or {}).get("text") or "")
-            if not text.strip():
-                raise RuntimeErrorBase("Empty prompt: refusing to invoke the model.")
-            model_ref = (data or {}).get("model") or {}
-            assistant = await self._prompt_and_wait(
-                session_id=session_id,
-                text=text[:MAX_PROMPT_CHARS],
-                model_ref=model_ref,
-                timeout=timeout,
-            )
-            reply = self._assistant_text(assistant)
-            if not reply.strip():
-                raise RuntimeErrorBase(f"No text content returned from session {session_id}.")
-            return {
-                "data": {
-                    "info": {
-                        "id": assistant.get("id"),
-                        "role": "assistant",
-                        "model": assistant.get("model"),
-                    },
-                    # `parts` (SDK prompt shape) and `content` (v2 message shape) both
-                    # carry the text so either reader finds it.
-                    "parts": [{"type": "text", "text": reply[:MAX_OUTPUT_CHARS]}],
-                    "content": assistant.get("content") or [{"type": "text", "text": reply[:MAX_OUTPUT_CHARS]}],
-                    "cost": assistant.get("cost", 0.0),
-                    "tokens": assistant.get("tokens", {}),
-                }
-            }
-        return await self._run_cli_api(method, path, data, timeout=timeout)
 
     # -- session helpers ---------------------------------------------------
     @staticmethod

@@ -19,7 +19,8 @@ Durable events
 - ``iter_events`` serves replay + live tail: it subscribes BEFORE reading the
   DB, dedupes by id, and drops subscribers whose bounded queue overflows (the
   client reconnects with its last id and replays from the DB).
-Events are lifecycle only: no token/text streaming.
+Legacy delivery remains lifecycle only. Driver envelopes are persisted alongside
+lifecycle rows and exposed only through explicit normalised-v1 projection.
 
 All database work is synchronous on the event-loop thread (single connection),
 so there is no cross-thread publish and no thread-pool detour.
@@ -28,6 +29,7 @@ so there is no cross-thread publish and no thread-pool detour.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 import json
 import logging
 import sqlite3
@@ -38,20 +40,21 @@ from backend.pyworker.core import run_inputs, run_skills
 from backend.pyworker.core.approvals import expire_for_run as expire_approvals_for_run
 from backend.pyworker.db.core import Database, iso, new_id, ts
 from backend.pyworker.runtime.base import ExecuteAgentTask
+from backend.pyworker.runtime.engine_registry import create_engine_runtime, create_turn_driver
 from backend.pyworker.runtime.errors import safe_error_message
+from backend.pyworker.runtime.providers import ledger_provider
 from backend.pyworker.runtime.ledger import (
     KIND_MISSION_DELEGATE,
     KIND_MISSION_PLANNER,
     KIND_MISSION_SYNTHESIS,
     run_agent_task,
+    _record_event as record_usage,
 )
 
 logger = logging.getLogger("agentos.conversation_runs")
 
 ACTIVE_STATUSES = ("queued", "running")
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "interrupted")
-ENGINE_PROVIDERS = {"claude-code": "anthropic", "codex": "openai", "opencode": "opencode",
-                    "antigravity": "antigravity", "mock": "mock"}
 INTERRUPTED_ERROR = "Run interrupted by server restart or shutdown; it was not re-executed."
 KIND_CONVERSATION_RUN = "conversation_run"
 KIND_MISSION_TASK = "mission_task"
@@ -104,25 +107,6 @@ class MissionRunCancelled(Exception):
     """A mission worker run lost to a cancel (user, mission, or shutdown)."""
 
 
-def default_runtime_factory(engine_id: str):
-    if engine_id == "mock":
-        from backend.pyworker.runtime.mock_runtime import MockRuntime
-        return MockRuntime()
-    if engine_id == "opencode":
-        from backend.pyworker.runtime.opencode_runtime import RealOpenCodeRuntime
-        return RealOpenCodeRuntime()
-    if engine_id == "claude-code":
-        from backend.pyworker.runtime.claude_runtime import ClaudeCodeRuntime
-        return ClaudeCodeRuntime()
-    if engine_id == "codex":
-        from backend.pyworker.runtime.codex_runtime import CodexCliRuntime
-        return CodexCliRuntime()
-    if engine_id == "antigravity":
-        from backend.pyworker.runtime.agy_acp_runtime import AgyAcpRuntime
-        return AgyAcpRuntime()
-    raise UnsupportedEngine(engine_id)
-
-
 class ConversationRunManager:
     def __init__(
         self,
@@ -140,7 +124,7 @@ class ConversationRunManager:
         self._max_subscribers = max(1, max_subscribers)
         self._heartbeat = heartbeat_seconds
         self._subscribers: Set[_Subscriber] = set()
-        self._runtime_factory = runtime_factory or default_runtime_factory
+        self._runtime_factory = runtime_factory or create_engine_runtime
         self._max_concurrent = max(1, max_concurrent)
         self._max_pending = max(1, max_pending)
         self._abort_grace = abort_grace
@@ -151,6 +135,10 @@ class ConversationRunManager:
         self._run_keys: Dict[str, str] = {}      # mission runs: session_title the adapter tracks the process by
         self._tool_sessions = {}
         self._computer_owner = None
+        self._run_drivers = {}
+        self._driver_terminals = {}
+        self._pending_usage = {}
+        self._incremental = {}  # run_id -> prompt for a resumed native session (no replayed history)
 
     # -- helpers -------------------------------------------------------------
     def _runtime(self, engine_id: str):
@@ -170,11 +158,53 @@ class ConversationRunManager:
     # -- durable events ------------------------------------------------------
     def _add_event(self, run_id: str, type_: str, **data: Any) -> Dict[str, Any]:
         """Insert an event in the caller's transaction; caller commits then publishes."""
+        if type_ in TERMINAL_STATUSES:
+            terminal = self._driver_terminals.pop(run_id, None)
+            # A conflicting driver terminal is dropped, not a lifecycle terminal
+            # or a cleanup acknowledgement. Durable cancellation always wins.
+            if terminal is not None and terminal.data.get("status") == type_:
+                self._insert_driver_event(terminal)
         payload = {"run_id": run_id, "status": type_, **{k: v for k, v in data.items() if v is not None}}
         cur = self._db.execute(
             "INSERT INTO conversation_run_events(run_id,type,data_json,created_at) VALUES(?,?,?,?)",
             (run_id, type_, json.dumps(payload, ensure_ascii=False), ts()))
         return {"id": cur.lastrowid, "run_id": run_id, "type": type_, "data": payload}
+
+    def _insert_driver_event(self, event):
+        payload = {"run_id": event.run_id, "status": "running", "event": asdict(event)}
+        cur = self._db.execute(
+            "INSERT OR IGNORE INTO conversation_run_events(run_id,type,data_json,created_at,driver_event_id) "
+            "VALUES(?,?,?,?,?)", (event.run_id, "runtime", json.dumps(payload, ensure_ascii=False),
+                                  event.created_at, event.event_id))
+        if not cur.rowcount:
+            return None
+        return {"id": cur.lastrowid, "run_id": event.run_id, "type": "runtime", "data": payload}
+
+    async def _driver_event(self, event):
+        # Cancellation is durable first. Late terminals are cleanup acknowledgements.
+        if self._db.scalar("SELECT status FROM conversation_runs WHERE id=?", (event.run_id,)) not in ACTIVE_STATUSES:
+            return
+        if event.type == "turn.completed":
+            self._driver_terminals.setdefault(event.run_id, event)
+            return
+        with self._db.tx():
+            row = self._insert_driver_event(event)
+        if row is not None:
+            self._publish([row])
+
+    @staticmethod
+    def _project_event(event, event_format):
+        if event["type"] != "runtime":
+            return event
+        if event_format == "legacy":
+            return None
+        envelope = event["data"]["event"]
+        return {**event, "type": envelope["type"], "data": envelope}
+
+    @staticmethod
+    def _check_event_format(event_format):
+        if event_format not in {"legacy", "normalised-v1"}:
+            raise ValueError("Unknown event format")
 
     @staticmethod
     def _event_dict(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -202,23 +232,26 @@ class ConversationRunManager:
     def subscriber_capacity_exhausted(self) -> bool:
         return len(self._subscribers) >= self._max_subscribers
 
-    def list_events(self, run_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
+    def list_events(self, run_id: str, after_id: int = 0, event_format: str = "legacy") -> List[Dict[str, Any]]:
         """All persisted events of a run after ``after_id`` (raises RunNotFound)."""
         self.get_run(run_id)
+        self._check_event_format(event_format)
         out: List[Dict[str, Any]] = []
         while True:
             batch = self._replay(run_id, after_id)
-            out.extend(batch)
+            out.extend(projected for ev in batch if (projected := self._project_event(ev, event_format)) is not None)
             if len(batch) < 500:
                 return out
             after_id = batch[-1]["id"]
 
-    async def iter_events(self, run_id: str, last_event_id: int = 0) -> AsyncIterator[Optional[Dict[str, Any]]]:
+    async def iter_events(self, run_id: str, last_event_id: int = 0,
+                          event_format: str = "legacy") -> AsyncIterator[Optional[Dict[str, Any]]]:
         """Replay persisted events after ``last_event_id`` then tail live ones.
 
         Yields event dicts, or None as a heartbeat tick. Ends after the
         terminal event was delivered, or when this client is too slow."""
         self.get_run(run_id)  # RunNotFound before subscribing
+        self._check_event_format(event_format)
         sub = _Subscriber(run_id, self._subscriber_queue_size)
         if len(self._subscribers) >= self._max_subscribers:
             raise TooManyRuns("Too many event subscribers.")
@@ -229,7 +262,9 @@ class ConversationRunManager:
                 batch = self._replay(run_id, last)
                 for ev in batch:
                     last = ev["id"]
-                    yield ev
+                    projected = self._project_event(ev, event_format)
+                    if projected is not None:
+                        yield projected
                     if ev["type"] in TERMINAL_STATUSES:
                         return
                 if len(batch) < 500:
@@ -254,7 +289,9 @@ class ConversationRunManager:
                     batch = self._replay(run_id, last)
                     for persisted in batch:
                         last = persisted["id"]
-                        yield persisted
+                        projected = self._project_event(persisted, event_format)
+                        if projected is not None:
+                            yield projected
                         if persisted["type"] in TERMINAL_STATUSES:
                             return
                     if len(batch) < 500:
@@ -324,6 +361,7 @@ class ConversationRunManager:
             return prepared["snap"]
         run_id = prepared["run_id"]
         self._publish([prepared["event"]])
+        self._incremental[run_id] = prepared.get("incremental_prompt")
         task = asyncio.get_running_loop().create_task(
             self._execute(run_id, prepared["engine"], prepared["model_id"], prepared["prompt"],
                           prepared["timeout"], prepared["variant"]), name=self._key(run_id))
@@ -335,9 +373,11 @@ class ConversationRunManager:
                       variant: Optional[str], request_key: Optional[str], skills: Optional[List[Any]],
                       input_files: Optional[List[str]], tool_mode: str = "none",
                       computer_window: Optional[int] = None) -> Dict[str, Any]:
-        if engine not in ENGINE_PROVIDERS:
+        if ledger_provider(engine) is None:
             raise UnsupportedEngine(engine)
         if engine == "mock" and settings.RUNTIME_MODE != "mock":
+            raise UnsupportedEngine(engine)
+        if settings.RUNTIME_MODE == "mock" and engine != "mock":
             raise UnsupportedEngine(engine)
         db = self._db
         wanted_refs = [tuple(r) if isinstance(r, (tuple, list)) else (r.source_id, r.skill_id)
@@ -427,6 +467,7 @@ class ConversationRunManager:
             if selected:
                 history = json.dumps(selected, ensure_ascii=False)
                 prompt_for_engine = f"Previous conversation (JSON):\n{history}\n\nCurrent user message:\n{prompt}"
+        incremental_prompt = f"{skill_block}\n\n{run_skills.USER_LABEL}{prompt}" if skill_block else prompt
         if skill_block:
             if prompt_for_engine == prompt:
                 prompt_for_engine = f"{run_skills.USER_LABEL}{prompt}"
@@ -459,7 +500,8 @@ class ConversationRunManager:
             raise ActiveRunExists(conversation_id)
         snap = self.get_run(run_id)
         return {"schedule": True, "snap": snap, "event": queued_event, "run_id": run_id, "engine": engine,
-                "model_id": model_id, "prompt": prompt_for_engine, "timeout": timeout, "variant": variant}
+                "model_id": model_id, "prompt": prompt_for_engine, "timeout": timeout, "variant": variant,
+                "incremental_prompt": incremental_prompt}
 
     # -- cancel --------------------------------------------------------------
     def _cancel_db(self, run_id: str):
@@ -498,9 +540,13 @@ class ConversationRunManager:
             task = self._tasks.get(run_id)
             if prior == "running":
                 try:
-                    rt = self._run_runtimes.get(run_id) or self._runtime(engine)
-                    await asyncio.wait_for(rt.abort_task(self._run_keys.get(run_id, self._key(run_id))),
-                                           timeout=self._abort_grace)
+                    driver = self._run_drivers.get(run_id)
+                    if driver is not None:
+                        await asyncio.wait_for(driver.interrupt(run_id), timeout=self._abort_grace)
+                    else:
+                        rt = self._run_runtimes.get(run_id) or self._runtime(engine)
+                        await asyncio.wait_for(rt.abort_task(self._run_keys.get(run_id, self._key(run_id))),
+                                               timeout=self._abort_grace)
                 except Exception as exc:  # best effort; task cancel below also kills the CLI
                     logger.warning("abort_task failed for run %s: %s", run_id, type(exc).__name__)
             if task is not None and not task.done():
@@ -509,13 +555,25 @@ class ConversationRunManager:
         return self.get_run(run_id)
 
     async def shutdown(self) -> None:
-        """Cancel in-flight tasks WITHOUT touching DB state: rows stay active
-        and are marked interrupted on next start (or by ``interrupt_active``)."""
+        """Join cleanup, preserving already collected success before recovery.
+
+        Unfinished rows remain active for ``interrupt_active``/startup recovery.
+        """
         tasks = list(self._tasks.values())
         for t in tasks:
             t.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait(tasks)
+            except asyncio.CancelledError:
+                # Application.wait_for supplies the shutdown deadline. Wake
+                # bounded legacy joins when that deadline expires, without
+                # cancelling a wrapped task again while its kill is in flight.
+                for driver in list(self._run_drivers.values()):
+                    expire = getattr(driver, "expire_cleanup", None)
+                    if expire is not None:
+                        expire()
+                await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
         self._sem = None
 
@@ -524,6 +582,19 @@ class ConversationRunManager:
         return self.recover_interrupted()
 
     # -- execution -----------------------------------------------------------
+    def _defer_usage(self, task, kind, result, elapsed, success, error, run_id):
+        self._pending_usage[run_id] = (task, kind, result, elapsed, error)
+
+    def _flush_usage(self, run_id):
+        usage = self._pending_usage.pop(run_id, None)
+        if usage is not None:
+            task, kind, result, elapsed, error = usage
+            succeeded = self._db.scalar("SELECT status FROM conversation_runs WHERE id=?", (run_id,)) == "succeeded"
+            record_usage(task, kind, result, elapsed, succeeded, error, run_id)
+
+    def _durably_cancelled(self, run_id):
+        return self._db.scalar("SELECT status FROM conversation_runs WHERE id=?", (run_id,)) == "cancelled"
+
     def _semaphore(self) -> asyncio.Semaphore:
         if self._sem is None:
             self._sem = asyncio.Semaphore(self._max_concurrent)
@@ -536,9 +607,18 @@ class ConversationRunManager:
                 if not self._transition(run_id, "queued", "running", started_at=ts()):
                     return  # cancelled while waiting
                 task = ExecuteAgentTask(prompt=prompt, model_id=model_id, variant=variant,
-                                        provider_id=ENGINE_PROVIDERS[engine], timeout=timeout,
+                                        provider_id=ledger_provider(engine), timeout=timeout,
                                         agent_id=settings.CHAT_AGENT_ID if engine == "opencode" else None,
                                         session_title=self._key(run_id))
+                runtime = self._runtime(engine)
+                conversation_id = self._db.scalar("SELECT conversation_id FROM conversation_runs WHERE id=?", (run_id,))
+                driver = self._run_drivers[run_id] = create_turn_driver(
+                    engine, runtime, legacy_task=task, db=self._db, conversation_id=conversation_id, run_id=run_id,
+                    resume_prompt=self._incremental.get(run_id))
+                call_options = {"driver": driver, "emit": self._driver_event, "engine": engine,
+                    "scope_kind": "conversation", "scope_id": conversation_id,
+                    "usage_recorder": self._defer_usage,
+                    "is_cancelled": lambda: self._durably_cancelled(run_id)}
                 try:
                     config = self._db.scalar("SELECT tool_config_json FROM conversation_runs WHERE id=?", (run_id,))
                     if config:
@@ -546,11 +626,11 @@ class ConversationRunManager:
                         async with ToolSession(self, run_id, json.loads(config)) as session:
                             task.mcp_servers = session.servers
                             result = await run_agent_task(self._runtime(engine), task,
-                                                          kind=KIND_CONVERSATION_RUN, run_id=run_id)
+                                                          kind=KIND_CONVERSATION_RUN, run_id=run_id, **call_options)
                             await session.verify_completion()
                     else:
                         result = await run_agent_task(self._runtime(engine), task,
-                                                      kind=KIND_CONVERSATION_RUN, run_id=run_id)
+                                                      kind=KIND_CONVERSATION_RUN, run_id=run_id, **call_options)
                 except asyncio.CancelledError:
                     raise  # cancel() already persisted; shutdown leaves the row for recovery
                 except Exception as exc:
@@ -581,6 +661,11 @@ class ConversationRunManager:
                 self._transition(run_id, "running", "failed", error="Internal error.", finished_at=ts())
             except Exception as exc2:
                 logger.error("could not mark run %s failed (%s)", run_id, type(exc2).__name__)
+        finally:
+            self._flush_usage(run_id)
+            self._run_drivers.pop(run_id, None)
+            self._driver_terminals.pop(run_id, None)
+            self._incremental.pop(run_id, None)
 
     def _transition_db(self, run_id: str, from_status: str, to_status: str,
                        **values: Any) -> Optional[Dict[str, Any]]:
@@ -713,13 +798,18 @@ class ConversationRunManager:
         self._tasks.pop(run_id, None)
         self._run_runtimes.pop(run_id, None)
         self._run_keys.pop(run_id, None)
+        self._run_drivers.pop(run_id, None)
+        self._driver_terminals.pop(run_id, None)
 
     async def _execute_mission_run(self, run_id, runtime, provider_id, model_id, variant, prompt,
                                    session_title, timeout, max_output_chars, validate, ledger_kind) -> Any:
-        async with self._semaphore():
-            return await self._execute_mission_body(run_id, runtime, provider_id, model_id, variant, prompt,
-                                                    session_title, timeout, max_output_chars, validate,
-                                                    ledger_kind)
+        try:
+            async with self._semaphore():
+                return await self._execute_mission_body(run_id, runtime, provider_id, model_id, variant, prompt,
+                                                        session_title, timeout, max_output_chars, validate,
+                                                        ledger_kind)
+        finally:
+            self._flush_usage(run_id)
 
     async def _execute_mission_body(self, run_id, runtime, provider_id, model_id, variant, prompt,
                                     session_title, timeout, max_output_chars, validate,
@@ -729,9 +819,22 @@ class ConversationRunManager:
             raise MissionRunCancelled(run_id)
         req = ExecuteAgentTask(prompt=prompt, model_id=model_id, provider_id=provider_id, variant=variant,
                                session_title=session_title, timeout=timeout)
+        driver = self._run_drivers[run_id] = create_turn_driver(self._db.scalar(
+            "SELECT engine FROM conversation_runs WHERE id=?", (run_id,)), runtime, legacy_task=req)
+        execution = asyncio.create_task(run_agent_task(
+            runtime, req, kind=ledger_kind, run_id=run_id, driver=driver,
+            emit=self._driver_event, scope_kind="mission_attempt", scope_id=run_id,
+            max_output_chars=max_output_chars, usage_recorder=self._defer_usage,
+            is_cancelled=lambda: self._durably_cancelled(run_id)))
         try:
-            result = await asyncio.wait_for(
-                run_agent_task(runtime, req, kind=ledger_kind, run_id=run_id), timeout=timeout + 30)
+            try:
+                result = await asyncio.wait_for(execution, timeout=timeout + 30)
+            except asyncio.CancelledError:
+                # wait_for propagates caller cancellation even if its child
+                # preserved a completed answer while joining cleanup.
+                if not execution.done() or execution.cancelled():
+                    raise
+                result = execution.result()
             text = (result.text or "")[:max_output_chars]
             validated = validate(text) if validate else None
         except asyncio.CancelledError:

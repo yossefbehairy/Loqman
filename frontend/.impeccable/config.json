@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "gradient-text",
+        "value": "*",
+        "files": [
+          "src/rusebot/styles.css"
+        ],
+        "createdAt": "2026-11-14T12:56:27.683Z",
+        "reason": "Claude triage: only match is .thinking-shimmer, the animated 'Thinking' status indicator inherited from RuseBot 0.1.127 (loading motion, not decorative text)"
+      }
+    ]
+  }
+}

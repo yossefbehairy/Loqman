@@ -1,5 +1,5 @@
 /**
- * Read-only view of conversations kept by the classic AgentOS UI in
+ * Read-only view of conversations kept by the classic Loqman UI in
  * localStorage (`agentos_ceo_threads_v1`). The worker's
  * `conversations.import_ceo` only copies the `ceo_messages` table, so these
  * browser-side threads are surfaced separately instead of being lost.

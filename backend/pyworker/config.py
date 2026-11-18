@@ -27,6 +27,14 @@ class Settings:
     log_level: str = "INFO"
 
 
+def _runtime_mode(value: str) -> str:
+    from .appsettings import RUNTIME_MODES, runtime_mode_error
+
+    if value not in RUNTIME_MODES:
+        raise argparse.ArgumentTypeError(runtime_mode_error(value))
+    return value
+
+
 def parse_args(argv: list[str]) -> Settings:
     p = argparse.ArgumentParser(
         prog="python -m backend.pyworker",
@@ -35,8 +43,8 @@ def parse_args(argv: list[str]) -> Settings:
     p.add_argument("--db", default=None, help="Explicit sqlite file (created if missing).")
     p.add_argument("--data-dir", default=None,
                    help="Writable data directory; the database is <dir>/agentos.db (desktop mode).")
-    p.add_argument("--runtime-mode", default=None, choices=["real", "mock", "claude", "codex", "agy"],
-                   help="Override RUNTIME_MODE (default: environment / real).")
+    p.add_argument("--runtime-mode", default=None, type=_runtime_mode,
+                   help="Override RUNTIME_MODE: real (default) or mock. The default engine is chosen in Settings.")
     p.add_argument("--max-message-bytes", type=int, default=DEFAULT_MAX_MESSAGE_BYTES)
     p.add_argument("--shutdown-timeout", type=float, default=5.0)
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])

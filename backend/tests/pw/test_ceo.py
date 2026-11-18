@@ -92,12 +92,34 @@ async def test_memory_is_backend_owned_and_survives_asks(make_app):
     await api("ceo.ask", question="hello")
     await api("ceo.ask", question="thanks")
     assert "Recent conversation" in rt.prompts[1].prompt and "- User: hello" in rt.prompts[1].prompt
-    hist = (await api("ceo.history"))["messages"]
-    assert [(m["role"], m["fast"]) for m in hist] == [("user", True), ("assistant", True)] * 2
-    assert hist[0]["content"] == "hello" and hist[0]["created_at"]
     seqs = [r["seq"] for r in api.db.all("SELECT seq FROM ceo_messages ORDER BY seq")]
     assert seqs == [1, 2, 3, 4]
-    assert len((await api("ceo.history", limit=2))["messages"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_separate_chats_do_not_share_ceo_memory(make_app):
+    rt = Recorder()
+    api = Api(make_app(runtime=rt))
+    a = (await api("conversations.create", title="chat A"))["id"]
+    b = (await api("conversations.create", title="chat B"))["id"]
+    await api("ceo.ask", question="hello from alpha", conversation_id=a)
+    await api("conversations.add_message", conversation_id=a, role="assistant", content="ALPHA-REPLY")
+    # A new chat starts clean: nothing from chat A is in its prompt, and it has its own runtime thread.
+    await api("ceo.ask", question="thanks", conversation_id=b)
+    assert "alpha" not in rt.prompts[1].prompt.lower() and "ALPHA-REPLY" not in rt.prompts[1].prompt
+    assert "Recent conversation" not in rt.prompts[1].prompt
+    assert rt.prompts[1].session_title != rt.prompts[0].session_title
+    assert a in rt.prompts[0].session_title and b in rt.prompts[1].session_title
+    # Chat A keeps its own memory.
+    await api("ceo.ask", question="and again", conversation_id=a)
+    assert "- User: hello from alpha" in rt.prompts[2].prompt and "ALPHA-REPLY" in rt.prompts[2].prompt
+    assert (await api.fail("ceo.ask", question="hello", conversation_id="missing")).status == 404
+    # Without a conversation id the global memory is used, as before.
+    await api("ceo.ask", question="hello")
+    assert rt.prompts[3].session_title == "ceo-fast-gm"
+    assert "alpha" not in rt.prompts[3].prompt.lower()  # scoped chats never reach the company log
+    await api("ceo.ask", question="thanks")
+    assert "Recent conversation" in rt.prompts[4].prompt and "- User: hello" in rt.prompts[4].prompt
 
 
 @pytest.mark.asyncio
@@ -228,3 +250,58 @@ async def test_proposal_tools_validate_before_recording(make_app):
     assert ceo_tools.run_tool(db, "get_profile", {"identifier": "dr_sara"}).startswith("planner |")
     assert ceo_tools.run_tool(db, "list_missions", {"limit": 99}).startswith("ERROR: invalid args")
     assert db.scalar("SELECT COUNT(*) FROM pending_actions") == 1  # only the valid new_profile request
+
+
+@pytest.mark.asyncio
+async def test_team_members_carry_the_team_name_in_settings(api):
+    out = await api("ceo.ask", question="create a security team")
+    assert len(out["agents_created"]) == 3
+    for created in out["agents_created"]:
+        profile = await api("profiles.get", profile_id=created["id"])
+        assert json.loads(profile["settings_json"])["team_name"]  # the UI groups members by this key
+    names = {json.loads((await api("profiles.get", profile_id=c["id"]))["settings_json"])["team_name"]
+             for c in out["agents_created"]}
+    assert len(names) == 1
+
+
+@pytest.mark.asyncio
+async def test_overlapping_asks_only_claim_their_own_proposals(make_app):
+    import asyncio
+
+    release_alpha, release_beta = asyncio.Event(), asyncio.Event()
+
+    def call(name):
+        return json.dumps({"tool_call": {"name": "propose_new_profile", "args": {
+            "name": name, "role": "researcher", "instructions": "i"}}})
+
+    class Overlap(MockRuntime):
+        def __init__(self):
+            super().__init__()
+            self.calls = {"alpha": 0, "beta": 0}
+
+        async def execute_task(self, task):
+            # beta's prompt also carries alpha's recorded turn in its history, so test beta first
+            who = "beta" if "beta status question" in task.prompt else "alpha"
+            self.calls[who] += 1
+            n = self.calls[who]
+            if who == "alpha":
+                if n == 1:
+                    return AgentResult(text=call("AlphaAgent"), model_id=task.model_id)
+                await release_alpha.wait()  # alpha finishes only after beta recorded its proposal
+                release_beta.set()  # beta finishes only after alpha has returned and acted
+                return AgentResult(text='{"final": "alpha done"}', model_id=task.model_id)
+            if n == 1:
+                release_alpha.set()
+                return AgentResult(text=call("BetaAgent"), model_id=task.model_id)
+            await release_beta.wait()
+            return AgentResult(text='{"final": "beta done"}', model_id=task.model_id)
+
+    api = Api(make_app(runtime=Overlap()))
+
+    async def beta():
+        await asyncio.sleep(0.05)  # let alpha record its proposal first
+        return await api("ceo.ask", question="beta status question")
+
+    alpha_out, beta_out = await asyncio.gather(api("ceo.ask", question="alpha status question"), beta())
+    assert [a["name"] for a in alpha_out["agents_created"]] == ["AlphaAgent"]
+    assert [a["name"] for a in beta_out["agents_created"]] == ["BetaAgent"]

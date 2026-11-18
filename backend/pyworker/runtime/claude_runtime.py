@@ -2,8 +2,8 @@
 ClaudeCodeRuntime: a deliberately BOUNDED AgentRuntime adapter over the local
 Claude Code CLI (`claude`), using its official non-interactive print mode.
 
-Selected only with RUNTIME_MODE=claude. The default (RUNTIME_MODE=real) stays
-OpenCode; nothing here is imported unless Claude is selected.
+Created through ``engine_registry.create_engine_runtime("claude-code")``; nothing
+here is imported unless Claude is selected.
 
 What one task does
   claude -p --output-format json --tools "" --strict-mcp-config
@@ -14,7 +14,9 @@ What one task does
 Explicit limitations (do not oversell this adapter)
   * NOT a sandbox. `--tools ""` disables Claude's BUILT-IN tools and
     `--strict-mcp-config` (with no --mcp-config) ignores configured MCP
-    servers, but the user's own Claude settings/hooks/memory still load, and
+    servers; user settings/hooks are skipped via `--setting-sources project`
+    when the CLI advertises it (memory may still load), the child environment
+    is an explicit allowlist, and
     the empty cwd is a convenience, not an access boundary. No approval flow
     and no workspace restriction are offered.
   * Fail closed: before the first run the adapter reads `claude --help` and
@@ -89,6 +91,19 @@ REQUIRED_FLAGS = ("--print", "--output-format", "--tools", "--strict-mcp-config"
 
 # Documented aliases only. Availability for the user's account is NOT verified.
 KNOWN_MODEL_ALIASES = ("sonnet", "opus", "haiku")
+# Full model ids and long-context variants the CLI accepts for --model. The CLI cannot list models, so every
+# entry is 'unverified': it works only if the user's Claude account has access to it.
+KNOWN_MODELS = (
+    ("sonnet", "Claude Sonnet"),
+    ("opus", "Claude Opus"),
+    ("haiku", "Claude Haiku"),
+    ("claude-fable-5-2", "Claude Fable 5.2"),
+    ("claude-opus-5-5", "Claude Opus 5.5"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5"),
+    ("sonnet[1m]", "Claude Sonnet (latest, 1M context)"),
+    ("opus[1m]", "Claude Opus (latest, 1M context)"),
+)
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-\[\]]{0,63}$")
 _STRIPPED_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
@@ -135,25 +150,31 @@ def parse_result(stdout: str) -> Dict[str, Any]:
 
 
 class ClaudeCodeRuntime:
-    def __init__(self, cli_cmd: Optional[CmdSpec] = None, allow_api_key_env: bool = False):
-        """cli_cmd: executable path or argv prefix (tests pass [python, fake.py])."""
+    def __init__(self, cli_cmd: Optional[CmdSpec] = None, allow_api_key_env: bool = False,
+                 extra_env: Optional[Dict[str, str]] = None):
+        """cli_cmd: executable path or argv prefix (tests pass [python, fake.py]). ``extra_env`` adds reviewed
+        variables to the allowlisted child environment."""
         if cli_cmd is None:
             cli_cmd = shutil.which("claude") or None
         if isinstance(cli_cmd, str):
             cli_cmd = [cli_cmd]
         self._cmd: Optional[List[str]] = list(cli_cmd) if cli_cmd else None
         self._allow_api_key_env = allow_api_key_env
+        self._extra_env = dict(extra_env or {})
+        self._help_text = ""
         self._flags_ok: Optional[bool] = None
         self._inflight: Dict[str, asyncio.subprocess.Process] = {}
         self._cancelled: set = set()
 
     # -- helpers -----------------------------------------------------------
     def _env(self) -> Dict[str, str]:
-        env = dict(os.environ)
-        env.pop("AGENTOS_LOCAL_TOKEN", None)
-        if not self._allow_api_key_env:
+        # S5: explicit allowlist (no tokens/keys); Claude's login lives in the user profile, not the environment.
+        from backend.pyworker.runtime.claude_driver import claude_child_env
+        env = claude_child_env(extra=self._extra_env)
+        if self._allow_api_key_env:  # explicit opt-in to API-key billing
             for k in _STRIPPED_ENV:
-                env.pop(k, None)
+                if k in os.environ:
+                    env[k] = os.environ[k]
         return env
 
     def _probe_sync(self, args: Sequence[str]) -> Optional[subprocess.CompletedProcess]:
@@ -177,6 +198,7 @@ class ClaudeCodeRuntime:
         if self._flags_ok is None:
             res = await self._probe(["--help"])
             text = ((res.stdout or "") + (res.stderr or "")) if res else ""
+            self._help_text = text
             self._flags_ok = bool(text) and all(f in text for f in REQUIRED_FLAGS)
             if not self._flags_ok:
                 logger.warning("Installed claude CLI does not advertise all required flags.")
@@ -208,7 +230,7 @@ class ClaudeCodeRuntime:
     # -- health / models ---------------------------------------------------
     async def check_health(self) -> RuntimeHealth:
         """Install + login status only. Never starts a model turn."""
-        models = len(KNOWN_MODEL_ALIASES)
+        models = len(KNOWN_MODELS)
         if not self._cmd:
             return RuntimeHealth(status="offline", service_url=None,
                                  default_model_status="unavailable", models_count=0,
@@ -226,15 +248,15 @@ class ClaudeCodeRuntime:
         return RuntimeHealth(status=status, service_url=None, default_model_status="unverified",
                              models_count=models, free_models_count=0)
 
-    async def list_available_models(self, free_only: bool = True) -> List[ModelCatalogEntry]:
-        """Static documented aliases. The CLI cannot list models, so these are
+    async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]:
+        """Static documented aliases and ids. The CLI cannot list models, so these are
         'unverified' and never free (free_only=True therefore returns [])."""
         if free_only:
             return []
-        return [ModelCatalogEntry(id=a, name=f"Claude {a} (alias, unverified)",
+        return [ModelCatalogEntry(id=mid, name=name,
                                   provider_id="anthropic", cost=ModelCost(), variants=[],
                                   is_free=False, status="unverified")
-                for a in KNOWN_MODEL_ALIASES]
+                for mid, name in KNOWN_MODELS]
 
     # -- execution -----------------------------------------------------------
     async def execute_task(self, task: ExecuteAgentTask) -> AgentResult:
@@ -256,6 +278,8 @@ class ClaudeCodeRuntime:
         prompt = task.prompt[:MAX_PROMPT_CHARS]
         argv = [*self._cmd, "-p", "--output-format", "json", "--tools", "",
                 "--strict-mcp-config", "--no-session-persistence", "--model", model]
+        if "--setting-sources" in self._help_text:  # S5: do not load the user's settings/hooks when the CLI can avoid it
+            argv += ["--setting-sources", "project"]
         key = task.session_title or f"task-{time.time_ns()}"
         if key in self._inflight:
             raise RuntimeErrorBase("A Claude task with this session_title is already running.")
@@ -271,7 +295,8 @@ class ClaudeCodeRuntime:
                 with open(config_path, "w", encoding="utf-8") as config_file:
                     json.dump({"mcpServers": task.mcp_servers}, config_file)
                 argv += ["--mcp-config", config_path, "--allowedTools", "mcp__agentos_workspace__*",
-                         "--setting-sources", "project", "--disable-slash-commands"]
+                         *([] if "--setting-sources" in argv else ["--setting-sources", "project"]),
+                         "--disable-slash-commands"]
                 argv[argv.index("--tools") + 1] = "ToolSearch"
             try:
                 kwargs: Dict[str, Any] = {}

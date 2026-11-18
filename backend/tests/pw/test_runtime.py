@@ -34,6 +34,7 @@ async def test_mock_runtime_execute_planner_task():
     task = ExecuteAgentTask(
         prompt="Role: Planner. Create steps for registration system.",
         model_id="muse-spark-1.3-contributor-free",
+        provider_id="opencode",
         task_depth="Standard"
     )
     result = await runtime.execute_task(task)
@@ -49,6 +50,7 @@ async def test_mock_runtime_execute_analyst_task():
     task = ExecuteAgentTask(
         prompt="Role: Analyst. Evaluate risks for registration system.",
         model_id="muse-spark-1.3-contributor-free",
+        provider_id="opencode",
         task_depth="Deep"
     )
     result = await runtime.execute_task(task)

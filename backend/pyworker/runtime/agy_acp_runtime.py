@@ -1,8 +1,8 @@
 """
 AgyAcpRuntime: an AgentRuntime adapter over the Antigravity CLI's Agent Client
 Protocol (ACP) server: `agy acp --stdio`. NOT Gemini CLI, NOT `agy -p`
-(that is agy_runtime.AgyCliRuntime). Nothing imports this module until a
-caller wires it in.
+(the retired print-mode adapter). Created through
+``engine_registry.create_engine_runtime("antigravity")``.
 
 One task = one `agy acp` process = one ACP session
   argv : agy acp --stdio --sandbox --include-default-customizations=false
@@ -481,11 +481,8 @@ class AgyAcpRuntime:
 
     # -- process plumbing ----------------------------------------------------
     def _env(self) -> Dict[str, str]:
-        env = dict(os.environ)
-        for k in _STRIPPED_ENV:
-            if k == "AGENTOS_LOCAL_TOKEN" or not self._allow_api_key_env:
-                env.pop(k, None)
-        return env
+        from backend.pyworker.runtime.child_env import child_env
+        return child_env([k for k in _STRIPPED_ENV if k != "AGENTOS_LOCAL_TOKEN"] if self._allow_api_key_env else ())
 
     @staticmethod
     def _kill_tree_sync(pid: int) -> None:
@@ -581,7 +578,7 @@ class AgyAcpRuntime:
                              default_model_status="unverified", models_count=len(models),
                              free_models_count=0)
 
-    async def list_available_models(self, free_only: bool = True) -> List[ModelCatalogEntry]:
+    async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]:
         """Models offered by session/new; never 'free' (billing unknown)."""
         if free_only or not self._cmd:
             return []

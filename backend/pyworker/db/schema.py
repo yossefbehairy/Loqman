@@ -1,7 +1,9 @@
 """GENERATED from the legacy SQLAlchemy models (schema v16). Static DDL for sqlite3."""
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
+# Tables workflows, workflow_executions, node_executions, execution_events and opencode_conversations are retained
+# for existing databases and no longer written (the code that used them was removed).
 TABLES = {
     'agent_profiles': 'CREATE TABLE agent_profiles (\n\tid VARCHAR(64) NOT NULL, \n\tname VARCHAR(255) NOT NULL, \n\trole_type VARCHAR(64) NOT NULL, \n\tdescription TEXT, \n\tinstructions TEXT NOT NULL, \n\tinput_schema_json TEXT, \n\toutput_schema_json TEXT, \n\tdefault_model_id VARCHAR(128) NOT NULL, \n\tdefault_variant_id VARCHAR(64), \n\ttask_depth VARCHAR(32) NOT NULL, \n\tsettings_json TEXT, \n\tengine VARCHAR(32), \n\tcreated_at DATETIME NOT NULL, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)',
     'ceo_messages': 'CREATE TABLE ceo_messages (\n\tid VARCHAR(36) NOT NULL, \n\tseq INTEGER NOT NULL, \n\trole VARCHAR(16) NOT NULL, \n\tcontent TEXT NOT NULL, \n\tfast BOOLEAN NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id)\n)',
@@ -37,6 +39,53 @@ TABLES["workspace_writes"] = """CREATE TABLE workspace_writes (
     temporary_path TEXT,
     created_at TEXT NOT NULL,
     finished_at TEXT
+)"""
+
+# Shared by fresh DDL and the recognised additive migration path.
+DRIVER_COLUMNS = {
+    "conversation_runs": {
+        "runtime_key": "TEXT NOT NULL DEFAULT 'default'",
+        "driver_protocol": "TEXT",
+        "native_session_id": "TEXT",
+        "native_turn_id": "TEXT",
+        "session_generation": "INTEGER",
+    },
+    "conversation_run_events": {"driver_event_id": "TEXT"},
+    "approvals": {
+        "origin": "TEXT NOT NULL DEFAULT 'workspace'",
+        "runtime_request_id": "TEXT",
+        "request_type": "TEXT",
+        "request_json": "TEXT",
+        "response_json": "TEXT",
+        "delivery_status": "TEXT",
+    },
+}
+for _table, _columns in DRIVER_COLUMNS.items():
+    # Insert before existing constraints (the event PK is declared inline).
+    _marker = "\n\tFOREIGN KEY" if _table == "conversation_run_events" else "\n\tPRIMARY KEY"
+    TABLES[_table] = TABLES[_table].replace(
+        _marker, "".join(f"\n\t{name} {decl}, " for name, decl in _columns.items()) + _marker, 1)
+
+TABLES["runtime_sessions"] = """CREATE TABLE runtime_sessions (
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('conversation','ceo','mission_attempt','workflow')),
+    scope_id TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    runtime_key TEXT NOT NULL,
+    protocol TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    native_session_id TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1,
+    state TEXT NOT NULL DEFAULT 'unverified' CHECK (state IN ('unverified','ready','invalid')),
+    model_id TEXT NOT NULL,
+    provider_id TEXT,
+    variant TEXT,
+    agent_id TEXT,
+    cwd TEXT,
+    config_fingerprint TEXT,
+    last_turn_id TEXT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL,
+    PRIMARY KEY (scope_kind, scope_id, engine, runtime_key)
 )"""
 
 # Indexes per table (created with the table, like SQLAlchemy create_all).
@@ -117,3 +166,11 @@ INDEXES = {
         'CREATE INDEX ix_execution_events_node_execution_id ON execution_events (node_execution_id)',
     ],
 }
+
+INDEXES["runtime_sessions"] = [
+    "CREATE UNIQUE INDEX uq_runtime_sessions_native ON runtime_sessions (engine, runtime_key, namespace, protocol, native_session_id)",
+]
+INDEXES["conversation_run_events"].append(
+    "CREATE UNIQUE INDEX uq_run_driver_event ON conversation_run_events (run_id, driver_event_id) WHERE driver_event_id IS NOT NULL")
+INDEXES["approvals"].append(
+    "CREATE UNIQUE INDEX uq_approval_runtime_request ON approvals (run_id, runtime_request_id) WHERE runtime_request_id IS NOT NULL")

@@ -6,7 +6,9 @@ from backend.pyworker.core.browser import BrowserSession, BrowserError
 
 
 @pytest.mark.asyncio
-async def test_real_browser_reads_fills_clicks_and_yields_control():
+async def test_real_browser_reads_fills_clicks_and_yields_control(monkeypatch):
+    # The public-address guard (S7) correctly refuses this loopback fixture server; disable it here only.
+    monkeypatch.setattr("backend.pyworker.core.browser._check_public_url", lambda url: None)
     page = b"""<html><body><input aria-label="name"><button onclick="
       document.querySelector('p').innerText='Hello '+document.querySelector('input').value">Show</button>
       <p>Waiting</p></body></html>"""

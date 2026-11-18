@@ -8,8 +8,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, FileText, Loader2, MessageSquarePlus, PackageCheck, Plus, Search, Settings, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { GlassBar, GlassScrollFrame, GlassScroller } from './GlassScrollFrame';
-import type { Conversation } from '../data/worker';
+import { AgentAvatar } from './AgentAvatar';
+import { CEO_PROFILE_ID, type Conversation } from '../data/worker';
+import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
+import type { Agent } from '../types';
 
 export type View = 'chat' | 'team' | 'contracts' | 'results';
 
@@ -17,7 +20,7 @@ const SIMPLE_TOP_BUTTON =
   'flex size-[30px] shrink-0 items-center justify-center rounded-full bg-raised/50 text-ink hover:bg-raised focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus';
 
 function stamp(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   if (Number.isNaN(d.getTime())) return '';
   const today = new Date();
   return d.toDateString() === today.toDateString()
@@ -72,6 +75,9 @@ export interface SidebarProps {
   onView: (view: View) => void;
   conversations: Conversation[];
   legacy: LegacyThread[];
+  /** Every agent of the company; the ones without a chat yet are listed so they can be opened from here. */
+  agents: Agent[];
+  onOpenAgent: (agent: Agent) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   onNewChat: () => void;
@@ -107,21 +113,39 @@ export function Sidebar(props: SidebarProps) {
   }, [plusOpen]);
   const q = query.trim().toLowerCase();
 
-  useEffect(() => {
-    if (!searchOpen) setQuery('');
-  }, [searchOpen]);
+  const toggleSearch = () => {
+    if (searchOpen) setQuery('');
+    setSearchOpen(!searchOpen);
+  };
+  const closeSearch = () => {
+    setQuery('');
+    setSearchOpen(false);
+  };
 
   const rows = useMemo(
     () => props.conversations.filter((c) => !q || c.title.toLowerCase().includes(q)),
     [props.conversations, q]
   );
+  const idleAgents = useMemo(() => {
+    const withChat = new Set(props.conversations.map((c) => c.profile_id).filter(Boolean));
+    return props.agents.filter(
+      (a) => a.id !== CEO_PROFILE_ID && !withChat.has(a.id) && (!q || a.name.toLowerCase().includes(q))
+    );
+  }, [props.agents, props.conversations, q]);
   const legacyRows = useMemo(
     () => props.legacy.filter((t) => !q || t.title.toLowerCase().includes(q)),
     [props.legacy, q]
   );
 
-  const row = (id: string, title: string, when: string, preview: string, working: boolean) => {
+  const agentsById = useMemo(() => new Map(props.agents.map((a) => [a.id, a])), [props.agents]);
+  const agentIndex = useMemo(() => new Map(props.agents.map((a, i) => [a.id, i])), [props.agents]);
+
+  const row = (id: string, title: string, when: string, preview: string, working: boolean, profileId?: string | null) => {
     const current = view === 'chat' && props.selectedId === id;
+    // The badge shows who the chat is with: the agent's colour and initial, so chats with
+    // different agents read apart at a glance. Unknown agent (or an older chat): the title's initial, neutral.
+    const agent = profileId ? agentsById.get(profileId) : undefined;
+    const avatarLabel = agent?.name || title;
     if (rail) {
       return (
         <button
@@ -133,11 +157,11 @@ export function Sidebar(props: SidebarProps) {
           aria-current={current ? 'page' : undefined}
           onClick={() => props.onSelect(id)}
           className={cn(
-            'mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium',
+            'mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-focus',
             current ? 'bg-raised text-ink' : 'text-ink-secondary hover:bg-raised/50 hover:text-ink'
           )}
         >
-          {title.trim().charAt(0).toUpperCase() || '?'}
+          <AgentAvatar identity={profileId} index={profileId ? agentIndex.get(profileId) : undefined} label={avatarLabel} />
         </button>
       );
     }
@@ -145,9 +169,10 @@ export function Sidebar(props: SidebarProps) {
       <div
         key={id}
         className={cn(
-          'group/thread relative flex min-w-0 items-center rounded-xl',
+          'sidebar-row group/thread relative flex min-w-0 items-center rounded-xl',
           current ? 'bg-raised' : 'hover:bg-raised/50'
         )}
+        data-current={current ? 'true' : undefined}
       >
         <button
           type="button"
@@ -155,17 +180,15 @@ export function Sidebar(props: SidebarProps) {
           aria-current={current ? 'page' : undefined}
           title={title}
           onClick={() => props.onSelect(id)}
-          className="flex min-h-[46px] min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+          className="flex min-h-[46px] min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-raised text-[13px] font-medium text-ink-secondary">
-            {title.trim().charAt(0).toUpperCase() || '?'}
-          </span>
+          <AgentAvatar identity={profileId} index={profileId ? agentIndex.get(profileId) : undefined} label={avatarLabel} />
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="flex items-baseline gap-2">
               <span dir="auto" className={cn('min-w-0 flex-1 truncate text-[14px] font-medium leading-5', current ? 'text-ink' : 'text-ink')}>
                 {title}
               </span>
-              {when && <time className="shrink-0 tabular-nums text-[10px] text-ink-secondary">{when}</time>}
+              {when && <time className="shrink-0 tabular-nums text-[11px] text-ink-tertiary">{when}</time>}
             </span>
             <span className="flex items-center gap-1">
               <span dir="auto" className="min-w-0 flex-1 truncate text-[12.5px] leading-4 text-ink-secondary">
@@ -206,7 +229,7 @@ export function Sidebar(props: SidebarProps) {
               <button
                 type="button"
                 data-sidebar-search-toggle
-                onClick={() => setSearchOpen((o) => !o)}
+                onClick={toggleSearch}
                 aria-label="Search chats"
                 aria-expanded={searchOpen}
                 title="Search chats"
@@ -273,7 +296,7 @@ export function Sidebar(props: SidebarProps) {
                   onKeyDown={(e) => {
                     if (e.key === 'Escape') {
                       e.preventDefault();
-                      setSearchOpen(false);
+                      closeSearch();
                     }
                   }}
                   placeholder="Search chats"
@@ -282,7 +305,7 @@ export function Sidebar(props: SidebarProps) {
                 />
                 <button
                   type="button"
-                  onClick={() => setSearchOpen(false)}
+                  onClick={closeSearch}
                   aria-label="Close search"
                   title="Close search"
                   className="flex size-6 shrink-0 items-center justify-center rounded-full text-ink-tertiary hover:bg-raised hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-focus"
@@ -332,11 +355,47 @@ export function Sidebar(props: SidebarProps) {
                 c.title,
                 stamp(c.updated_at),
                 props.previews[c.id] ?? '',
-                Boolean(props.activeRunIds[c.id])
+                Boolean(props.activeRunIds[c.id]),
+                c.profile_id
+              )
+            )}
+            {idleAgents.length > 0 && !rail && (
+              <div role="heading" aria-level={2} className="mx-1 mt-2 border-t border-hairline/50 px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">
+                Agents
+              </div>
+            )}
+            {idleAgents.map((a) =>
+              rail ? (
+                <button
+                  key={`agent:${a.id}`}
+                  type="button"
+                  data-sidebar-agent-row={a.id}
+                  title={a.name}
+                  aria-label={a.name}
+                  onClick={() => props.onOpenAgent(a)}
+                  className="mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium text-ink-secondary outline-none hover:bg-raised/50 hover:text-ink focus-visible:ring-2 focus-visible:ring-focus"
+                >
+                  <AgentAvatar identity={a.id} index={agentIndex.get(a.id)} label={a.name} />
+                </button>
+              ) : (
+                <button
+                  key={`agent:${a.id}`}
+                  type="button"
+                  data-sidebar-agent-row={a.id}
+                  title={a.name}
+                  onClick={() => props.onOpenAgent(a)}
+                  className="flex min-h-[46px] min-w-0 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none hover:bg-raised/50 focus-visible:ring-2 focus-visible:ring-focus"
+                >
+                  <AgentAvatar identity={a.id} index={agentIndex.get(a.id)} label={a.name} />
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span dir="auto" className="truncate text-[14px] font-medium leading-5 text-ink">{a.name}</span>
+                    <span dir="auto" className="truncate text-[12.5px] leading-4 text-ink-secondary">{a.role}</span>
+                  </span>
+                </button>
               )
             )}
             {legacyRows.length > 0 && !rail && (
-              <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
+              <div role="heading" aria-level={2} className="mx-1 mt-2 border-t border-hairline/50 px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">
                 Earlier chats
               </div>
             )}
@@ -349,7 +408,7 @@ export function Sidebar(props: SidebarProps) {
                 false
               )
             )}
-            {rows.length === 0 && legacyRows.length === 0 && q && (
+            {rows.length === 0 && legacyRows.length === 0 && idleAgents.length === 0 && q && (
               <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">No chats match “{query}”.</div>
             )}
           </div>

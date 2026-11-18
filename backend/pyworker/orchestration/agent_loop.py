@@ -16,6 +16,7 @@ itself cannot mutate contracts or profiles.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.pyworker.appsettings import settings
@@ -40,7 +41,8 @@ _ORG_CONTEXT = (
     "You may create agents and teams whenever the user needs them: call propose_new_profile "
     "(one agent) or propose_new_team (several) with a clear name and full working instructions. "
     "Those two requests are applied immediately, with no approval step. "
-    "Always write the name Loqman exactly in English, even inside an Arabic reply.\n"
+    "Always write the name Loqman exactly in English, even inside an Arabic reply. "
+    "Answer in the language of the user's latest message, matching its dialect.\n"
 )
 
 
@@ -100,6 +102,15 @@ def build_fast_system_prompt(
     )
 
 
+def _lane(title: str, engine: str) -> tuple:
+    """(agent_id, session_title) for a CEO task. The locked OpenCode agent and the shared, reusable session
+    title are OpenCode (and mock) concepts. Account engines key running tasks by session title (a repeated
+    title is refused while one runs) and never receive OpenCode's agent id."""
+    if engine in ("opencode", "mock"):
+        return settings.CHAT_AGENT_ID, title
+    return None, f"{title}-{uuid.uuid4().hex[:8]}"
+
+
 def _parse_envelope(text: str) -> Optional[Dict[str, Any]]:
     try:
         data = json.loads(sanitize_model_output(text))
@@ -122,7 +133,7 @@ def _emit(progress: Optional[Callable[[str, str, int], None]], stage: str,
 async def run_ceo_ask(
     question: str,
     model_id: str,
-    provider_id: str = "opencode",
+    provider_id: str,
     variant: Optional[str] = None,
     runtime=None,
     db: Optional[Database] = None,
@@ -130,6 +141,10 @@ async def run_ceo_ask(
     timeout: int = 120,
     progress: Optional[Callable[[str, str, int], None]] = None,
     history: Optional[List[Dict[str, Any]]] = None,
+    thread_id: Optional[str] = None,
+    *,
+    engine: str,
+    action_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Run the bounded tool loop. Returns {reply, actions_proposed, iterations}."""
     if runtime is None or db is None:
@@ -141,7 +156,7 @@ async def run_ceo_ask(
     system = build_loop_system_prompt(question, history)
     transcript: List[str] = []
     used_write_calls: set = set()
-    baseline_pending = {r["id"] for r in db.all("SELECT id FROM pending_actions")}
+    own_actions: List[str] = action_ids if action_ids is not None else []
     observations: List[str] = []
     iterations = 0
 
@@ -153,14 +168,16 @@ async def run_ceo_ask(
             prompt += "\n\nConversation so far:\n" + "\n".join(transcript)
         prompt = prompt[: settings.MISSION_MAX_PROMPT_CHARS]
 
+        agent_id, session_title = _lane(
+            f"{CEO_ASK_THREAD_TITLE}-{thread_id}" if thread_id else CEO_ASK_THREAD_TITLE, engine)
         res = await run_agent_task(runtime, ExecuteAgentTask(
             prompt=prompt,
             model_id=model_id,
             provider_id=provider_id,
             variant=variant,
-            session_title=CEO_ASK_THREAD_TITLE,
+            session_title=session_title,
             timeout=timeout,
-            agent_id=settings.CHAT_AGENT_ID,
+            agent_id=agent_id,
         ), kind=KIND_CEO_ASK)
         raw = (res.text or "").strip()
         if not raw:
@@ -176,7 +193,7 @@ async def run_ceo_ask(
         if isinstance(envelope.get("final"), str):
             reply = envelope["final"].strip() or _fallback_summary(observations)
             _emit(progress, "final", "", iterations)
-            return _result(db, baseline_pending, reply, iterations)
+            return _result(db, own_actions, reply, iterations)
         call = envelope.get("tool_call")
         if not isinstance(call, dict):
             transcript.append(
@@ -203,14 +220,14 @@ async def run_ceo_ask(
                 )
                 continue
             used_write_calls.add(key)
-        observation = ceo_tools.run_tool(db, name, args)
+        observation = ceo_tools.run_tool(db, name, args, own_actions)
         observations.append(observation)
         transcript.append(f"[tool_observation] {observation}")
         _emit(progress, "tool", str(name), iterations)
 
     _emit(progress, "final", "limit", iterations)
     return _result(
-        db, baseline_pending,
+        db, own_actions,
         _fallback_summary(observations) + " (Reached the reasoning limit; partial answer.)",
         iterations,
     )
@@ -226,11 +243,14 @@ def _fallback_summary(observations: List[str]) -> str:
 async def run_ceo_fast(
     question: str,
     model_id: str,
-    provider_id: str = "opencode",
+    provider_id: str,
     variant: Optional[str] = None,
     runtime=None,
     timeout: int = 60,
     history: Optional[List[Dict[str, Any]]] = None,
+    thread_id: Optional[str] = None,
+    *,
+    engine: str,
 ) -> Dict[str, Any]:
     """Single-call plain-text path for small talk.
 
@@ -244,14 +264,16 @@ async def run_ceo_fast(
     if not question:
         raise ValueError("Empty question.")
     # PR6: one stable smalltalk thread — the GM remembers previous greetings.
+    agent_id, session_title = _lane(
+        f"{CEO_FAST_THREAD_TITLE}-{thread_id}" if thread_id else CEO_FAST_THREAD_TITLE, engine)
     res = await run_agent_task(runtime, ExecuteAgentTask(
         prompt=build_fast_system_prompt(question, history)[: settings.MISSION_MAX_PROMPT_CHARS],
         model_id=model_id,
         provider_id=provider_id,
         variant=variant,
-        session_title="ceo-fast-gm",
+        session_title=session_title,
         timeout=timeout,
-        agent_id=settings.CHAT_AGENT_ID,
+        agent_id=agent_id,
     ), kind=KIND_CEO_ASK_FAST)
     reply = sanitize_model_output(res.text or "").strip()
     # Unwrap harmless JSON wrappers without ever re-encoding.
@@ -267,10 +289,10 @@ async def run_ceo_fast(
     return {"reply": reply[:2000], "actions_proposed": [], "iterations": 1}
 
 
-def _result(db: Database, baseline_pending: set, reply: str, iterations: int) -> Dict[str, Any]:
+def _result(db: Database, own_actions: List[str], reply: str, iterations: int) -> Dict[str, Any]:
     fresh = db.all("SELECT id, kind, summary FROM pending_actions WHERE status='pending'")
     proposed = [
         {"id": a["id"], "kind": a["kind"], "summary": a["summary"]}
-        for a in fresh if a["id"] not in baseline_pending
+        for a in fresh if a["id"] in own_actions
     ]
     return {"reply": reply, "actions_proposed": proposed, "iterations": iterations}

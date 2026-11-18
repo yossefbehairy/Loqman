@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+from backend.pyworker.runtime import child_env
+
 from backend.pyworker.runtime import agy_acp_runtime as ac
 from backend.pyworker.runtime.agy_acp_runtime import AgyAcpRuntime, RuntimeUnsupported
 from backend.pyworker.runtime.base import ExecuteAgentTask
@@ -174,6 +176,8 @@ def fake(tmp_path, monkeypatch):
     script.write_text(FAKE, encoding="utf-8")
     log = tmp_path / "log.jsonl"
     monkeypatch.setenv("FAKE_LOG", str(log))
+    # The child env is an allowlist (S2); let only the fake CLI's own control vars through.
+    monkeypatch.setattr(child_env, "_NAMES", child_env._NAMES | {"FAKE_LOG", "FAKE_MODE", "PYTHONUTF8"})
     monkeypatch.setenv("GEMINI_API_KEY", "key-should-be-stripped")
     monkeypatch.setenv("AGENTOS_LOCAL_TOKEN", "tok-should-be-stripped")
     monkeypatch.setattr(ac, "MIN_TASK_TIMEOUT", 1)
@@ -195,7 +199,7 @@ def fake(tmp_path, monkeypatch):
 
 
 def task(**kw):
-    base = dict(prompt="ping", model_id="claude-sonnet-4-6", session_title="t1", timeout=30)
+    base = dict(prompt="ping", model_id="claude-sonnet-4-6", provider_id="antigravity", session_title="t1", timeout=30)
     base.update(kw)
     return ExecuteAgentTask(**base)
 
