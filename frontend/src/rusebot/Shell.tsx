@@ -14,7 +14,7 @@ import { ResultsView } from './components/ResultsView';
 import { SettingsModal, type PageId } from './components/SettingsModal';
 import { NewAgentDialog } from './components/NewAgentDialog';
 import { useChat, useEngines, messageOf } from './state/useChat';
-import { agentOf, useCompany } from './state/useCompany';
+import { useCompany } from './state/useCompany';
 import {
   approveCeoAction,
   ceoActionOutcome,
@@ -30,6 +30,7 @@ import { useMediaQuery, SIDEBAR_AND_PANEL_FIT } from './lib/use-media-query';
 import type { Agent } from './types';
 import type { ApiError } from '../api/transport';
 import type { DecideResult } from './components/ApprovalCard';
+import { useProfilePhoto } from './state/useProfilePhoto';
 
 const KEY_NAME = 'agentos.rusebot.userName.v1';
 const KEY_RAIL = 'agentos.rusebot.rail.v1';
@@ -43,6 +44,7 @@ function readText(key: string, fallback: string): string {
 }
 
 export function Shell() {
+  const profilePhoto = useProfilePhoto();
   const engines = useEngines();
   const company = useCompany();
   const reloadAgents = company.reload;
@@ -214,6 +216,7 @@ export function Shell() {
           needsYou={needsYou}
           onNeedsYou={() => goView('results')}
           userName={userName}
+          userPhoto={profilePhoto.url}
           previews={previews}
         />
         {view === 'chat' && (
@@ -232,6 +235,7 @@ export function Shell() {
         {(view === 'team' || view === 'contracts') && (
           <TeamView
             mode={view}
+            loaded={company.loaded}
             teams={company.teams}
             agents={company.agents}
             profiles={profiles}
@@ -281,16 +285,15 @@ export function Shell() {
       {newAgent && (
         <NewAgentDialog
           onClose={() => setNewAgent(false)}
-          onCreated={async (profile) => {
+          onCreated={async () => {
             setNewAgent(false);
-            await company.reload();
-            await chat.openAgentChat(agentOf(profile)).catch(() => undefined);
-            goView('chat');
+            await Promise.all([company.reload(), refreshCompany()]);
           }}
         />
       )}
       {settings && (
         <SettingsModal
+          profilePhoto={profilePhoto}
           initialPage={settings}
           onClose={() => setSettings(null)}
           userName={userName}

@@ -5,11 +5,10 @@
  * centred transcript column, message bubbles, copy action, working dots and
  * the floating composer dock. Messages, runs and approvals arrive as props.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Check, Copy, Cpu, X } from 'lucide-react';
 import { CEO_PROFILE_ID } from '../data/worker';
 import { cn } from '../lib/cn';
-import { useComposerDockPad } from '../lib/composer-dock';
 import { userBubbleStyle } from '../lib/user-bubble-tone';
 import { GlassBar, GlassScrollFrame } from './GlassScrollFrame';
 import { ChatMarkdown } from './ChatMarkdown';
@@ -212,18 +211,32 @@ export function ChatView({
   /** False until the conversation list and the agents are loaded, so the remembered chat is not shown as Loqman first. */
   ready?: boolean;
 }) {
-  const dockRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const dock = useComposerDockPad(dockRef);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const scrollState = useRef({ followTail: true, top: 0, maxScroll: 0 });
   const ASSISTANT_NAME = ready ? (agent?.name ?? FALLBACK_NAME) : '';
   const running = Boolean(chat.run && (chat.run.status === 'queued' || chat.run.status === 'running'));
   const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? 'New chat');
 
-  const lastKey = `${chat.messages.length}:${chat.pendingUser ?? ''}:${running}:${legacyThread?.turns.length ?? 0}`;
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [lastKey, chat.selectedId]);
+  useLayoutEffect(() => {
+    const viewport = scrollRef.current!;
+    const transcript = transcriptRef.current!;
+    // Each conversation opens at its latest message, including after its history loads.
+    scrollState.current.followTail = true;
+    const keepLatestInView = () => {
+      if (!scrollState.current.followTail) return;
+      const maxScroll = viewport.scrollHeight - viewport.clientHeight;
+      viewport.scrollTop = maxScroll;
+      scrollState.current = { followTail: true, top: viewport.scrollTop, maxScroll };
+    };
+    keepLatestInView();
+    // Observe both the content (including streaming Markdown) and the space
+    // available for it (including composer growth and window resizing).
+    const observer = new ResizeObserver(keepLatestInView);
+    observer.observe(viewport);
+    observer.observe(transcript);
+    return () => observer.disconnect();
+  }, [chat.selectedId]);
 
   // A chat runs on the provider and model picked in the composer; the model saved on the agent is used for delegated tasks.
   const choice = engines.choice;
@@ -232,12 +245,6 @@ export function ChatView({
   const overridden = Boolean(choice && savedModel && savedModel !== choice.model);
 
   const live = hasLiveContent(chat.live) ? chat.live : null;
-  const liveSize = live ? live.items.reduce((n, i) => n + i.text.length + 1, 0) : 0;
-  const stick = useRef(true);
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [liveSize]);
 
   const runApprovals = useMemo(
     () => chat.approvals.filter((a) => chat.run && a.run_id === chat.run.runId),
@@ -276,7 +283,7 @@ export function ChatView({
 
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
-      <GlassScrollFrame className="flex-1 [--glass-tint:var(--color-app)]">
+      <GlassScrollFrame className="flex flex-1 flex-col [--glass-tint:var(--color-app)]">
         <GlassBar edge="top" className="z-[25]">
           <div className="@container/chathead px-5 py-3 pl-11 md:pl-5">
             <div
@@ -340,15 +347,22 @@ export function ChatView({
         </GlassBar>
 
         <div
+          key={chat.selectedId ?? 'new-chat'}
           ref={scrollRef}
           onScroll={(e) => {
             const el = e.currentTarget;
-            stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+            const { scrollTop: top, scrollHeight, clientHeight } = el;
+            const maxScroll = scrollHeight - clientHeight;
+            const previous = scrollState.current;
+            // A resize or content update can move the browser's scroll anchor
+            // before ResizeObserver runs. Keep following through that reflow.
+            if (top === previous.top || (previous.followTail && maxScroll !== previous.maxScroll)) return;
+            scrollState.current = { top, maxScroll, followTail: maxScroll - top <= 2 };
           }}
-          className="glass-scroller h-full overflow-x-hidden overflow-y-auto overscroll-y-contain px-5 [overflow-anchor:none]">
+          className="glass-scroller min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain px-5">
           <div
-            className="glass-scroller-content chat-column relative flex w-full flex-col gap-3"
-            style={{ paddingBottom: dock.pad }}
+            ref={transcriptRef}
+            className="chat-column relative flex w-full flex-col gap-3 pt-[var(--glass-top,0px)] pb-3"
             role="log"
             aria-live="off"
             aria-label={`Conversation with ${ASSISTANT_NAME}`}
@@ -409,7 +423,7 @@ export function ChatView({
           {running ? 'Working' : ''}
         </p>
 
-        <div ref={dockRef} className="pointer-events-none absolute inset-x-0 bottom-0 z-[2] chat-column-dock">
+        <div className="chat-column-dock relative z-[2] w-full shrink-0">
           <div className="pointer-events-none relative px-5 pb-3">
             <div className="pointer-events-auto">
               <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} onRetry={chat.retry} />

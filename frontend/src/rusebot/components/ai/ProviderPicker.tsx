@@ -2,10 +2,8 @@
 import { useEffect, useRef } from 'react';
 import { cn } from '../../lib/cn';
 import { defaultModelFor, loadProviderModels, useProviders, type EngineChoice } from '../../state/useProviders';
+import { SettingsSelect } from './SettingsSelect';
 import { STATE_SHORT, selectable } from '../../state/providerText';
-
-export const PICKER_SELECT =
-  'w-full min-w-0 cursor-pointer rounded-lg border border-hairline/40 bg-inset py-2 pl-3 pr-3 text-[13px] text-ink focus:outline-none focus:ring-1 focus:ring-focus disabled:cursor-default disabled:opacity-60';
 
 /** Provider select + model select. `value` / `onChange` default to nothing: callers pass the choice they edit. */
 export function ProviderPicker({
@@ -50,55 +48,39 @@ export function ProviderPicker({
         <label htmlFor={`${idPrefix}-engine`} className="mb-1 block text-[12px] font-medium text-ink-secondary">
           Provider
         </label>
-        <select
+        <SettingsSelect
           id={`${idPrefix}-engine`}
           value={engine}
           disabled={s.selectable.length === 0}
-          onChange={(e) => void pickEngine(e.target.value)}
-          className={PICKER_SELECT}
-        >
-          {s.selectable.length === 0 && <option value="">{s.loading ? 'Loading…' : 'No providers found'}</option>}
-          {s.selectable.length > 0 && !engine && (
-            <option value="" disabled>
-              {s.loading ? 'Loading…' : 'Choose a provider'}
-            </option>
-          )}
-          {s.selectable.map((e) => {
-            const usable = e.id === 'mock' || selectable(e.state);
-            return (
-              <option key={e.id} value={e.id} disabled={!usable}>
-                {e.title}
-                {e.state !== 'ready' && e.id !== 'mock' ? ` (${STATE_SHORT[e.state]})` : ''}
-              </option>
-            );
-          })}
-        </select>
+          onValueChange={(id) => void pickEngine(id)}
+          options={[
+            ...(s.selectable.length === 0 ? [{ value: '', label: s.loading ? 'Loading…' : 'No providers found' }] : []),
+            ...(s.selectable.length > 0 && !engine ? [{ value: '', label: s.loading ? 'Loading…' : 'Choose a provider', disabled: true }] : []),
+            ...s.selectable.map(e => ({
+              value: e.id,
+              label: e.title + (e.state !== 'ready' && e.id !== 'mock' ? ` (${STATE_SHORT[e.state]})` : ''),
+              disabled: !(e.id === 'mock' || selectable(e.state)),
+            })),
+          ]}
+        />
       </div>
       <div className="min-w-0">
         <label htmlFor={`${idPrefix}-model`} className="mb-1 block text-[12px] font-medium text-ink-secondary">
           Model
         </label>
-        <select
+        <SettingsSelect
           id={`${idPrefix}-model`}
           value={value?.model ?? ''}
           disabled={!value || slot?.status !== 'ready' || models.length === 0}
-          onChange={(e) => pickModel(e.target.value)}
-          className={PICKER_SELECT}
-        >
-          {(!slot || slot.status === 'loading') && <option value="">Loading models…</option>}
-          {slot?.status === 'error' && <option value="">Could not load models</option>}
-          {slot?.status === 'ready' && models.length === 0 && <option value="">No models</option>}
-          {modelMissing && value && (
-            <option value={value.model} disabled>
-              {value.model}
-            </option>
-          )}
-          {models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.name}
-            </option>
-          ))}
-        </select>
+          onValueChange={pickModel}
+          options={[
+            ...(!slot || slot.status === 'loading' ? [{ value: '', label: 'Loading models…' }] : []),
+            ...(slot?.status === 'error' ? [{ value: '', label: 'Could not load models' }] : []),
+            ...(slot?.status === 'ready' && models.length === 0 ? [{ value: '', label: 'No models' }] : []),
+            ...(modelMissing && value ? [{ value: value.model, label: value.model, disabled: true }] : []),
+            ...models.map(m => ({ value: m.id, label: m.name })),
+          ]}
+        />
       </div>
     </div>
   );

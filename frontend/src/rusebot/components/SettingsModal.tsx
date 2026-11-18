@@ -8,15 +8,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { Download, Info, Palette, Search, Sparkles, User, X } from 'lucide-react';
 import { cn } from '../lib/cn';
-import { SKINS, applySkin, readSkin, type SkinId } from '../lib/skins';
-import { FONT_IDS, applyFont, readFont, type FontId } from '../lib/fonts';
-import { CHAT_WIDTH_IDS, applyChatWidth, readChatWidth, type ChatWidthId } from '../lib/chat-width';
+import { AppearanceSettings } from './AppearanceSettings';
 import { AiProviders } from './AiProviders';
+import { ProviderPicker } from './ai/ProviderPicker';
+import { SettingsSelect } from './ai/SettingsSelect';
+import { saveDefaultProvider, useProviders } from '../state/useProviders';
+import type { ProfilePhoto } from '../state/useProfilePhoto';
+import { UserAvatar } from './UserAvatar';
 
 export type PageId = 'general' | 'appearance' | 'ai' | 'about';
 const PAGES: Array<{ id: PageId; label: string; icon: typeof User; keywords?: string }> = [
-  { id: 'general', label: 'General', icon: User, keywords: 'profile name data backup export' },
-  { id: 'appearance', label: 'Appearance', icon: Palette, keywords: 'theme font chat width skin' },
+  { id: 'general', label: 'General', icon: User, keywords: 'profile photo avatar name default data backup export' },
+  { id: 'appearance', label: 'Appearance', icon: Palette, keywords: 'theme typography font text size chat width skin' },
   { id: 'ai', label: 'AI', icon: Sparkles, keywords: 'providers engines models accounts claude chatgpt codex opencode antigravity sign in' },
   { id: 'about', label: 'About', icon: Info },
 ];
@@ -27,22 +30,6 @@ function Card({ title, subtitle, children }: { title?: string; subtitle?: string
       {title && <div className="text-[15px] font-medium text-ink">{title}</div>}
       {subtitle && <div className={cn('text-[13px] leading-relaxed text-ink-secondary', title && 'mt-0.5')}>{subtitle}</div>}
       {children && <div className={title || subtitle ? 'mt-4' : undefined}>{children}</div>}
-    </div>
-  );
-}
-
-function Row({ id, title, subtitle, children }: { id: string; title: string; subtitle?: string; children: React.ReactNode }) {
-  return (
-    <div role="group" aria-labelledby={id} className="px-4">
-      <div className="grid min-w-0 grid-cols-1 items-center gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:gap-6">
-        <div className="min-w-0">
-          <div id={id} className="text-[14px] font-medium text-ink">
-            {title}
-          </div>
-          {subtitle && <div className="mt-1 text-[12px] leading-relaxed text-ink-secondary">{subtitle}</div>}
-        </div>
-        <div className="min-w-0 sm:max-w-[240px]">{children}</div>
-      </div>
     </div>
   );
 }
@@ -96,7 +83,7 @@ function DataCard() {
   };
 
   return (
-    <Card title="Data" subtitle="A copy of your chats, agents and missions as one file you can keep somewhere safe.">
+    <Card title="Data & backup" subtitle="A copy of your chats, agents and missions as one file you can keep somewhere safe.">
       <div className="flex flex-col items-start gap-2">
         <button type="button" data-backup-button disabled={!available || state.kind === 'running'} onClick={() => void run()} className="ui-button ui-button-md">
           <Download size={13} aria-hidden="true" />
@@ -124,25 +111,23 @@ function DataCard() {
   );
 }
 
-const SELECT =
-  'w-full min-w-0 cursor-pointer rounded-lg border border-hairline/40 bg-inset py-2 pl-3 pr-3 text-[13px] text-ink focus:outline-none focus:ring-1 focus:ring-focus';
-
 export function SettingsModal({
   onClose,
   userName,
   onUserName,
+  profilePhoto,
   initialPage = 'general',
 }: {
   onClose: () => void;
   initialPage?: PageId;
   userName: string;
   onUserName: (name: string) => void;
+  profilePhoto: ProfilePhoto;
 }) {
+  const providers = useProviders();
+  const photoInput = useRef<HTMLInputElement>(null);
   const [page, setPage] = useState<PageId>(initialPage);
   const [search, setSearch] = useState('');
-  const [skin, setSkin] = useState<SkinId>(() => readSkin());
-  const [font, setFont] = useState<FontId>(() => readFont());
-  const [width, setWidth] = useState<ChatWidthId>(() => readChatWidth());
   const dialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -205,18 +190,15 @@ export function SettingsModal({
         </nav>
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="flex shrink-0 items-center justify-between gap-3 border-b border-hairline/30 px-3 py-3 sm:pl-9">
-            <select
-              aria-label="Settings page"
-              value={page}
-              onChange={(e) => setPage(e.target.value as PageId)}
-              className={cn(SELECT, 'sm:hidden')}
-            >
-              {PAGES.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
+            <div className="min-w-0 flex-1 sm:hidden">
+              <SettingsSelect
+                id="settings-page"
+                aria-label="Settings page"
+                value={page}
+                onValueChange={(value) => setPage(value as PageId)}
+                options={PAGES.map(p => ({ value: p.id, label: p.label }))}
+              />
+            </div>
             <span className="hidden text-[15px] font-semibold text-ink sm:block">{current.label}</span>
             <button aria-label="Close settings" title="Close settings (Esc)" onClick={onClose} className="ui-icon-button shrink-0 cursor-pointer">
               <X size={16} />
@@ -225,76 +207,49 @@ export function SettingsModal({
           <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-4 sm:px-5 sm:pb-5">
             {page === 'general' && (
               <section data-settings-block="general" className="flex flex-col gap-4">
-                <Card title="Profile" subtitle="Your name as it appears in the sidebar. Saved on this device.">
-                  <input
-                    aria-label="Your name"
-                    placeholder="Your name"
-                    value={userName}
-                    onChange={(e) => onUserName(e.target.value)}
-                    className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
-                  />
+                <Card title="Profile">
+                  <div className="flex min-w-0 flex-col gap-4 sm:flex-row sm:items-center sm:gap-6">
+                    <div className="flex shrink-0 justify-center sm:w-32">
+                      <UserAvatar name={userName} photo={profilePhoto.url} large />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <label htmlFor="settings-display-name" className="mb-1 block text-[13px] font-medium text-ink-secondary">Display Name</label>
+                      <input
+                        id="settings-display-name"
+                        aria-label="Your name"
+                        placeholder="Your name"
+                        value={userName}
+                        onChange={(e) => onUserName(e.target.value)}
+                        className="w-full rounded-lg border border-hairline/40 bg-inset px-3 py-2 text-[14px] text-ink placeholder:text-ink-secondary focus:outline-none"
+                      />
+                      <p className="mt-2 text-[13px] leading-relaxed text-ink-secondary">Your name as it appears in the sidebar. Saved on this device.</p>
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap items-center gap-3">
+                    <input ref={photoInput} type="file" accept="image/png,image/jpeg,image/webp" aria-label="Choose profile photo" aria-describedby={profilePhoto.error ? 'profile-photo-help profile-photo-error' : 'profile-photo-help'} className="hidden" onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      e.target.value = '';
+                      if (file) void profilePhoto.change(file);
+                    }} />
+                    <button type="button" className="ui-button ui-button-md" disabled={profilePhoto.busy} aria-describedby={profilePhoto.error ? 'profile-photo-help profile-photo-error' : 'profile-photo-help'} onClick={() => photoInput.current?.click()}>
+                      Change photo
+                    </button>
+                    {profilePhoto.url && <button type="button" className="ui-button ui-button-md profile-photo-remove" disabled={profilePhoto.busy} onClick={() => void profilePhoto.change(null)}>Remove photo</button>}
+                    {profilePhoto.busy && <span role="status" className="text-[12px] text-ink-secondary">Updating photo…</span>}
+                  </div>
+                  <p id="profile-photo-help" className="mt-2 text-[12px] leading-relaxed text-ink-secondary">PNG, JPEG or WebP, up to 10 MB. Photo stays in this browser or desktop app; it is not synced or included in backups.</p>
+                  {profilePhoto.error && <p id="profile-photo-error" role="alert" className="mt-2 text-[12px] text-danger">{profilePhoto.error}</p>}
+                </Card>
+                <Card title="Default for new chats" subtitle="Used by the chat box, by Loqman, for missions and as the starting point for new agents. You can still change it per chat.">
+                  <div data-providers-default>
+                    <ProviderPicker idPrefix="ai-default" value={providers.choice} onChange={(next) => void saveDefaultProvider(next)} />
+                    {providers.defaultError && <p role="alert" className="mt-2 text-[12px] text-danger">Could not save the default. {providers.defaultError}</p>}
+                  </div>
                 </Card>
                 <DataCard />
               </section>
             )}
-            {page === 'appearance' && (
-              <section data-settings-block="appearance" className="flex flex-col gap-4">
-                <Row id="rb-skin" title="Theme" subtitle={SKINS.find((s) => s.id === skin)?.tagline}>
-                  <select
-                    aria-label="Theme"
-                    value={skin}
-                    onChange={(e) => {
-                      const next = e.target.value as SkinId;
-                      applySkin(next);
-                      setSkin(next);
-                    }}
-                    className={SELECT}
-                  >
-                    {SKINS.map((s) => (
-                      <option key={s.id} value={s.id}>
-                        {s.name}
-                      </option>
-                    ))}
-                  </select>
-                </Row>
-                <Row id="rb-font" title="Font" subtitle="Follow the theme or pick a typeface.">
-                  <select
-                    aria-label="Font"
-                    value={font}
-                    onChange={(e) => {
-                      const next = e.target.value as FontId;
-                      applyFont(next);
-                      setFont(next);
-                    }}
-                    className={SELECT}
-                  >
-                    {FONT_IDS.map((f) => (
-                      <option key={f} value={f}>
-                        {f === 'skin' ? 'Theme default' : f.charAt(0).toUpperCase() + f.slice(1)}
-                      </option>
-                    ))}
-                  </select>
-                </Row>
-                <Row id="rb-width" title="Chat width" subtitle="How wide the conversation column grows.">
-                  <select
-                    aria-label="Chat width"
-                    value={width}
-                    onChange={(e) => {
-                      const next = e.target.value as ChatWidthId;
-                      applyChatWidth(next);
-                      setWidth(next);
-                    }}
-                    className={SELECT}
-                  >
-                    {CHAT_WIDTH_IDS.map((w) => (
-                      <option key={w} value={w}>
-                        {w.charAt(0).toUpperCase() + w.slice(1)}
-                      </option>
-                    ))}
-                  </select>
-                </Row>
-              </section>
-            )}
+            {page === 'appearance' && <AppearanceSettings />}
             {page === 'ai' && <AiProviders />}
             {page === 'about' && (
               <section data-settings-block="about" className="flex flex-col gap-4">

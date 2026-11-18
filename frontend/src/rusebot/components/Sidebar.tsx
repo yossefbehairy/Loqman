@@ -9,6 +9,7 @@ import { ChevronLeft, ChevronRight, FileText, Loader2, MessageSquarePlus, Packag
 import { cn } from '../lib/cn';
 import { GlassBar, GlassScrollFrame, GlassScroller } from './GlassScrollFrame';
 import { AgentAvatar } from './AgentAvatar';
+import { UserAvatar } from './UserAvatar';
 import { CEO_PROFILE_ID, type Conversation } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
@@ -87,6 +88,7 @@ export interface SidebarProps {
   needsYou: number;
   onNeedsYou: () => void;
   userName: string;
+  userPhoto: string | null;
   previews: Record<string, string>;
 }
 
@@ -429,9 +431,7 @@ export function Sidebar(props: SidebarProps) {
                     <Settings size={18} className="text-ink-secondary" />
                   ) : (
                     <span className="flex min-h-[46px] w-full items-center gap-3 rounded-xl px-3 py-2 text-left transition-colors hover:bg-raised/50">
-                      <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-raised text-[13px] font-medium text-ink-secondary">
-                        {props.userName.trim().charAt(0).toUpperCase() || '?'}
-                      </span>
+                      <UserAvatar name={props.userName} photo={props.userPhoto} />
                       <span className="min-w-0 flex-1 truncate text-[14px] font-medium leading-5 text-ink">{props.userName}</span>
                     </span>
                   )}
