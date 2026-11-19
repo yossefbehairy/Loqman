@@ -23,8 +23,6 @@ import type { Conversation } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
 
-const FALLBACK_NAME = 'Loqman';
-
 function WorkingDots({ size = 4, className }: { size?: number; className?: string }) {
   return (
     <span className={cn('flex items-center gap-1', className)} aria-hidden="true">
@@ -214,9 +212,11 @@ export function ChatView({
   const scrollRef = useRef<HTMLDivElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const scrollState = useRef({ followTail: true, top: 0, maxScroll: 0 });
-  const ASSISTANT_NAME = ready ? (agent?.name ?? FALLBACK_NAME) : '';
+  const unknownRecipient = chat.selectedAgentId === null;
+  const fallbackName = unknownRecipient ? 'Recipient unavailable' : chat.selectedAgentId === CEO_PROFILE_ID ? 'Loqman' : 'Specialist';
+  const ASSISTANT_NAME = ready ? (agent?.name ?? fallbackName) : '';
   const running = Boolean(chat.run && (chat.run.status === 'queued' || chat.run.status === 'running'));
-  const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? 'New chat');
+  const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? (unknownRecipient ? 'Saved conversation' : 'New chat'));
 
   useLayoutEffect(() => {
     const viewport = scrollRef.current!;
@@ -298,8 +298,8 @@ export function ChatView({
                   type="button"
                   data-chathead-pill="true"
                   data-tour="bot-pill"
-                  title={`${ASSISTANT_NAME} in the team`}
-                  aria-label={`Open ${ASSISTANT_NAME}'s team`}
+                  title={agent ? `${ASSISTANT_NAME} in the team` : 'Open team'}
+                  aria-label={agent ? `Open ${ASSISTANT_NAME}'s team` : 'Open team'}
                   onClick={onOpenProfile}
                   className="group flex h-9 min-w-0 items-center gap-2.5 rounded-full border border-hairline/40 bg-control/60 py-0.5 pl-2 pr-3.5 text-ink hover:bg-raised-hover"
                 >
@@ -392,7 +392,9 @@ export function ChatView({
                   </div>
                 )}
                 {ready && !chat.threadError && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
-                  <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description="Send a message to start the conversation." />
+                  <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description={unknownRecipient
+                    ? 'Sending is paused until the chat list includes this conversation.'
+                    : 'Send a message to start the conversation.'} />
                 )}
                 {rows}
                 {chat.pendingUser && !chat.messages.some((m) => m.role === 'user' && m.content === chat.pendingUser) && (
@@ -431,7 +433,7 @@ export function ChatView({
             <div className="pointer-events-auto relative w-full">
               <div className="relative">
                 <Composer
-                  placeholder={ready ? `Message ${ASSISTANT_NAME}` : 'Loading…'}
+                  placeholder={!ready ? 'Loading…' : unknownRecipient ? 'Recipient unavailable' : `Message ${ASSISTANT_NAME}`}
                   value={chat.draft}
                   onChange={chat.setDraft}
                   onSend={chat.send}
@@ -440,7 +442,7 @@ export function ChatView({
                   stopping={chat.stopping}
                   running={running}
                   sending={chat.sending}
-                  disabled={engines.loading || !ready}
+                  disabled={engines.loading || !ready || unknownRecipient}
                   engines={engines}
                   onNewAgent={onNewAgent}
                   onManageProviders={onManageProviders}

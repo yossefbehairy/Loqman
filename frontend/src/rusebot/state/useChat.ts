@@ -183,6 +183,7 @@ export interface ChatState {
   downloadDraft: (draft: Draft) => Promise<void>;
   loaded: boolean;
   activeRunIds: Record<string, string>;
+  selectedAgentId: string | null;
   agentFor: (conversationId: string | null) => Agent | null;
   openAgentChat: (agent: Agent) => Promise<string>;
   reloadConversations: () => Promise<void>;
@@ -191,21 +192,6 @@ export interface ChatState {
 
 export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-/**
- * The agent a chat belongs to. The conversation's own profile_id (stored in SQLite by the worker) decides; the
- * browser-side map only covers chats made before conversations were bound, and Loqman is the last resort.
- */
-export function resolveAgent(
-  profileId: string | null | undefined,
-  mappedId: string | null | undefined,
-  agents: Agent[],
-  ceo: Agent | null
-): Agent | null {
-  const bound = profileId ? agents.find((a) => a.id === profileId) : undefined;
-  const mapped = mappedId ? agents.find((a) => a.id === mappedId) : undefined;
-  return bound ?? mapped ?? ceo;
 }
 
 interface SendAttempt {
@@ -426,21 +412,25 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   const [agentMap, setAgentMap] = useState<Record<string, string>>(() => readJson(KEY_AGENTS, {}));
   const agentMapRef = useRef(agentMap);
   agentMapRef.current = agentMap;
-  const ceo = useMemo(() => agents.find((a) => a.mgr && !a.team) ?? agents[0] ?? null, [agents]);
   const bindAgent = useCallback((cid: string, agentId: string) => {
     const next = { ...agentMapRef.current, [cid]: agentId };
     agentMapRef.current = next;
     setAgentMap(next);
     writeJson(KEY_AGENTS, next);
   }, []);
-  const agentFor = useCallback(
-    (cid: string | null) =>
-      cid
-        ? resolveAgent(conversations.find((c) => c.id === cid)?.profile_id, agentMap[cid], agents, ceo)
-        : (agents.find((a) => a.id === draftAgentId) ?? ceo),
-    [agents, agentMap, ceo, draftAgentId, conversations]
-  );
-  const selectedOwnerKey = chatOwnerKey(selectedId, agentFor(null)?.id ?? CEO_PROFILE_ID);
+  const newChatAgentId = draftAgentId ?? CEO_PROFILE_ID;
+  const recipientIdFor = useCallback((cid: string | null) => {
+    if (cid === null) return newChatAgentId;
+    if (cid.startsWith('legacy:')) return legacy.some((t) => `legacy:${t.id}` === cid) ? CEO_PROFILE_ID : null;
+    const row = conversations.find((c) => c.id === cid);
+    // Only a known, unbound row can use the browser's legacy recipient hint.
+    return row ? (row.profile_id ?? agentMap[cid] ?? CEO_PROFILE_ID) : null;
+  }, [newChatAgentId, legacy, conversations, agentMap]);
+  const agentFor = useCallback((cid: string | null) => {
+    const id = recipientIdFor(cid);
+    return agents.find((a) => a.id === id) ?? null;
+  }, [agents, recipientIdFor]);
+  const selectedOwnerKey = chatOwnerKey(selectedId, newChatAgentId);
   const streams = useRef(new Map<string, StreamHandle>());
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -732,11 +722,6 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         );
         return;
       }
-      const agent = agents.find((a) => a.id === agentId);
-      if (!agent && agentId !== CEO_PROFILE_ID) {
-        raise(errorOwner, 'The original agent is no longer available.');
-        return;
-      }
       clearError(errorOwner);
       const lock = Symbol();
       const locks = new Map(sending.current).set(key, lock);
@@ -802,7 +787,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           cid = created.id;
           boundProfile = created.profile_id;
           setConversations((prev) => (prev.some((chat) => chat.id === created.id) ? prev : [created, ...prev]));
-          if (agent) bindAgent(cid, agentId);
+          bindAgent(cid, agentId);
           if (sending.current.has(cid)) {
             // The destination has its own send. Offer an explicit Retry at the source, targeting the created ID.
             retainedSourceKey = sourceKey;
@@ -854,7 +839,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
             return next;
           });
         };
-        if (!agent || agent.id === CEO_PROFILE_ID) {
+        if (agentId === CEO_PROFILE_ID) {
           // Loqman (the CEO) answers through the CEO loop, which is the path that can create agents.
           const ticket = requestId;
           if (attempt.requestId && attempt.cid === chatId) {
@@ -931,10 +916,16 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         // worker applies the agent's instructions; only if that fails does the first message carry the contract.
         let outgoing = prompt;
         if (!boundProfile) {
-          const bound = await bindConversationProfile(chatId, agent.id).catch(() => null);
+          const agent = agents.find((a) => a.id === agentId);
+          const bound = await bindConversationProfile(chatId, agentId).catch((e: unknown) => {
+            // A confirmed binding conflict cannot use the legacy first-message contract.
+            if (!agent || (e instanceof ApiError && e.status === 409)) throw e;
+            return null;
+          });
           if (bound) {
             setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
-          } else if (agent.prompt && (await listMessages(chatId).catch(() => [{}])).length === 0) {
+            if (bound.profile_id !== agentId) throw new Error('The conversation is bound to a different agent.');
+          } else if (agent?.prompt && (await listMessages(chatId).catch(() => [{}])).length === 0) {
             outgoing = `${CONTRACT_OPEN}
 ${agent.prompt}
 ${CONTRACT_CLOSE}
@@ -977,7 +968,8 @@ ${prompt}`;
     const prompt = text.trim();
     if (!prompt) return Promise.resolve();
     const cid = selectedRef.current;
-    const agentId = agentFor(cid?.startsWith('legacy:') ? null : cid)?.id ?? CEO_PROFILE_ID;
+    const agentId = recipientIdFor(cid);
+    if (agentId === null) return Promise.resolve();
     const revision = draftRevisions.current.get(chatOwnerKey(cid, agentId));
     for (const [errorKey, entry] of Object.entries(errors)) {
       const action = entry.retry;
@@ -988,12 +980,12 @@ ${prompt}`;
       cid, prompt, agentId,
       draftRevision: revision,
     });
-  }, [agentFor, sendAttempt, errors]);
+  }, [recipientIdFor, sendAttempt, errors]);
 
   const openAgentChat = useCallback(
     async (agent: Agent) => {
       const existing = Object.entries(agentMapRef.current).find(
-        ([cid, id]) => id === agent.id && conversations.some((c) => c.id === cid)
+        ([cid, id]) => id === agent.id && conversations.some((c) => c.id === cid && (c.profile_id ?? id) === agent.id)
       )?.[0];
       if (existing) {
         select(existing);
@@ -1104,7 +1096,7 @@ ${prompt}`;
 
   const messages = thread.cid !== null && thread.cid === selectedId ? thread.list : NO_MESSAGES;
   const runsBySeq = runsThread.cid !== null && runsThread.cid === selectedId ? runsThread.map : NO_RUNS;
-  const selectedAgentId = agentFor(selectedId)?.id;
+  const selectedAgentId = recipientIdFor(selectedId);
   const submissionKey = Object.keys(errors).reverse().find((key) => {
     const action = errors[key].retry;
     return key.startsWith(SUBMISSION_PREFIX) && action !== null && typeof action === 'object' && action.agentId === selectedAgentId &&
@@ -1176,7 +1168,7 @@ ${prompt}`;
     send,
     stop,
     newChat: () => {
-      const current = agentFor(selectedRef.current)?.id ?? null;
+      const current = recipientIdFor(selectedRef.current);
       select(null);
       setDraftAgentId(current);
     },
@@ -1186,6 +1178,7 @@ ${prompt}`;
     downloadDraft,
     loaded,
     activeRunIds,
+    selectedAgentId,
     agentFor,
     openAgentChat,
     reloadConversations: refreshConversations,
