@@ -439,6 +439,7 @@ export function ChatView({
                   canStop={chat.canStop}
                   stopping={chat.stopping}
                   running={running}
+                  sending={chat.sending}
                   disabled={engines.loading || !ready}
                   engines={engines}
                   onNewAgent={onNewAgent}

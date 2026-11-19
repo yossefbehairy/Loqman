@@ -32,7 +32,7 @@ import {
   type EngineStatus,
   type RunSnapshot,
 } from '../data/worker';
-import type { StreamHandle } from '../../api/transport';
+import { ApiError, type StreamHandle } from '../../api/transport';
 import { emptyLive, freezeLive, hasLiveContent, reduceLive, type LiveTurn } from './liveTurn';
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
 import type { Agent } from '../types';
@@ -45,6 +45,8 @@ import {
 } from './useProviders';
 
 const KEY_DRAFTS = 'agentos.rusebot.drafts.v1';
+const CEO_SUBMISSION_PREFIX = 'ceo-submission:';
+const SUBMISSION_PREFIX = 'agentos.rusebot.submission.v1.';
 const KEY_RUNS = 'agentos.rusebot.runs.v1';
 const KEY_SELECTED = 'agentos.rusebot.selected.v1';
 const KEY_AGENTS = 'agentos.rusebot.convAgents.v1';
@@ -140,6 +142,7 @@ export interface RunState {
   runId: string;
   status: string;
   error: string | null;
+  hideSubmittedDraft?: boolean;
 }
 
 export interface ChatState {
@@ -166,6 +169,7 @@ export interface ChatState {
   retryThread: () => void;
   /** Stop was pressed and the worker has not confirmed yet. */
   stopping: boolean;
+  sending: boolean;
   /** The selected run can be cancelled (a Loqman answer cannot once it has started). */
   canStop: boolean;
   draft: string;
@@ -204,10 +208,66 @@ export function resolveAgent(
   return bound ?? mapped ?? ceo;
 }
 
+interface SendAttempt {
+  cid: string | null;
+  agentId: string;
+  prompt: string;
+  draftRevision: symbol | undefined;
+  createdCeoChat?: boolean;
+  requestId?: string;
+  deferredSource?: string;
+  /** Source draft kept when the created chat already has independent work. */
+  retainedSourceKey?: string;
+}
+
+interface SubmissionRecord {
+  cid: string | null;
+  agentId: string;
+  prompt: string;
+  requestId: string;
+  ownsDraft: boolean;
+  rejected?: boolean;
+  createdCeoChat?: boolean;
+  deferredSource?: string;
+}
+
+function readSubmissions(): Map<string, SubmissionRecord> {
+  const records = new Map<string, SubmissionRecord>();
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (!key.startsWith(SUBMISSION_PREFIX)) continue;
+      const record = readJson<Partial<SubmissionRecord> | null>(key, null);
+      if (!record || (record.cid !== null && (typeof record.cid !== 'string' || !record.cid)) || typeof record.agentId !== 'string' ||
+          !record.agentId || typeof record.prompt !== 'string' || !record.prompt.trim() ||
+          typeof record.ownsDraft !== 'boolean' || typeof record.requestId !== 'string' ||
+          key !== SUBMISSION_PREFIX + record.requestId ||
+          !/^(ui|ceo)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(record.requestId) ||
+          record.requestId.startsWith('ceo-') !== (record.agentId === CEO_PROFILE_ID) ||
+          (record.deferredSource !== undefined && record.deferredSource !== chatOwnerKey(null, record.agentId) &&
+            !(typeof record.deferredSource === 'string' && record.deferredSource.startsWith('legacy:')))) continue;
+      records.set(record.requestId, record as SubmissionRecord);
+    }
+  } catch { /* Storage unavailable. Live sends still use in-memory state. */ }
+  return records;
+}
+
+const deliveryWarning = 'Delivery was not confirmed. Check the conversation before retrying';
+const creationWarning = 'Conversation creation was not confirmed. Check your chat list before retrying';
+const rejectionNotice = 'The worker rejected this request';
+
+function needsConversation(cid: string | null): cid is null | `legacy:${string}` {
+  return cid === null || cid.startsWith('legacy:');
+}
+
+function chatOwnerKey(cid: string | null, agentId: string): string {
+  // The reserved CEO profile ID owns the unsaved Loqman slot.
+  return cid ?? `new:${agentId}`;
+}
+
 /** An error shown in the chat, with what "Retry" does about it. */
 interface ChatErrorEntry {
   message: string;
-  retry: 'send' | 'load' | null;
+  retry: SendAttempt | 'load' | null;
 }
 
 const NO_MESSAGES: ConvMessage[] = [];
@@ -297,11 +357,59 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   );
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
-  // Errors belong to the chat they happened in ('' = no chat open yet or the list itself); another chat never shows them.
-  const [errors, setErrors] = useState<Record<string, ChatErrorEntry>>({});
+  // Keep the legacy '' entry in storage for recovery. Its agent is unknown.
+  const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
+  const [submissions] = useState(readSubmissions);
+  const createdCeoSubmissions = useRef(new Map<string, SendAttempt>());
+  const forgetSubmission = useCallback((id: string) => {
+    const record = submissions.get(id);
+    submissions.delete(id);
+    try { localStorage.removeItem(SUBMISSION_PREFIX + id); } catch { /* storage unavailable */ }
+    if (!record?.createdCeoChat || !record.cid) return;
+    createdCeoSubmissions.current.delete(record.cid);
+    const compatibilityKey = CEO_SUBMISSION_PREFIX + record.cid;
+    setDraftMap((prev) => {
+      if (prev[compatibilityKey] !== record.prompt) return prev;
+      const next = { ...prev };
+      delete next[compatibilityKey];
+      writeJson(KEY_DRAFTS, next);
+      return next;
+    });
+  }, [submissions]);
+  const [errors, setErrors] = useState<Record<string, ChatErrorEntry>>(() => {
+    const recovered: Record<string, ChatErrorEntry> = {};
+    for (const [key, prompt] of Object.entries(draftMap)) {
+      if (!key.startsWith(CEO_SUBMISSION_PREFIX) || typeof prompt !== 'string' || !prompt.trim()) continue;
+      const cid = key.slice(CEO_SUBMISSION_PREFIX.length);
+      if ([...submissions.values()].some(record => record.cid === cid && record.createdCeoChat && record.prompt === prompt)) continue;
+      recovered[cid] = {
+        message: `${deliveryWarning}: ${prompt}`,
+        // The ordinary draft belongs to a separate edit, even if its text is identical.
+        retry: { cid, agentId: CEO_PROFILE_ID, prompt, draftRevision: Symbol(), createdCeoChat: true },
+      };
+    }
+    for (const record of submissions.values()) {
+      const owner = chatOwnerKey(record.cid, record.agentId);
+      const draft = draftMap[owner];
+      const notice = record.rejected === true ? rejectionNotice : needsConversation(record.cid) ? creationWarning : deliveryWarning;
+      recovered[SUBMISSION_PREFIX + record.requestId] = {
+        message: `${notice}: ${record.prompt}`,
+        retry: { ...record,
+          draftRevision: record.ownsDraft && typeof draft === 'string' && draft.trim() === record.prompt ? undefined : Symbol() },
+      };
+    }
+    return recovered;
+  });
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
   const [stoppingRuns, setStoppingRuns] = useState<Record<string, true>>({});
-  const failedSend = useRef<{ cid: string | null; prompt: string } | null>(null);
+  const [sendLocks, setSendLocks] = useState<ReadonlyMap<string, symbol>>(() => new Map());
+  const sending = useRef(sendLocks);
+  const publishLocks = useCallback((locks: Map<string, symbol>) => {
+    sending.current = locks;
+    setSendLocks(locks);
+  }, []);
+  const draftRevisions = useRef(new Map<string, symbol | undefined>());
+  const selectionRevision = useRef(0);
   const raise = useCallback((cid: string | null, message: string, retry: ChatErrorEntry['retry'] = null) => {
     setErrors((prev) => ({ ...prev, [cid ?? '']: { message, retry } }));
   }, []);
@@ -313,11 +421,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       return next;
     });
   }, []);
-  const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
   const [loaded, setLoaded] = useState(false);
   const [draftAgentId, setDraftAgentId] = useState<string | null>(null);
-  const draftAgentRef = useRef<string | null>(null);
-  draftAgentRef.current = draftAgentId;
   const [agentMap, setAgentMap] = useState<Record<string, string>>(() => readJson(KEY_AGENTS, {}));
   const agentMapRef = useRef(agentMap);
   agentMapRef.current = agentMap;
@@ -335,6 +440,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         : (agents.find((a) => a.id === draftAgentId) ?? ceo),
     [agents, agentMap, ceo, draftAgentId, conversations]
   );
+  const selectedOwnerKey = chatOwnerKey(selectedId, agentFor(null)?.id ?? CEO_PROFILE_ID);
   const streams = useRef(new Map<string, StreamHandle>());
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -383,6 +489,20 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     const list = await listMessages(conversationId);
     if (readSeq.current.get(conversationId) === ticket && selectedRef.current === conversationId) {
       setThread({ cid: conversationId, list });
+      // CEO replies carry the ask ID. A matching prompt alone cannot identify a submission.
+      for (const record of submissions.values()) {
+        if (record.cid !== conversationId || record.agentId !== CEO_PROFILE_ID || sending.current.has(conversationId) ||
+            !list.some((m) => m.role === 'assistant' && m.client_message_id === `ask:${record.requestId}:assistant`)) continue;
+        forgetSubmission(record.requestId);
+        clearError(SUBMISSION_PREFIX + record.requestId);
+        if (record.ownsDraft) setDraftMap((prev) => {
+          if (prev[conversationId]?.trim() !== record.prompt) return prev;
+          const next = { ...prev };
+          delete next[conversationId];
+          writeJson(KEY_DRAFTS, next);
+          return next;
+        });
+      }
     }
     // The worker knows this conversation's runs; the browser index is only a fallback when it is unreachable.
     let snaps: Array<RunSnapshot | null> | null = await listRuns(conversationId, 30).catch(() => null);
@@ -404,7 +524,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       setDrafts((prev) => ({ ...prev, ...nextDrafts }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
-  }, []);
+  }, [submissions, forgetSubmission, clearError]);
 
   const remember = (conversationId: string, runId: string) => {
     const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -552,6 +672,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   }, [anyActive]);
 
   const select = useCallback((id: string | null) => {
+    selectionRevision.current++;
+    selectedRef.current = id;
     setDraftAgentId(null);
     setSelectedId(id);
     writeJson(KEY_SELECTED, id);
@@ -560,80 +682,211 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
 
   const setDraft = useCallback(
     (text: string) => {
-      const key = selectedRef.current ?? '';
+      const key = selectedOwnerKey;
+      for (const record of submissions.values()) {
+        if (chatOwnerKey(record.cid, record.agentId) === key && record.ownsDraft) {
+          record.ownsDraft = false;
+          writeJson(SUBMISSION_PREFIX + record.requestId, record);
+        }
+      }
+      const submitted = createdCeoSubmissions.current.get(key);
+      draftRevisions.current.set(key, Symbol());
+      setRuns((prev) => prev[key]?.hideSubmittedDraft
+        ? { ...prev, [key]: { ...prev[key], hideSubmittedDraft: false } }
+        : prev);
       setDraftMap((prev) => {
         const next = { ...prev };
+        if (submitted) next[CEO_SUBMISSION_PREFIX + key] = submitted.prompt;
         if (text) next[key] = text;
         else delete next[key];
         writeJson(KEY_DRAFTS, next);
         return next;
       });
     },
-    []
+    [selectedOwnerKey, submissions]
   );
 
-  const send = useCallback(
-    async (text: string) => {
-      const prompt = text.trim();
-      if (!prompt) return;
+  const sendAttempt = useCallback(
+    async (attempt: SendAttempt, retryOwner?: string) => {
+      const { prompt, agentId, draftRevision } = attempt;
+      let { cid } = attempt;
+      let key = chatOwnerKey(cid, agentId);
+      const errorOwner = retryOwner ?? key;
+      let retainedSourceKey = attempt.retainedSourceKey;
+      const deferredSource = attempt.deferredSource;
+      let recoverySource = deferredSource;
+      const previous = createdCeoSubmissions.current.get(key);
+      // Pressing Send on the unchanged restored draft acknowledges the same submission as Retry.
+      const createdCeoChat = agentId === CEO_PROFILE_ID &&
+        (attempt.createdCeoChat || needsConversation(cid) ||
+          (previous?.prompt === prompt && previous.draftRevision === draftRevision));
+      if (sending.current.has(key) || (deferredSource && sending.current.has(deferredSource))) return;
       if (!engine?.model) {
-        raise(selectedRef.current, 'No AI provider is ready. Open Settings > AI to sign in or pick a model.');
+        raise(errorOwner, 'No AI provider is ready. Open Settings > AI to sign in or pick a model.', deferredSource || attempt.requestId ? attempt : null);
         return;
       }
-      let cid = selectedRef.current;
-      clearError(cid);
-      failedSend.current = null;
-      const draftKey = cid ?? '';
-      const known = cid && !cid.startsWith('legacy:') ? cid : null;
-      const target = known
-        ? resolveAgent(conversations.find((c) => c.id === known)?.profile_id, agentMapRef.current[known], agents, ceo)
-        : (agents.find((a) => a.id === draftAgentRef.current) ?? ceo);
-      if ((!target || target.id === CEO_PROFILE_ID) && prompt.length > CEO_MAX_CHARS) {
+      if (agentId === CEO_PROFILE_ID && prompt.length > CEO_MAX_CHARS) {
         raise(
-          cid,
+          errorOwner,
           `Loqman reads messages of up to ${CEO_MAX_CHARS.toLocaleString('en-US')} characters; this one has ${prompt.length.toLocaleString('en-US')}. Shorten it and send again.`
         );
         return;
       }
-      let boundProfile: string | null | undefined = cid ? conversations.find((c) => c.id === cid)?.profile_id : null;
-      const keepDraft = (key: string) =>
+      const agent = agents.find((a) => a.id === agentId);
+      if (!agent && agentId !== CEO_PROFILE_ID) {
+        raise(errorOwner, 'The original agent is no longer available.');
+        return;
+      }
+      clearError(errorOwner);
+      const lock = Symbol();
+      const locks = new Map(sending.current).set(key, lock);
+      if (deferredSource) locks.set(deferredSource, lock);
+      publishLocks(locks);
+      const releaseLock = () => {
+        const current = sending.current;
+        if (current.get(key) !== lock) return;
+        const next = new Map(current);
+        next.delete(key);
+        if (deferredSource && next.get(deferredSource) === lock) next.delete(deferredSource);
+        publishLocks(next);
+      };
+      const selectionAtStart = selectionRevision.current;
+      let boundProfile = conversations.find((c) => c.id === cid)?.profile_id;
+      const ownsDraft = (owner: string) => draftRevisions.current.get(owner) === draftRevision;
+      const requestId = attempt.requestId ?? (agentId === CEO_PROFILE_ID ? 'ceo-' : 'ui-') + crypto.randomUUID();
+      const submissionKey = SUBMISSION_PREFIX + requestId;
+      const recoveryAttempt = (): SendAttempt => ({ ...attempt, cid, retainedSourceKey, createdCeoChat, requestId,
+        deferredSource: recoverySource });
+      const persist = (owned: boolean, recoveryFallback?: string) => {
+        const record: SubmissionRecord = { cid, agentId, prompt, requestId, ownsDraft: owned,
+          createdCeoChat, deferredSource: recoverySource };
+        try {
+          localStorage.setItem(submissionKey, JSON.stringify(record));
+          submissions.set(requestId, record);
+          return true;
+        } catch {
+          raise(submissionKey, `Could not save this submission for recovery. Sending is paused until browser storage is available: ${prompt}`,
+            { ...recoveryAttempt(), deferredSource: recoveryFallback ?? recoverySource });
+          return false;
+        }
+      };
+      const fail = (message: string, cause?: unknown) => {
+        const rejected = cause instanceof ApiError && cause.status === 422;
+        const record = submissions.get(requestId);
+        if (record && rejected) {
+          record.rejected = true;
+          writeJson(submissionKey, record);
+        }
+        const notice = rejected ? rejectionNotice : needsConversation(cid) ? creationWarning : deliveryWarning;
+        raise(submissionKey, `${message}. ${notice}: ${prompt}`, recoveryAttempt());
+        const draftKey = key;
+        if (!ownsDraft(draftKey)) return;
         setDraftMap((prev) => {
-          // A failed send gives the text back in the chat it belongs to, and never over something typed since.
-          const next = { ...prev, [key]: prev[key] || prompt };
-          if (draftKey !== key) delete next[draftKey];
+          if (prev[draftKey]) return prev;
+          const next = { ...prev, [draftKey]: prompt };
           writeJson(KEY_DRAFTS, next);
           return next;
         });
+      };
       try {
-        if (!cid || cid.startsWith('legacy:')) {
+        if (!persist(ownsDraft(key))) return;
+        if (needsConversation(cid)) {
           const created = await createConversation(
             prompt.replace(/\s+/g, ' ').slice(0, 60),
-            target && target.id !== CEO_PROFILE_ID ? target.id : undefined
+            agentId !== CEO_PROFILE_ID ? agentId : undefined
           );
+          const sourceKey = key;
+          const stillHere = selectedRef.current === cid && selectionRevision.current === selectionAtStart;
+          const sourceRevision = draftRevisions.current.get(sourceKey);
+          const sourceEdited = sourceRevision !== draftRevision;
           cid = created.id;
           boundProfile = created.profile_id;
-          setConversations((prev) => [created, ...prev]);
-          selectedRef.current = cid;
-          setSelectedId(cid);
-          writeJson(KEY_SELECTED, cid);
-          const starter = agents.find((a) => a.id === draftAgentRef.current) ?? ceo;
-          if (starter) bindAgent(cid, starter.id);
+          setConversations((prev) => (prev.some((chat) => chat.id === created.id) ? prev : [created, ...prev]));
+          if (agent) bindAgent(cid, agentId);
+          if (sending.current.has(cid)) {
+            // The destination has its own send. Offer an explicit Retry at the source, targeting the created ID.
+            retainedSourceKey = sourceKey;
+            recoverySource = sourceKey;
+            if (persist(false)) {
+              raise(submissionKey, `Another message is being sent in the created chat. Retry here when it finishes: ${prompt}`,
+                recoveryAttempt());
+            }
+            return;
+          }
+          const nextLocks = new Map(sending.current);
+          if (nextLocks.get(sourceKey) === lock) nextLocks.delete(sourceKey);
+          key = cid;
+          publishLocks(nextLocks.set(key, lock));
+          // Preserve edits if a concurrent list refresh exposed the new chat before creation returned.
+          const destinationEdited = draftRevisions.current.has(cid);
+          if (!destinationEdited) {
+            draftRevisions.current.set(cid, stillHere ? sourceRevision : draftRevision);
+          } else {
+            retainedSourceKey = sourceKey;
+          }
+          // Record the actual destination before moving the draft or sending the prompt.
+          if (!persist(ownsDraft(cid), sourceKey)) return;
+          // Only remove the source here if its text actually moves to the destination.
+          if (!destinationEdited && (!sourceEdited || stillHere)) {
+            setDraftMap((prev) => {
+              if (!(sourceKey in prev)) return prev;
+              const next = { ...prev };
+              next[created.id] = prev[sourceKey];
+              delete next[sourceKey];
+              writeJson(KEY_DRAFTS, next);
+              return next;
+            });
+          }
+          if (stillHere) {
+            selectedRef.current = cid;
+            setSelectedId(cid);
+            writeJson(KEY_SELECTED, cid);
+          }
         }
         const chatId = cid;
-        const agent = resolveAgent(boundProfile, agentMapRef.current[chatId], agents, ceo);
-        const clearDraft = () =>
+        const clearDraft = (owner: string) => {
+          if (!ownsDraft(owner)) return;
           setDraftMap((prev) => {
+            if (!(owner in prev)) return prev;
             const next = { ...prev };
-            delete next[draftKey];
+            delete next[owner];
             writeJson(KEY_DRAFTS, next);
             return next;
           });
+        };
         if (!agent || agent.id === CEO_PROFILE_ID) {
           // Loqman (the CEO) answers through the CEO loop, which is the path that can create agents.
-          const ticket = `ceo-${crypto.randomUUID()}`;
-          setPendingUser(prompt);
-          clearDraft();
-          setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null } }));
+          const ticket = requestId;
+          if (attempt.requestId && attempt.cid === chatId) {
+            const history = await listMessages(chatId).catch(() => []);
+            if (history.some((m) => m.role === 'assistant' && m.client_message_id === `ask:${ticket}:assistant`)) {
+              forgetSubmission(ticket);
+              clearDraft(chatId);
+              if (retainedSourceKey) clearDraft(retainedSourceKey);
+              return;
+            }
+            const progress = await ceoAskProgress(ticket).catch(() => null);
+            if (progress && (!progress.done || progress.stage === 'done')) {
+              fail('The worker has received this question. Check its reply before retrying');
+              return;
+            }
+          }
+          if (selectedRef.current === chatId) setPendingUser(prompt);
+          const recoveryKey = CEO_SUBMISSION_PREFIX + chatId;
+          const hideSubmittedDraft = ownsDraft(chatId);
+          // Keep the existing new-CEO draft format compatible. The submission record owns recovery.
+          if (createdCeoChat) {
+            createdCeoSubmissions.current.set(chatId, attempt);
+            // Creation may already have transferred a newer edit into the saved composer.
+            setDraftMap((prev) => {
+              if (prev[chatId]?.trim() === prompt && hideSubmittedDraft) return prev;
+              const next = { ...prev, [recoveryKey]: prompt };
+              writeJson(KEY_DRAFTS, next);
+              return next;
+            });
+          }
+          // Hide the submitted revision until the ask settles. Reload reads the persisted draft.
+          setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null, hideSubmittedDraft } }));
           // Ask the worker where the answer has got to. One request at a time; it ends with the ask, a chat switch or unmount.
           let polling = true;
           void (async () => {
@@ -654,18 +907,21 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
             // The worker stores both sides of the exchange in this chat (the question before generating, the
             // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
             const answer = await askCeo(prompt, engine.engine, engine.model, ticket, chatId);
+            forgetSubmission(requestId);
+            clearDraft(chatId);
+            if (retainedSourceKey) clearDraft(retainedSourceKey);
             if (answer.agents_created.length) onAgentsChanged?.();
           } catch (e) {
             failure = messageOf(e);
-            failedSend.current = { cid: chatId, prompt };
-            raise(chatId, failure, 'send');
-            keepDraft(chatId);
+            fail(failure, e);
           } finally {
             polling = false;
-            setCeoStep(null);
+            setCeoStep((prev) => (prev?.cid === chatId ? null : prev));
             if (selectedRef.current === chatId) setPendingUser(null);
             // A failed answer is a failed run, not a finished one.
             setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: failure ? 'failed' : 'succeeded', error: failure } }));
+            // The answer is settled. A slow history refresh must not swallow the next Retry.
+            releaseLock();
             await refreshConversations().catch(() => undefined);
             await fetchMessages(chatId).catch(() => null);
           }
@@ -674,7 +930,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         // A chat made before conversations were bound to their agent has no profile: bind it now so the
         // worker applies the agent's instructions; only if that fails does the first message carry the contract.
         let outgoing = prompt;
-        if (agent && !boundProfile) {
+        if (!boundProfile) {
           const bound = await bindConversationProfile(chatId, agent.id).catch(() => null);
           if (bound) {
             setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
@@ -686,42 +942,53 @@ ${CONTRACT_CLOSE}
 ${prompt}`;
           }
         }
-        setPendingUser(prompt);
+        if (selectedRef.current === chatId) setPendingUser(prompt);
         setLive((prev) => {
           if (!(chatId in prev)) return prev;
           const next = { ...prev };
           delete next[chatId];
           return next;
         });
-        try {
-          const snap = await startTurn({
-            conversationId: chatId,
-            engine: engine.engine,
-            modelId: engine.model,
-            prompt: outgoing,
-            requestKey: `ui-${crypto.randomUUID()}`,
-          });
-          remember(chatId, snap.id);
-          clearDraft();
-          setRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
-          await fetchMessages(chatId).catch(() => null);
-          follow(chatId, snap.id);
-        } catch (e) {
-          if (selectedRef.current === chatId) setPendingUser(null);
-          failedSend.current = { cid: chatId, prompt };
-          raise(chatId, messageOf(e), 'send');
-          keepDraft(chatId);
-        }
+        const snap = await startTurn({
+          conversationId: chatId,
+          engine: engine.engine,
+          modelId: engine.model,
+          prompt: outgoing,
+          requestKey: requestId,
+        });
+        remember(chatId, snap.id);
+        forgetSubmission(requestId);
+        clearDraft(chatId);
+        if (retainedSourceKey) clearDraft(retainedSourceKey);
+        setRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
+        await fetchMessages(chatId).catch(() => null);
+        follow(chatId, snap.id);
       } catch (e) {
-        // Creating the chat or binding it failed before anything was sent.
-        setPendingUser(null);
-        failedSend.current = { cid, prompt };
-        raise(cid, messageOf(e), 'send');
-        keepDraft(cid ?? '');
+        if (selectedRef.current === cid) setPendingUser(null);
+        fail(messageOf(e), e);
+      } finally {
+        releaseLock();
       }
     },
-    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, raise, clearError]
+    [engine, follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, raise, clearError, publishLocks, submissions, forgetSubmission]
   );
+
+  const send = useCallback((text: string) => {
+    const prompt = text.trim();
+    if (!prompt) return Promise.resolve();
+    const cid = selectedRef.current;
+    const agentId = agentFor(cid?.startsWith('legacy:') ? null : cid)?.id ?? CEO_PROFILE_ID;
+    const revision = draftRevisions.current.get(chatOwnerKey(cid, agentId));
+    for (const [errorKey, entry] of Object.entries(errors)) {
+      const action = entry.retry;
+      if (typeof action === 'object' && action?.requestId && action.cid === cid && action.agentId === agentId &&
+          action.prompt === prompt && action.draftRevision === revision) return sendAttempt(action, errorKey);
+    }
+    return sendAttempt({
+      cid, prompt, agentId,
+      draftRevision: revision,
+    });
+  }, [agentFor, sendAttempt, errors]);
 
   const openAgentChat = useCallback(
     async (agent: Agent) => {
@@ -837,23 +1104,35 @@ ${prompt}`;
 
   const messages = thread.cid !== null && thread.cid === selectedId ? thread.list : NO_MESSAGES;
   const runsBySeq = runsThread.cid !== null && runsThread.cid === selectedId ? runsThread.map : NO_RUNS;
-  const shownError = (selectedId && errors[selectedId]) || errors[''] || null;
-  const errorKey = selectedId && errors[selectedId] ? selectedId : '';
+  const selectedAgentId = agentFor(selectedId)?.id;
+  const submissionKey = Object.keys(errors).reverse().find((key) => {
+    const action = errors[key].retry;
+    return key.startsWith(SUBMISSION_PREFIX) && action !== null && typeof action === 'object' && action.agentId === selectedAgentId &&
+      (action.cid === selectedId || action.deferredSource === selectedOwnerKey);
+  });
+  const errorKey = errors[selectedOwnerKey] ? selectedOwnerKey : submissionKey ?? '';
+  const shownError = errors[errorKey];
   const threadError = selectedId ? (threadErrors[selectedId] ?? null) : null;
 
   const retry = useMemo(() => {
     if (!shownError?.retry) return null;
-    const kind = shownError.retry;
+    const action = shownError.retry;
     return () => {
-      if (kind === 'send') {
-        const failed = failedSend.current;
-        if (failed) void send(failed.prompt);
+      if (action !== 'load') {
+        if (action.cid && !action.cid.startsWith('legacy:')) {
+          const chat = conversations.find((c) => c.id === action.cid);
+          if (!chat || (chat.profile_id && chat.profile_id !== action.agentId)) {
+            raise(errorKey, 'The original conversation or its agent is no longer available.', action.requestId ? action : null);
+            return;
+          }
+        }
+        void sendAttempt(action, errorKey);
         return;
       }
       clearError(errorKey || null);
       void refreshConversations().catch((e) => raise(null, `Could not load your chats. ${messageOf(e)}`, 'load'));
     };
-  }, [shownError, send, clearError, errorKey, refreshConversations, raise]);
+  }, [shownError, conversations, sendAttempt, clearError, errorKey, refreshConversations, raise]);
 
   const retryThread = useCallback(() => {
     const cid = selectedRef.current;
@@ -882,13 +1161,17 @@ ${prompt}`;
     approvals,
     drafts,
     error: shownError?.message ?? null,
-    dismissError: () => clearError(errorKey || null),
+    dismissError: () => {
+      if (errorKey.startsWith(SUBMISSION_PREFIX)) forgetSubmission(errorKey.slice(SUBMISSION_PREFIX.length));
+      clearError(errorKey || null);
+    },
     retry,
     threadError,
     retryThread,
     stopping: Boolean(currentRun && stoppingRuns[currentRun.runId]),
+    sending: sendLocks.has(selectedOwnerKey),
     canStop: Boolean(currentRun && !currentRun.runId.startsWith('ceo-') && !isTerminal(currentRun.status)),
-    draft: draftMap[selectedId ?? ''] ?? '',
+    draft: currentRun?.hideSubmittedDraft ? '' : (draftMap[selectedOwnerKey] ?? ''),
     setDraft,
     send,
     stop,

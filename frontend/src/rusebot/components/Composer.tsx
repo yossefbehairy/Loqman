@@ -24,6 +24,7 @@ export interface ComposerProps {
   /** Stop was pressed and the worker has not confirmed yet. */
   stopping?: boolean;
   running: boolean;
+  sending: boolean;
   disabled?: boolean;
   engines: EngineState;
   onNewAgent?: () => void;
@@ -31,11 +32,10 @@ export interface ComposerProps {
   onManageProviders?: () => void;
 }
 
-export function Composer({ placeholder, value, onChange, onSend, onStop, canStop = true, stopping = false, running, disabled, engines, onNewAgent, onManageProviders }: ComposerProps) {
+export function Composer({ placeholder, value, onChange, onSend, onStop, canStop = true, stopping = false, running, sending, disabled, engines, onNewAgent, onManageProviders }: ComposerProps) {
   const choice = engines.choice;
   const ref = useRef<HTMLTextAreaElement>(null);
   const [menu, setMenu] = useState(false);
-  const [sending, setSending] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useLayoutEffect(() => {
@@ -78,13 +78,11 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
   const submit = async () => {
     if (!canSend) return;
     const text = value;
-    setSending(true);
     try {
       await onSend(text);
     } catch {
       onChange(text);
     } finally {
-      setSending(false);
       ref.current?.focus();
     }
   };
