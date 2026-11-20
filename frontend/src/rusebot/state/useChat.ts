@@ -262,6 +262,8 @@ const deliveryWarning = 'Delivery was not confirmed. Check the conversation befo
 const creationWarning = 'Conversation creation was not confirmed. Check your chat list before retrying';
 const rejectionNotice = 'The worker rejected this request';
 const missingSettings = 'The original execution settings were not saved. Check the conversation before dismissing this notice and sending again';
+const missingLegacyProfilesKey = 'agentos.rusebot.missingLegacyProfiles.v1';
+const missingLegacyProfile = 'This chat’s specialist is no longer available. Your draft stays here. Retry to check the binding again, or open a chat with an available specialist';
 
 function needsConversation(cid: string | null): cid is null | `legacy:${string}` {
   return cid === null || cid.startsWith('legacy:');
@@ -376,6 +378,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   // Keep the legacy '' entry in storage for recovery. Its agent is unknown.
   const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
   const [submissions] = useState(readSubmissions);
+  // Keep a definitive rejection across reloads, even when its submission is dismissed.
+  const [missingLegacyProfiles] = useState(() => new Set(readJson<string[]>(missingLegacyProfilesKey, [])));
   const createdCeoSubmissions = useRef(new Map<string, SendAttempt>());
   const forgetSubmission = useCallback((id: string) => {
     const record = submissions.get(id);
@@ -407,7 +411,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     for (const record of submissions.values()) {
       const owner = chatOwnerKey(record.cid, record.agentId);
       const draft = draftMap[owner];
-      const notice = !record.execution ? missingSettings : record.rejected === true ? rejectionNotice : needsConversation(record.cid) ? creationWarning : deliveryWarning;
+      const notice = !record.execution ? missingSettings : missingLegacyProfiles.has(record.agentId) ? missingLegacyProfile :
+        record.rejected === true ? rejectionNotice : needsConversation(record.cid) ? creationWarning : deliveryWarning;
       recovered[SUBMISSION_PREFIX + record.requestId] = {
         message: `${notice}: ${record.prompt}`,
         retry: { ...record,
@@ -896,14 +901,14 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           return false;
         }
       };
-      const fail = (message: string, cause?: unknown) => {
+      const fail = (message: string, cause?: unknown, noticeOverride?: string) => {
         const rejected = cause instanceof ApiError && cause.status === 422;
         const record = submissions.get(requestId);
         if (record && rejected) {
           record.rejected = true;
           writeJson(submissionKey, record);
         }
-        const notice = rejected ? rejectionNotice : needsConversation(cid) ? creationWarning : deliveryWarning;
+        const notice = noticeOverride ?? (rejected ? rejectionNotice : needsConversation(cid) ? creationWarning : deliveryWarning);
         raise(submissionKey, `${message}. ${notice}: ${prompt}`, recoveryAttempt());
         const draftKey = key;
         if (!ownsDraft(draftKey)) return;
@@ -1064,29 +1069,43 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           }
           return;
         }
-        // A chat made before conversations were bound to their agent has no profile: bind it now so the
-        // worker applies the agent's instructions; only if that fails does the first message carry the contract.
+        // Revalidate an unbound legacy recipient even when Retry already has a prepared payload.
         let outgoing = wirePrompt ?? prompt;
-        if (!boundProfile && wirePrompt === undefined) {
+        if (!boundProfile) {
           requireOriginalModel();
           const agent = agents.find((a) => a.id === agentId);
           const bound = await bindConversationProfile(chatId, agentId).catch((e: unknown) => {
-            // A confirmed binding conflict cannot use the legacy first-message contract.
-            if (!agent || (e instanceof ApiError && e.status === 409)) throw e;
+            if (e instanceof ApiError) {
+              if (e.status === 409 || (e.status === 404 && e.detail === 'Conversation not found')) throw e;
+              if (e.status === 404 && e.detail === 'Profile not found' && !missingLegacyProfiles.has(agentId)) {
+                missingLegacyProfiles.add(agentId);
+                writeJson(missingLegacyProfilesKey, [...missingLegacyProfiles]);
+              }
+            }
+            if (!agent && !missingLegacyProfiles.has(agentId)) throw e;
             return null;
           });
           if (bound) {
             setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
             if (bound.profile_id !== agentId) throw new Error('The conversation is bound to a different agent.');
-          } else if (agent?.prompt && (await listMessages(chatId).catch(() => [{}])).length === 0) {
+            if (missingLegacyProfiles.delete(agentId)) writeJson(missingLegacyProfilesKey, [...missingLegacyProfiles]);
+          } else if (!missingLegacyProfiles.has(agentId) && wirePrompt === undefined && agent?.prompt &&
+              (await listMessages(chatId).catch(() => [{}])).length === 0) {
             outgoing = `${CONTRACT_OPEN}
 ${agent.prompt}
 ${CONTRACT_CLOSE}
 
 ${prompt}`;
           }
-          wirePrompt = outgoing;
-          if (!persist(ownsDraft(key))) return;
+          if (!bound && missingLegacyProfiles.has(agentId)) {
+            fail(missingLegacyProfile, undefined, 'No new turn was submitted by this attempt');
+            return;
+          }
+          // An earlier start may already be accepted. Preserve its exact payload for the same request key.
+          if (wirePrompt === undefined) {
+            wirePrompt = outgoing;
+            if (!persist(ownsDraft(key))) return;
+          }
         }
         requireOriginalModel();
         const before = currentRuns.current[chatId];
@@ -1131,7 +1150,7 @@ ${prompt}`;
         releaseLock();
       }
     },
-    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, forgetSubmission, clearStopping, closeFollower, finishRun]
+    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun]
   );
 
   const send = useCallback((text: string) => {
