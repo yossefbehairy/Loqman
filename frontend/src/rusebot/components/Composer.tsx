@@ -73,7 +73,10 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
   }, [menu]);
 
   // No usable provider with a model: sending would go nowhere, so say so and point to Settings > AI.
-  const noProvider = !disabled && !(choice?.model);
+  const noProvider = !disabled && !engines.executionReady;
+  const providerNotice = engines.catalogStatus === 'loading' ? 'Loading models for the selected provider.'
+    : engines.catalogStatus === 'error' ? 'Could not load models for the selected provider.'
+    : choice ? 'Choose an available model for the selected provider.' : 'No AI provider is ready to answer.';
   const canSend = value.trim().length > 0 && !running && !sending && !disabled && !noProvider;
   const submit = async () => {
     if (!canSend) return;
@@ -94,7 +97,7 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
     >
       {noProvider && (
         <p role="status" data-composer-no-provider className="px-3 pb-1 pt-1.5 text-[12.5px] leading-relaxed text-ink-secondary">
-          No AI provider is ready to answer.{' '}
+          {providerNotice}{' '}
           {onManageProviders ? (
             <button type="button" onClick={onManageProviders} className="font-medium text-accent-text hover:underline">
               Open Settings &gt; AI
@@ -102,7 +105,7 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
           ) : (
             'Open Settings > AI'
           )}{' '}
-          to sign in or pick a model.
+          to manage providers.
         </p>
       )}
       <div data-composer-row="true" className="flex items-end gap-1 @max-[30rem]/composer:flex-wrap">

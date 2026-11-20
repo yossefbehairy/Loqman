@@ -10,7 +10,7 @@
  * the worker runs in test mode, and stays preferred there so e2e never calls a real model.
  * The worker owns the default for new chats (preferences.get / preferences.set_default). On the first
  * load it replaces a remembered choice when that default is usable and still offers its model; localStorage
- * stays as the cache and for the per-chat choice. The Settings strip saves through saveDefaultProvider.
+ * caches the selection shared across chats. The Settings strip saves through saveDefaultProvider.
  * A late answer never overrides a choice made after it was requested (see choiceSeq).
  */
 import { useEffect, useSyncExternalStore } from 'react';
@@ -123,6 +123,18 @@ function entryOf(id: string, status: EngineStatus | null, caps: EngineCapabiliti
 
 const isUsable = (e: ProviderEntry) => e.id === 'mock' || selectable(e.state);
 
+/** Consult the live store, including catalog updates received since the last React render. */
+export function isExecutableChoice(choice: EngineChoice | null | undefined): boolean {
+  if (!choice || snap.loading) return false;
+  const catalog = snap.models[choice.engine];
+  return catalog?.status === 'ready' && catalog.list.some((model) => model.id === choice.model) &&
+    snap.selectable.some((entry) => entry.id === choice.engine && isUsable(entry));
+}
+
+export function currentExecutionChoice(): EngineChoice | null {
+  return isExecutableChoice(snap.choice) ? snap.choice : null;
+}
+
 // ---- models -------------------------------------------------------------------------
 
 const modelRequests = new Map<string, Promise<EngineModel[]>>();
@@ -215,6 +227,7 @@ export async function saveDefaultProvider(next: EngineChoice): Promise<void> {
 export async function selectProviderEngine(engine: string): Promise<void> {
   const ticket = ++choiceSeq;
   userChoiceSeq += 1;
+  patch({ choice: { engine, model: '' } });
   const list = await loadProviderModels(engine);
   if (ticket !== choiceSeq) return;
   setProviderChoice({ engine, model: modelFor(engine, list) });
@@ -240,6 +253,21 @@ async function reconcileChoice(): Promise<void> {
   const ticket = choiceSeq;
   const current = snap.choice;
   const usable = snap.selectable.filter(isUsable);
+  // Once selected, keep the engine even if its refreshed catalog is empty or unavailable.
+  if (current && (!snap.loading || userChoiceSeq > 0)) {
+    const slot = snap.models[current.engine];
+    if (slot?.status === 'loading') return;
+    const available = usable.some((e) => e.id === current.engine);
+    // A choice made during startup may precede discovery of this engine's catalog.
+    const list = available ? (slot?.list ?? await loadProviderModels(current.engine)) : [];
+    if (ticket !== choiceSeq) return;
+    const model = modelFor(current.engine, list, current);
+    if (current.model !== model) {
+      choiceSeq += 1;
+      patch({ choice: { engine: current.engine, model } });
+    }
+    return;
+  }
   const order = [
     ...usable.filter((e) => e.id === current?.engine),
     ...usable.filter((e) => e.id === 'mock'),

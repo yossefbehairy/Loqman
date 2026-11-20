@@ -37,6 +37,8 @@ import { emptyLive, freezeLive, hasLiveContent, reduceLive, type LiveTurn } from
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
 import type { Agent } from '../types';
 import {
+  currentExecutionChoice,
+  isExecutableChoice,
   loadProviderModels,
   selectProviderEngine,
   setProviderChoice,
@@ -110,6 +112,8 @@ export interface EngineState {
   /** Models of the current provider. */
   models: EngineModel[];
   choice: EngineChoice | null;
+  catalogStatus: 'loading' | 'ready' | 'error' | undefined;
+  executionReady: boolean;
   loading: boolean;
   setChoice: (choice: EngineChoice) => void;
   /** Switch provider and use its preferred model. */
@@ -129,6 +133,8 @@ export function useEngines(): EngineState {
     engines,
     models,
     choice: s.choice,
+    catalogStatus: s.choice ? s.models[s.choice.engine]?.status : undefined,
+    executionReady: isExecutableChoice(s.choice),
     loading: s.loading,
     setChoice: setProviderChoice,
     selectEngine: selectProviderEngine,
@@ -194,7 +200,14 @@ export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-interface SendAttempt {
+interface ExecutionSettings {
+  /** Absent on recovery records written before execution settings were saved. */
+  execution?: EngineChoice;
+  /** The first legacy turn may include an agent contract in its worker payload. */
+  wirePrompt?: string;
+}
+
+interface SendAttempt extends ExecutionSettings {
   cid: string | null;
   agentId: string;
   prompt: string;
@@ -206,7 +219,7 @@ interface SendAttempt {
   retainedSourceKey?: string;
 }
 
-interface SubmissionRecord {
+interface SubmissionRecord extends ExecutionSettings {
   cid: string | null;
   agentId: string;
   prompt: string;
@@ -231,6 +244,9 @@ function readSubmissions(): Map<string, SubmissionRecord> {
           record.requestId.startsWith('ceo-') !== (record.agentId === CEO_PROFILE_ID) ||
           (record.deferredSource !== undefined && record.deferredSource !== chatOwnerKey(null, record.agentId) &&
             !(typeof record.deferredSource === 'string' && record.deferredSource.startsWith('legacy:')))) continue;
+      if (typeof record.execution?.engine !== 'string' || !record.execution.engine ||
+          typeof record.execution.model !== 'string' || !record.execution.model ||
+          (record.wirePrompt !== undefined && typeof record.wirePrompt !== 'string')) delete record.execution;
       records.set(record.requestId, record as SubmissionRecord);
     }
   } catch { /* Storage unavailable. Live sends still use in-memory state. */ }
@@ -240,6 +256,7 @@ function readSubmissions(): Map<string, SubmissionRecord> {
 const deliveryWarning = 'Delivery was not confirmed. Check the conversation before retrying';
 const creationWarning = 'Conversation creation was not confirmed. Check your chat list before retrying';
 const rejectionNotice = 'The worker rejected this request';
+const missingSettings = 'The original execution settings were not saved. Check the conversation before dismissing this notice and sending again';
 
 function needsConversation(cid: string | null): cid is null | `legacy:${string}` {
   return cid === null || cid.startsWith('legacy:');
@@ -283,6 +300,14 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   }, []);
   const historyUsed = useRef(false);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
+  // Stream callbacks and RPC replies can arrive before React commits the previous run update.
+  const currentRuns = useRef(runs);
+  const updateRuns = useCallback((update: (current: Record<string, RunState>) => Record<string, RunState>) => {
+    const next = update(currentRuns.current);
+    if (next === currentRuns.current) return;
+    currentRuns.current = next;
+    setRuns(next);
+  }, []);
   const [live, setLive] = useState<Record<string, LiveTurn>>({});
   const liveRuns = useRef(new Map<string, LiveTurn>());
   const stoppedRuns = useRef(new Set<string>());
@@ -306,7 +331,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         const next = { ...prev };
         for (const [cid, rid] of entries) {
           const turn = liveRuns.current.get(rid);
-          if (turn) next[cid] = turn;
+          if (turn && currentRuns.current[cid]?.runId === rid) next[cid] = turn;
         }
         return next;
       });
@@ -329,7 +354,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     stoppedRuns.current.delete(runId);
     if (liveDirty.current.get(conversationId) === runId) liveDirty.current.delete(conversationId);
     setLive((prev) => {
-      if (!(conversationId in prev)) return prev;
+      if (prev[conversationId]?.runId !== runId) return prev;
       const next = { ...prev };
       delete next[conversationId];
       return next;
@@ -369,7 +394,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       const cid = key.slice(CEO_SUBMISSION_PREFIX.length);
       if ([...submissions.values()].some(record => record.cid === cid && record.createdCeoChat && record.prompt === prompt)) continue;
       recovered[cid] = {
-        message: `${deliveryWarning}: ${prompt}`,
+        message: `${missingSettings}: ${prompt}`,
         // The ordinary draft belongs to a separate edit, even if its text is identical.
         retry: { cid, agentId: CEO_PROFILE_ID, prompt, draftRevision: Symbol(), createdCeoChat: true },
       };
@@ -377,7 +402,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     for (const record of submissions.values()) {
       const owner = chatOwnerKey(record.cid, record.agentId);
       const draft = draftMap[owner];
-      const notice = record.rejected === true ? rejectionNotice : needsConversation(record.cid) ? creationWarning : deliveryWarning;
+      const notice = !record.execution ? missingSettings : record.rejected === true ? rejectionNotice : needsConversation(record.cid) ? creationWarning : deliveryWarning;
       recovered[SUBMISSION_PREFIX + record.requestId] = {
         message: `${notice}: ${record.prompt}`,
         retry: { ...record,
@@ -526,21 +551,25 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   const follow = useCallback(
     (conversationId: string, runId: string) => {
       if (streams.current.has(runId)) return;
+      let handle: StreamHandle = { close: () => undefined };
+      const isFollowing = () => streams.current.get(runId) === handle;
+      const ownsRun = () => currentRuns.current[conversationId]?.runId === runId;
       const finish = async (status: string, err: string | null) => {
-        const handle = streams.current.get(runId);
-        handle?.close();
+        if (!isFollowing()) return;
         streams.current.delete(runId);
-        setRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error: err } }));
+        handle.close();
+        const current = ownsRun();
+        if (current) updateRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error: err } }));
         setStoppingRuns((prev) => {
           if (!(runId in prev)) return prev;
           const next = { ...prev };
           delete next[runId];
           return next;
         });
-        if (selectedRef.current === conversationId) setPendingUser(null);
-        if (err && status !== 'cancelled') raise(conversationId, err);
+        if (current && selectedRef.current === conversationId) setPendingUser(null);
+        if (current && err && status !== 'cancelled') raise(conversationId, err);
         const partial = liveRuns.current.get(runId);
-        if (status === 'cancelled' && hasLiveContent(partial)) {
+        if (current && status === 'cancelled' && hasLiveContent(partial)) {
           // Keep what was written, marked as stopped; a reload shows only what the worker stored.
           const kept = freezeLive(partial);
           liveRuns.current.set(runId, kept);
@@ -554,20 +583,22 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         if (selectedRef.current === conversationId) await loadThread(conversationId).catch(() => undefined);
         setApprovals(await listApprovals().catch(() => []));
       };
-      const placeholder = { close: () => undefined } as StreamHandle;
-      streams.current.set(runId, placeholder);
+      streams.current.set(runId, handle);
       followRun(
         runId,
         (type, data) => {
+          if (!isFollowing()) return;
           // Only a lifecycle terminal ends the run; driver events feed the live reply; anything else is ignored.
           if (isTerminal(type)) void finish(type, typeof data.error === 'string' ? data.error : null);
+          else if (!ownsRun() || isTerminal(currentRuns.current[conversationId].status)) return;
           else if (type === 'queued' || type === 'running') {
-            setRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
+            updateRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
           } else applyLive(conversationId, runId, type, data);
         },
         () => {
-          if (streams.current.has(runId)) {
+          if (isFollowing()) {
             void getRun(runId).then((snap) => {
+              if (!isFollowing()) return;
               if (isTerminal(snap.status)) void finish(snap.status, snap.error);
               else streams.current.delete(runId);
             });
@@ -576,16 +607,21 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         0,
         'normalised-v1'
       )
-        .then((handle) => {
-          if (streams.current.has(runId)) streams.current.set(runId, handle);
-          else handle.close();
+        .then((opened) => {
+          if (!isFollowing()) {
+            opened.close();
+            return;
+          }
+          handle = opened;
+          streams.current.set(runId, handle);
         })
         .catch((e) => {
+          if (!isFollowing()) return;
           streams.current.delete(runId);
-          raise(conversationId, messageOf(e));
+          if (ownsRun()) raise(conversationId, messageOf(e));
         });
     },
-    [loadThread, fetchMessages, refreshConversations, applyLive, dropLive, raise]
+    [loadThread, fetchMessages, refreshConversations, applyLive, dropLive, raise, updateRuns]
   );
 
   useEffect(() => {
@@ -609,17 +645,19 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           })
         );
         if (!alive) return;
-        const active: Record<string, RunState> = {};
         for (const [cid, last] of Object.entries(lastRun)) {
           if (!last) continue;
           const snap = await getRun(last).catch(() => null);
+          if (!alive) return;
           if (snap && !isTerminal(snap.status)) {
-            active[cid] = { runId: snap.id, status: snap.status, error: null };
-            follow(cid, snap.id);
+            updateRuns((prev) => prev[cid] ? prev : {
+              ...prev, [cid]: { runId: snap.id, status: snap.status, error: null },
+            });
+            const current = currentRuns.current[cid];
+            if (current.runId === snap.id && !isTerminal(current.status)) follow(cid, snap.id);
           }
         }
         if (!alive) return;
-        setRuns(active);
         setApprovals(await listApprovals().catch(() => []));
       } catch (e) {
         if (alive) raise(null, `Could not load your chats. ${messageOf(e)}`, 'load');
@@ -633,7 +671,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       for (const handle of open.values()) handle.close();
       open.clear();
     };
-  }, [follow, withoutEmptyHistory, raise]);
+  }, [follow, withoutEmptyHistory, raise, updateRuns]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -681,7 +719,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       }
       const submitted = createdCeoSubmissions.current.get(key);
       draftRevisions.current.set(key, Symbol());
-      setRuns((prev) => prev[key]?.hideSubmittedDraft
+      updateRuns((prev) => prev[key]?.hideSubmittedDraft
         ? { ...prev, [key]: { ...prev[key], hideSubmittedDraft: false } }
         : prev);
       setDraftMap((prev) => {
@@ -693,7 +731,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         return next;
       });
     },
-    [selectedOwnerKey, submissions]
+    [selectedOwnerKey, submissions, updateRuns]
   );
 
   const sendAttempt = useCallback(
@@ -711,8 +749,9 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         (attempt.createdCeoChat || needsConversation(cid) ||
           (previous?.prompt === prompt && previous.draftRevision === draftRevision));
       if (sending.current.has(key) || (deferredSource && sending.current.has(deferredSource))) return;
-      if (!engine?.model) {
-        raise(errorOwner, 'No AI provider is ready. Open Settings > AI to sign in or pick a model.', deferredSource || attempt.requestId ? attempt : null);
+      const execution = attempt.execution;
+      if (!execution) {
+        raise(errorOwner, `${missingSettings}: ${prompt}`, attempt);
         return;
       }
       if (agentId === CEO_PROFILE_ID && prompt.length > CEO_MAX_CHARS) {
@@ -740,10 +779,12 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       const ownsDraft = (owner: string) => draftRevisions.current.get(owner) === draftRevision;
       const requestId = attempt.requestId ?? (agentId === CEO_PROFILE_ID ? 'ceo-' : 'ui-') + crypto.randomUUID();
       const submissionKey = SUBMISSION_PREFIX + requestId;
-      const recoveryAttempt = (): SendAttempt => ({ ...attempt, cid, retainedSourceKey, createdCeoChat, requestId,
+      let previewedSpecialistPrompt = false;
+      let wirePrompt = attempt.wirePrompt;
+      const recoveryAttempt = (): SendAttempt => ({ ...attempt, cid, wirePrompt, retainedSourceKey, createdCeoChat, requestId,
         deferredSource: recoverySource });
       const persist = (owned: boolean, recoveryFallback?: string) => {
-        const record: SubmissionRecord = { cid, agentId, prompt, requestId, ownsDraft: owned,
+        const record: SubmissionRecord = { cid, agentId, prompt, execution, wirePrompt, requestId, ownsDraft: owned,
           createdCeoChat, deferredSource: recoverySource };
         try {
           localStorage.setItem(submissionKey, JSON.stringify(record));
@@ -775,7 +816,13 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       };
       try {
         if (!persist(ownsDraft(key))) return;
+        // A restored attempt may target an engine whose catalog has not loaded in this session.
+        if (attempt.requestId && !isExecutableChoice(execution)) await loadProviderModels(execution.engine);
+        const requireOriginalModel = () => {
+          if (!isExecutableChoice(execution)) throw new Error('The original engine and model are currently unavailable');
+        };
         if (needsConversation(cid)) {
+          requireOriginalModel();
           const created = await createConversation(
             prompt.replace(/\s+/g, ' ').slice(0, 60),
             agentId !== CEO_PROFILE_ID ? agentId : undefined
@@ -843,15 +890,19 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           // Loqman (the CEO) answers through the CEO loop, which is the path that can create agents.
           const ticket = requestId;
           if (attempt.requestId && attempt.cid === chatId) {
-            const history = await listMessages(chatId).catch(() => []);
+            const history = await listMessages(chatId);
             if (history.some((m) => m.role === 'assistant' && m.client_message_id === `ask:${ticket}:assistant`)) {
               forgetSubmission(ticket);
               clearDraft(chatId);
               if (retainedSourceKey) clearDraft(retainedSourceKey);
               return;
             }
-            const progress = await ceoAskProgress(ticket).catch(() => null);
-            if (progress && (!progress.done || progress.stage === 'done')) {
+            const progress = await ceoAskProgress(ticket).catch((e: unknown) => {
+              if (e instanceof ApiError && e.status === 404) return null;
+              throw e;
+            });
+            if ((progress && (!progress.done || progress.stage === 'done')) ||
+                (!progress && history.some((m) => m.client_message_id === `ask:${ticket}:user`))) {
               fail('The worker has received this question. Check its reply before retrying');
               return;
             }
@@ -871,7 +922,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
             });
           }
           // Hide the submitted revision until the ask settles. Reload reads the persisted draft.
-          setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null, hideSubmittedDraft } }));
+          updateRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null, hideSubmittedDraft } }));
           // Ask the worker where the answer has got to. One request at a time; it ends with the ask, a chat switch or unmount.
           let polling = true;
           void (async () => {
@@ -891,7 +942,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           try {
             // The worker stores both sides of the exchange in this chat (the question before generating, the
             // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
-            const answer = await askCeo(prompt, engine.engine, engine.model, ticket, chatId);
+            requireOriginalModel();
+            const answer = await askCeo(prompt, execution.engine, execution.model, ticket, chatId);
             forgetSubmission(requestId);
             clearDraft(chatId);
             if (retainedSourceKey) clearDraft(retainedSourceKey);
@@ -904,7 +956,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
             setCeoStep((prev) => (prev?.cid === chatId ? null : prev));
             if (selectedRef.current === chatId) setPendingUser(null);
             // A failed answer is a failed run, not a finished one.
-            setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: failure ? 'failed' : 'succeeded', error: failure } }));
+            updateRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: failure ? 'failed' : 'succeeded', error: failure } }));
             // The answer is settled. A slow history refresh must not swallow the next Retry.
             releaseLock();
             await refreshConversations().catch(() => undefined);
@@ -914,8 +966,9 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         }
         // A chat made before conversations were bound to their agent has no profile: bind it now so the
         // worker applies the agent's instructions; only if that fails does the first message carry the contract.
-        let outgoing = prompt;
-        if (!boundProfile) {
+        let outgoing = wirePrompt ?? prompt;
+        if (!boundProfile && wirePrompt === undefined) {
+          requireOriginalModel();
           const agent = agents.find((a) => a.id === agentId);
           const bound = await bindConversationProfile(chatId, agentId).catch((e: unknown) => {
             // A confirmed binding conflict cannot use the legacy first-message contract.
@@ -932,36 +985,45 @@ ${CONTRACT_CLOSE}
 
 ${prompt}`;
           }
+          wirePrompt = outgoing;
+          if (!persist(ownsDraft(key))) return;
         }
-        if (selectedRef.current === chatId) setPendingUser(prompt);
-        setLive((prev) => {
-          if (!(chatId in prev)) return prev;
-          const next = { ...prev };
-          delete next[chatId];
-          return next;
-        });
+        requireOriginalModel();
+        const before = currentRuns.current[chatId];
+        if (selectedRef.current === chatId && (!before || isTerminal(before.status))) {
+          setPendingUser(prompt);
+          previewedSpecialistPrompt = true;
+        }
         const snap = await startTurn({
           conversationId: chatId,
-          engine: engine.engine,
-          modelId: engine.model,
+          engine: execution.engine,
+          modelId: execution.model,
           prompt: outgoing,
           requestKey: requestId,
         });
-        remember(chatId, snap.id);
         forgetSubmission(requestId);
         clearDraft(chatId);
         if (retainedSourceKey) clearDraft(retainedSourceKey);
-        setRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
+        const current = currentRuns.current[chatId];
+        if (current && current.runId !== snap.id && isTerminal(snap.status)) {
+          // A replay can acknowledge an older turn even while a newer turn owns the chat.
+          if (previewedSpecialistPrompt && selectedRef.current === chatId) setPendingUser(null);
+          await loadThread(chatId).catch(() => null);
+          return;
+        }
+        remember(chatId, snap.id);
+        if (current && current.runId !== snap.id) dropLive(chatId, current.runId);
+        updateRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
         await fetchMessages(chatId).catch(() => null);
         follow(chatId, snap.id);
       } catch (e) {
-        if (selectedRef.current === cid) setPendingUser(null);
+        if (previewedSpecialistPrompt && selectedRef.current === cid) setPendingUser(null);
         fail(messageOf(e), e);
       } finally {
         releaseLock();
       }
     },
-    [engine, follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, raise, clearError, publishLocks, submissions, forgetSubmission]
+    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, forgetSubmission]
   );
 
   const send = useCallback((text: string) => {
@@ -976,11 +1038,13 @@ ${prompt}`;
       if (typeof action === 'object' && action?.requestId && action.cid === cid && action.agentId === agentId &&
           action.prompt === prompt && action.draftRevision === revision) return sendAttempt(action, errorKey);
     }
+    const execution = currentExecutionChoice();
+    if (!execution || execution.engine !== engine?.engine || execution.model !== engine.model) return Promise.resolve();
     return sendAttempt({
-      cid, prompt, agentId,
+      cid, prompt, agentId, execution,
       draftRevision: revision,
     });
-  }, [recipientIdFor, sendAttempt, errors]);
+  }, [recipientIdFor, sendAttempt, errors, engine]);
 
   const openAgentChat = useCallback(
     async (agent: Agent) => {
@@ -1005,20 +1069,21 @@ ${prompt}`;
 
   const stop = useCallback(async () => {
     const cid = selectedRef.current;
-    const run = cid ? runs[cid] : undefined;
+    const run = cid ? currentRuns.current[cid] : undefined;
     // A Loqman answer is one request to the worker that cannot be cancelled midway; the button is disabled for it.
     if (!cid || !run || run.runId.startsWith('ceo-') || isTerminal(run.status) || stoppingRuns[run.runId]) return;
     // The text stops changing the moment Stop is pressed, before the worker confirms.
     stoppedRuns.current.add(run.runId);
     setStoppingRuns((prev) => ({ ...prev, [run.runId]: true }));
-    const turn = liveRuns.current.get(run.runId);
-    if (turn) {
-      const frozen = freezeLive(turn);
-      liveRuns.current.set(run.runId, frozen);
-      setLive((prev) => ({ ...prev, [cid]: frozen }));
-    }
     try {
-      await cancelRun(run.runId);
+      const result = await cancelRun(run.runId);
+      const turn = liveRuns.current.get(run.runId);
+      if (result.status === 'cancelled' && currentRuns.current[cid]?.runId === run.runId &&
+          turn && streams.current.has(run.runId)) {
+        const frozen = freezeLive(turn);
+        liveRuns.current.set(run.runId, frozen);
+        setLive((prev) => ({ ...prev, [cid]: frozen }));
+      }
     } catch (e) {
       stoppedRuns.current.delete(run.runId);
       setStoppingRuns((prev) => {
@@ -1026,13 +1091,9 @@ ${prompt}`;
         delete next[run.runId];
         return next;
       });
-      if (turn) {
-        liveRuns.current.set(run.runId, turn);
-        setLive((prev) => ({ ...prev, [cid]: turn }));
-      }
-      raise(cid, `Could not stop the reply. ${messageOf(e)}`);
+      if (currentRuns.current[cid]?.runId === run.runId) raise(cid, `Could not stop the reply. ${messageOf(e)}`);
     }
-  }, [runs, stoppingRuns, raise]);
+  }, [stoppingRuns, raise]);
 
   const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny') => {
     try {
@@ -1109,6 +1170,7 @@ ${prompt}`;
   const retry = useMemo(() => {
     if (!shownError?.retry) return null;
     const action = shownError.retry;
+    if (typeof action === 'object' && !action.execution) return null;
     return () => {
       if (action !== 'load') {
         if (action.cid && !action.cid.startsWith('legacy:')) {
@@ -1155,6 +1217,14 @@ ${prompt}`;
     error: shownError?.message ?? null,
     dismissError: () => {
       if (errorKey.startsWith(SUBMISSION_PREFIX)) forgetSubmission(errorKey.slice(SUBMISSION_PREFIX.length));
+      else if (shownError?.retry && typeof shownError.retry === 'object' && shownError.retry.createdCeoChat && !shownError.retry.requestId) {
+        setDraftMap((prev) => {
+          const next = { ...prev };
+          delete next[CEO_SUBMISSION_PREFIX + errorKey];
+          writeJson(KEY_DRAFTS, next);
+          return next;
+        });
+      }
       clearError(errorKey || null);
     },
     retry,
