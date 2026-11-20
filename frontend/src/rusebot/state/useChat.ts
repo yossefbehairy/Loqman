@@ -59,6 +59,10 @@ export const CEO_MAX_CHARS = 2000;
 /** The conversation the legacy import creates for old CEO exchanges; hidden while it has nothing in it. */
 const CEO_HISTORY_ID = 'legacy-ceo-history';
 const CEO_PROGRESS_MS = 1500;
+const RUN_STREAM_IDLE_MS = 15_000;
+const RUN_STATUS_RETRY_MAX_MS = 15_000;
+const RUN_STATUS_SLOW_MS = 8_000;
+const runConnectionWarning = 'Could not verify this run’s status with the worker. Still checking for updates.';
 
 /** One short line for the pending reply area, from what ceo.ask_progress reports. */
 export function progressText(p: CeoProgress): string | null {
@@ -149,6 +153,7 @@ export interface RunState {
   status: string;
   error: string | null;
   hideSubmittedDraft?: boolean;
+  connectionWarning?: boolean;
 }
 
 export interface ChatState {
@@ -504,6 +509,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     const list = await listMessages(conversationId);
     if (readSeq.current.get(conversationId) === ticket && selectedRef.current === conversationId) {
       setThread({ cid: conversationId, list });
+      const run = currentRuns.current[conversationId];
+      if (run?.status === 'succeeded' && liveRuns.current.has(run.runId)) dropLive(conversationId, run.runId);
       // CEO replies carry the ask ID. A matching prompt alone cannot identify a submission.
       for (const record of submissions.values()) {
         if (record.cid !== conversationId || record.agentId !== CEO_PROFILE_ID || sending.current.has(conversationId) ||
@@ -539,7 +546,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       setDrafts((prev) => ({ ...prev, ...nextDrafts }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
-  }, [submissions, forgetSubmission, clearError]);
+  }, [submissions, forgetSubmission, clearError, dropLive]);
 
   const remember = (conversationId: string, runId: string) => {
     const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -548,81 +555,175 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     writeJson(KEY_RUNS, all);
   };
 
-  const follow = useCallback(
-    (conversationId: string, runId: string) => {
-      if (streams.current.has(runId)) return;
-      let handle: StreamHandle = { close: () => undefined };
-      const isFollowing = () => streams.current.get(runId) === handle;
-      const ownsRun = () => currentRuns.current[conversationId]?.runId === runId;
-      const finish = async (status: string, err: string | null) => {
-        if (!isFollowing()) return;
-        streams.current.delete(runId);
-        handle.close();
-        const current = ownsRun();
-        if (current) updateRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error: err } }));
-        setStoppingRuns((prev) => {
-          if (!(runId in prev)) return prev;
-          const next = { ...prev };
-          delete next[runId];
-          return next;
-        });
-        if (current && selectedRef.current === conversationId) setPendingUser(null);
-        if (current && err && status !== 'cancelled') raise(conversationId, err);
-        const partial = liveRuns.current.get(runId);
-        if (current && status === 'cancelled' && hasLiveContent(partial)) {
-          // Keep what was written, marked as stopped; a reload shows only what the worker stored.
-          const kept = freezeLive(partial);
-          liveRuns.current.set(runId, kept);
-          setLive((prev) => ({ ...prev, [conversationId]: kept }));
-        } else {
-          // The stored reply replaces the live one in the same render, so the text never shows twice or disappears.
-          if (status === 'succeeded') await fetchMessages(conversationId).catch(() => null);
-          dropLive(conversationId, runId);
+  const closeFollower = useCallback((runId: string) => {
+    const follower = streams.current.get(runId);
+    streams.current.delete(runId);
+    follower?.close();
+  }, []);
+
+  const clearStopping = useCallback((runId: string) => {
+    setStoppingRuns((prev) => {
+      if (!(runId in prev)) return prev;
+      const next = { ...prev };
+      delete next[runId];
+      return next;
+    });
+  }, []);
+
+  const finishRun = useCallback(async (conversationId: string, runId: string, status: string, error: string | null) => {
+    const ownsRun = () => mounted.current && currentRuns.current[conversationId]?.runId === runId;
+    const current = currentRuns.current[conversationId];
+    if (!mounted.current || (current && (current.runId !== runId || isTerminal(current.status)))) return;
+    closeFollower(runId);
+    updateRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error } }));
+    clearStopping(runId);
+    if (selectedRef.current === conversationId) setPendingUser(null);
+    if (error && status !== 'cancelled') raise(conversationId, error);
+
+    const partial = liveRuns.current.get(runId);
+    if (status === 'cancelled' && hasLiveContent(partial)) {
+      const kept = freezeLive(partial);
+      liveRuns.current.set(runId, kept);
+      setLive((prev) => ({ ...prev, [conversationId]: kept }));
+    } else if (status === 'succeeded') {
+      // The terminal event and snapshot are published after the reply is committed.
+      const history = await fetchMessages(conversationId).catch(() => null);
+      if (history !== null) dropLive(conversationId, runId);
+    } else {
+      dropLive(conversationId, runId);
+    }
+    if (!ownsRun()) return;
+    await refreshConversations().catch(() => undefined);
+    if (ownsRun() && selectedRef.current === conversationId) {
+      await loadThread(conversationId).catch((error: unknown) => {
+        if (ownsRun() && selectedRef.current === conversationId) {
+          setThreadErrors((prev) => ({ ...prev, [conversationId]: messageOf(error) }));
         }
-        await refreshConversations().catch(() => undefined);
-        if (selectedRef.current === conversationId) await loadThread(conversationId).catch(() => undefined);
-        setApprovals(await listApprovals().catch(() => []));
+      });
+    }
+    if (!ownsRun()) return;
+    const pending = await listApprovals().catch(() => []);
+    if (ownsRun()) setApprovals(pending);
+  }, [clearStopping, closeFollower, dropLive, fetchMessages, loadThread, raise, refreshConversations, updateRuns]);
+
+  const follow = useCallback((conversationId: string, runId: string) => {
+    if (!mounted.current || streams.current.has(runId) || currentRuns.current[conversationId]?.runId !== runId) return;
+    let handle: StreamHandle | undefined;
+    let subscription: symbol | undefined;
+    let timer: number | undefined;
+    let checking = false;
+    let lastEventId = 0;
+    let lastActivity = performance.now();
+    let retries = 0;
+    let statusFailures = 0;
+
+    const closeSubscription = () => {
+      subscription = undefined;
+      handle?.close();
+      handle = undefined;
+    };
+    const follower = {
+      close() {
+        window.clearTimeout(timer);
+        closeSubscription();
+      },
+    };
+    const isCurrent = () => mounted.current && streams.current.get(runId) === follower &&
+      currentRuns.current[conversationId]?.runId === runId;
+    const warning = (visible: boolean) => {
+      if (!isCurrent()) return;
+      updateRuns((prev) => {
+        const run = prev[conversationId];
+        return Boolean(run.connectionWarning) === visible ? prev :
+          { ...prev, [conversationId]: { ...run, connectionWarning: visible } };
+      });
+    };
+    const schedule = (callback: () => void, delay: number) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(callback, delay);
+    };
+    const retryDelay = () => {
+      const attempt = retries++;
+      return attempt === 0 ? 0 : Math.min(500 * 2 ** Math.min(attempt - 1, 5), RUN_STATUS_RETRY_MAX_MS);
+    };
+    const markRunning = () => {
+      updateRuns((prev) => {
+        const run = prev[conversationId];
+        return run.status === 'queued' ? { ...prev, [conversationId]: { ...run, status: 'running' } } : prev;
+      });
+    };
+
+    function checkWhenQuiet() {
+      if (!isCurrent()) return;
+      const remaining = RUN_STREAM_IDLE_MS - (performance.now() - lastActivity);
+      if (remaining > 0) schedule(checkWhenQuiet, remaining);
+      else void checkStatus();
+    }
+
+    async function checkStatus() {
+      if (!isCurrent() || checking) return;
+      checking = true;
+      schedule(() => warning(true), RUN_STATUS_SLOW_MS);
+      const snap = await getRun(runId).catch(() => null);
+      checking = false;
+      if (!isCurrent()) return;
+      window.clearTimeout(timer);
+      if (!snap || snap.id !== runId || snap.conversation_id !== conversationId) {
+        if (++statusFailures >= 3) warning(true);
+        schedule(() => void checkStatus(), retryDelay());
+        return;
+      }
+      statusFailures = 0;
+      warning(false);
+      if (isTerminal(snap.status)) {
+        void finishRun(conversationId, runId, snap.status, snap.error);
+        return;
+      }
+      if (snap.status === 'running') markRunning();
+      if (!subscription) connect();
+      else {
+        // EventSource can reconnect on its own. Check status after silence without opening another stream.
+        schedule(checkWhenQuiet, RUN_STREAM_IDLE_MS);
+      }
+    }
+
+    function connect() {
+      const attempt = Symbol();
+      subscription = attempt;
+      const isSubscribed = () => isCurrent() && subscription === attempt;
+      const disconnected = () => {
+        if (!isSubscribed()) return;
+        closeSubscription();
+        if (!checking) schedule(() => void checkStatus(), retryDelay());
       };
-      streams.current.set(runId, handle);
-      followRun(
-        runId,
-        (type, data) => {
-          if (!isFollowing()) return;
-          // Only a lifecycle terminal ends the run; driver events feed the live reply; anything else is ignored.
-          if (isTerminal(type)) void finish(type, typeof data.error === 'string' ? data.error : null);
-          else if (!ownsRun() || isTerminal(currentRuns.current[conversationId].status)) return;
-          else if (type === 'queued' || type === 'running') {
-            updateRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
-          } else applyLive(conversationId, runId, type, data);
-        },
-        () => {
-          if (isFollowing()) {
-            void getRun(runId).then((snap) => {
-              if (!isFollowing()) return;
-              if (isTerminal(snap.status)) void finish(snap.status, snap.error);
-              else streams.current.delete(runId);
-            });
-          }
-        },
-        0,
-        'normalised-v1'
-      )
-        .then((opened) => {
-          if (!isFollowing()) {
-            opened.close();
-            return;
-          }
-          handle = opened;
-          streams.current.set(runId, handle);
-        })
-        .catch((e) => {
-          if (!isFollowing()) return;
-          streams.current.delete(runId);
-          if (ownsRun()) raise(conversationId, messageOf(e));
-        });
-    },
-    [loadThread, fetchMessages, refreshConversations, applyLive, dropLive, raise, updateRuns]
-  );
+      lastActivity = performance.now();
+      schedule(checkWhenQuiet, RUN_STREAM_IDLE_MS);
+      const after = lastEventId;
+      let replayThrough = after;
+      void followRun(runId, (type, data, id) => {
+        if (!isSubscribed()) return;
+        if (typeof id === 'number') {
+          // A browser reconnect can replay from the original URL cursor.
+          if (id < lastEventId) replayThrough = lastEventId;
+          if (id <= replayThrough) return;
+          lastEventId = id;
+        }
+        lastActivity = performance.now();
+        retries = 0;
+        statusFailures = 0;
+        warning(false);
+        if (isTerminal(type)) void finishRun(conversationId, runId, type, typeof data.error === 'string' ? data.error : null);
+        else if (type === 'running') markRunning();
+        else if (type !== 'queued') applyLive(conversationId, runId, type, data);
+      }, disconnected, after, 'normalised-v1').then((opened) => {
+        if (isSubscribed()) handle = opened;
+        else opened.close();
+      }).catch(disconnected);
+    }
+
+    streams.current.set(runId, follower);
+    connect();
+  }, [applyLive, finishRun, updateRuns]);
 
   useEffect(() => {
     let alive = true;
@@ -668,10 +769,9 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     const open = streams.current;
     return () => {
       alive = false;
-      for (const handle of open.values()) handle.close();
-      open.clear();
+      for (const id of open.keys()) closeFollower(id);
     };
-  }, [follow, withoutEmptyHistory, raise, updateRuns]);
+  }, [closeFollower, follow, withoutEmptyHistory, raise, updateRuns]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -1005,14 +1105,22 @@ ${prompt}`;
         clearDraft(chatId);
         if (retainedSourceKey) clearDraft(retainedSourceKey);
         const current = currentRuns.current[chatId];
-        if (current && current.runId !== snap.id && isTerminal(snap.status)) {
-          // A replay can acknowledge an older turn even while a newer turn owns the chat.
+        if (current && (current.runId === snap.id ? isTerminal(current.status) : isTerminal(snap.status))) {
+          // A delayed acknowledgement cannot replace a settled run or take ownership from a newer run.
           if (previewedSpecialistPrompt && selectedRef.current === chatId) setPendingUser(null);
           await loadThread(chatId).catch(() => null);
           return;
         }
         remember(chatId, snap.id);
-        if (current && current.runId !== snap.id) dropLive(chatId, current.runId);
+        if (current && current.runId !== snap.id) {
+          closeFollower(current.runId);
+          clearStopping(current.runId);
+          dropLive(chatId, current.runId);
+        }
+        if (isTerminal(snap.status)) {
+          await finishRun(chatId, snap.id, snap.status, snap.error);
+          return;
+        }
         updateRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
         await fetchMessages(chatId).catch(() => null);
         follow(chatId, snap.id);
@@ -1023,7 +1131,7 @@ ${prompt}`;
         releaseLock();
       }
     },
-    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, forgetSubmission]
+    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, forgetSubmission, clearStopping, closeFollower, finishRun]
   );
 
   const send = useCallback((text: string) => {
@@ -1071,29 +1179,25 @@ ${prompt}`;
     const cid = selectedRef.current;
     const run = cid ? currentRuns.current[cid] : undefined;
     // A Loqman answer is one request to the worker that cannot be cancelled midway; the button is disabled for it.
-    if (!cid || !run || run.runId.startsWith('ceo-') || isTerminal(run.status) || stoppingRuns[run.runId]) return;
+    if (!cid || !run || run.runId.startsWith('ceo-') || isTerminal(run.status) || stoppedRuns.current.has(run.runId)) return;
     // The text stops changing the moment Stop is pressed, before the worker confirms.
     stoppedRuns.current.add(run.runId);
     setStoppingRuns((prev) => ({ ...prev, [run.runId]: true }));
     try {
       const result = await cancelRun(run.runId);
-      const turn = liveRuns.current.get(run.runId);
-      if (result.status === 'cancelled' && currentRuns.current[cid]?.runId === run.runId &&
-          turn && streams.current.has(run.runId)) {
-        const frozen = freezeLive(turn);
-        liveRuns.current.set(run.runId, frozen);
-        setLive((prev) => ({ ...prev, [cid]: frozen }));
+      if (result.id === run.runId && result.conversation_id === cid && isTerminal(result.status)) {
+        await finishRun(cid, run.runId, result.status, result.error);
+        return;
       }
     } catch (e) {
-      stoppedRuns.current.delete(run.runId);
-      setStoppingRuns((prev) => {
-        const next = { ...prev };
-        delete next[run.runId];
-        return next;
-      });
-      if (currentRuns.current[cid]?.runId === run.runId) raise(cid, `Could not stop the reply. ${messageOf(e)}`);
+      const current = currentRuns.current[cid];
+      if (current?.runId === run.runId && !isTerminal(current.status)) {
+        raise(cid, `Could not stop the reply. ${messageOf(e)}`);
+      }
     }
-  }, [stoppingRuns, raise]);
+    stoppedRuns.current.delete(run.runId);
+    clearStopping(run.runId);
+  }, [clearStopping, finishRun, raise]);
 
   const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny') => {
     try {
@@ -1214,8 +1318,15 @@ ${prompt}`;
     runsBySeq,
     approvals,
     drafts,
-    error: shownError?.message ?? null,
+    error: shownError?.message ?? (currentRun?.connectionWarning ? runConnectionWarning : null),
     dismissError: () => {
+      if (!shownError && selectedId && currentRun?.connectionWarning) {
+        updateRuns((prev) => {
+          const run = prev[selectedId];
+          return run?.runId === currentRun.runId ? { ...prev, [selectedId]: { ...run, connectionWarning: false } } : prev;
+        });
+        return;
+      }
       if (errorKey.startsWith(SUBMISSION_PREFIX)) forgetSubmission(errorKey.slice(SUBMISSION_PREFIX.length));
       else if (shownError?.retry && typeof shownError.retry === 'object' && shownError.retry.createdCeoChat && !shownError.retry.requestId) {
         setDraftMap((prev) => {
