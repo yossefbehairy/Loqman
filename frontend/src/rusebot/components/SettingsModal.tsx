@@ -125,6 +125,8 @@ export function SettingsModal({
   profilePhoto: ProfilePhoto;
 }) {
   const providers = useProviders();
+  const savedDefault = providers.defaultPreference?.saved ?? null;
+  const effectiveDefault = providers.defaultPreference?.effective ?? null;
   const photoInput = useRef<HTMLInputElement>(null);
   const [page, setPage] = useState<PageId>(initialPage);
   const [search, setSearch] = useState('');
@@ -242,7 +244,14 @@ export function SettingsModal({
                 </Card>
                 <Card title="Default for new chats" subtitle="Used by the chat box, by Loqman, for missions and as the starting point for new agents. You can still change it per chat.">
                   <div data-providers-default>
-                    <ProviderPicker idPrefix="ai-default" value={providers.choice} onChange={(next) => void saveDefaultProvider(next)} />
+                    <ProviderPicker idPrefix="ai-default" value={savedDefault ?? effectiveDefault} onChange={(next) => void saveDefaultProvider(next)} />
+                    {!savedDefault && effectiveDefault && (
+                      <p className="mt-2 text-[12px] text-ink-secondary">No saved default. The worker uses {effectiveDefault.engine} · {effectiveDefault.model}.</p>
+                    )}
+                    {savedDefault && !providers.selectable.some((entry) => entry.id === savedDefault.engine) && (
+                      <p className="mt-2 text-[12px] text-ink-secondary">Saved default is unavailable. {savedDefault.engine} · {savedDefault.model}</p>
+                    )}
+                    {providers.defaultSaving && <p role="status" className="mt-2 text-[12px] text-ink-secondary">Saving default…</p>}
                     {providers.defaultError && <p role="alert" className="mt-2 text-[12px] text-danger">Could not save the default. {providers.defaultError}</p>}
                   </div>
                 </Card>

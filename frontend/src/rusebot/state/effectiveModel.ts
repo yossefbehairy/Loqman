@@ -8,16 +8,16 @@ export interface EffectiveModel {
 }
 
 /**
- * The model an agent really runs on. The worker falls back to the default model whenever the agent's saved model
- * is not offered by the engine in use (see routing.usable_model), so the UI must not show a stale saved id.
+ * An explicit engine keeps the profile's configuration. For an inherited engine the worker falls back
+ * to its own default when its catalog excludes the candidate (see routing.usable_model).
  */
 export function effectiveModel(snap: ProvidersSnapshot, engine: string | null | undefined, saved: string | null | undefined): EffectiveModel {
-  const eng = engine || snap.choice?.engine || '';
-  const entry = eng ? snap.models[eng] : undefined;
   const model = (saved ?? '').trim();
-  if (model && (!entry || entry.status !== 'ready' || entry.list.some((m) => m.id === model))) {
+  const worker = snap.defaultPreference?.effective;
+  const entry = worker ? snap.models[worker.engine] : undefined;
+  if (model && (engine || entry?.status !== 'ready' || entry.list.some((m) => m.id === model))) {
     return { label: model, inherited: false, saved: model };
   }
-  const fallback = snap.choice && snap.choice.engine === eng ? snap.choice.model : (entry?.list[0]?.id ?? '');
+  const fallback = worker?.model;
   return { label: fallback ? `Default · ${fallback}` : 'Default model', inherited: true, saved: model };
 }

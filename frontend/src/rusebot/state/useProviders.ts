@@ -38,6 +38,19 @@ export interface EngineChoice {
   model: string;
 }
 
+interface WorkerDefault {
+  saved: EngineChoice | null;
+  effective: EngineChoice | null;
+}
+
+function workerDefaultOf(pref: DefaultPreference & { effective_engine?: string; effective_model_id?: string }): WorkerDefault {
+  const saved = pref.engine && pref.model_id ? { engine: pref.engine, model: pref.model_id } : null;
+  const effective = pref.effective_engine && pref.effective_model_id
+    ? { engine: pref.effective_engine, model: pref.effective_model_id }
+    : saved;
+  return { saved, effective };
+}
+
 export interface ProviderEntry {
   id: string;
   status: EngineStatus | null;
@@ -60,6 +73,8 @@ export interface ProvidersSnapshot {
   selectable: ProviderEntry[];
   models: Record<string, ModelsEntry>;
   choice: EngineChoice | null;
+  defaultPreference: WorkerDefault | null;
+  defaultSaving: boolean;
   preferred: Record<string, string>;
   /** True until the first load and the default pick have finished. */
   loading: boolean;
@@ -92,6 +107,8 @@ let snap: ProvidersSnapshot = {
   selectable: [],
   models: {},
   choice: readJson<EngineChoice | null>(KEY_ENGINE, null),
+  defaultPreference: null,
+  defaultSaving: false,
   preferred: readJson<Record<string, string>>(KEY_PREFERRED, {}),
   loading: true,
   refreshing: false,
@@ -123,12 +140,15 @@ function entryOf(id: string, status: EngineStatus | null, caps: EngineCapabiliti
 
 const isUsable = (e: ProviderEntry) => e.id === 'mock' || selectable(e.state);
 
-/** Consult the live store, including catalog updates received since the last React render. */
-export function isExecutableChoice(choice: EngineChoice | null | undefined): boolean {
-  if (!choice || snap.loading) return false;
+function hasCatalogChoice(choice: EngineChoice): boolean {
   const catalog = snap.models[choice.engine];
   return catalog?.status === 'ready' && catalog.list.some((model) => model.id === choice.model) &&
     snap.selectable.some((entry) => entry.id === choice.engine && isUsable(entry));
+}
+
+/** Consult the live store, including catalog updates received since the last React render. */
+export function isExecutableChoice(choice: EngineChoice | null | undefined): boolean {
+  return !!choice && !snap.loading && hasCatalogChoice(choice);
 }
 
 export function currentExecutionChoice(): EngineChoice | null {
@@ -200,27 +220,46 @@ let choiceSeq = 0;
 let userChoiceSeq = 0;
 
 export function setProviderChoice(next: EngineChoice): void {
-  choiceSeq += 1;
   userChoiceSeq += 1;
+  rememberChoice(next);
+}
+
+function rememberChoice(next: EngineChoice): void {
+  choiceSeq += 1;
   const preferred = next.model ? { ...snap.preferred, [next.engine]: next.model } : snap.preferred;
   patch({ choice: next, preferred });
   writeJson(KEY_ENGINE, next);
   if (next.model) writeJson(KEY_PREFERRED, preferred);
 }
 
-/**
- * The Settings "Default for new chats": use it now and save it in the worker, which applies it to Loqman's
- * missions, delegation and new agents. "mock" (test mode) is never saved: the worker would refuse it.
- */
-export async function saveDefaultProvider(next: EngineChoice): Promise<void> {
-  setProviderChoice(next);
-  if (next.engine === 'mock' || !next.model) return;
-  try {
-    await preferencesSetDefault(next.engine, next.model);
-    patch({ defaultError: null });
-  } catch (e) {
-    patch({ defaultError: e instanceof Error ? e.message : String(e) });
+let defaultSaveQueue = Promise.resolve();
+let latestDefaultSave = 0;
+
+export function saveDefaultProvider(next: EngineChoice): Promise<void> {
+  if (next.engine === 'mock' || !next.model) {
+    if (!snap.defaultSaving) patch({ defaultError: 'Choose a provider with an available model.' });
+    return Promise.resolve();
   }
+  const ticket = ++latestDefaultSave;
+  const userSeq = userChoiceSeq;
+  const previous = snap.defaultPreference?.saved ?? snap.defaultPreference?.effective;
+  const followsDefault = userSeq === 0 || (snap.choice?.engine === previous?.engine && snap.choice?.model === previous?.model);
+  patch({ defaultSaving: true, defaultError: null });
+  // Serialize writes as well as acknowledgements so save order also holds in the worker.
+  defaultSaveQueue = defaultSaveQueue.then(async () => {
+    try {
+      const pref = workerDefaultOf(await preferencesSetDefault(next.engine, next.model));
+      patch({ defaultPreference: pref });
+      if (followsDefault && userSeq === userChoiceSeq && pref.saved && hasCatalogChoice(pref.saved)) {
+        rememberChoice(pref.saved);
+      }
+    } catch (e) {
+      if (ticket === latestDefaultSave) patch({ defaultError: e instanceof Error ? e.message : String(e) });
+    } finally {
+      if (ticket === latestDefaultSave) patch({ defaultSaving: false });
+    }
+  });
+  return defaultSaveQueue;
 }
 
 /** Switch provider; the model becomes that provider's preferred one (or its first). The last request wins. */
@@ -298,16 +337,17 @@ async function reconcileChoice(): Promise<void> {
  * The worker's saved default replaces a remembered choice, once, if it is usable and still offers its model.
  * `userSeq` was captured before the first requests started: anything the user chose since wins.
  */
-async function applyWorkerDefault(pref: DefaultPreference | null, userSeq: number): Promise<void> {
-  if (!pref?.engine || !pref.model_id) return;
+async function applyWorkerDefault(pref: WorkerDefault, userSeq: number): Promise<void> {
+  const saved = pref.saved;
+  if (!saved) return;
   if (userSeq !== userChoiceSeq) return;
   if (snap.selectable.some((e) => e.id === 'mock')) return; // test mode keeps "mock" preferred
-  const entry = snap.selectable.find((e) => e.id === pref.engine);
+  const entry = snap.selectable.find((e) => e.id === saved.engine);
   if (!entry || !isUsable(entry)) return;
   const ticket = choiceSeq;
-  const models = await loadProviderModels(pref.engine);
-  if (ticket !== choiceSeq || userSeq !== userChoiceSeq || !models.some((m) => m.id === pref.model_id)) return;
-  setProviderChoice({ engine: pref.engine, model: pref.model_id });
+  const models = await loadProviderModels(saved.engine);
+  if (snap.defaultPreference !== pref || ticket !== choiceSeq || userSeq !== userChoiceSeq || !models.some((m) => m.id === saved.model)) return;
+  rememberChoice(saved);
 }
 
 /** Fold a fresh engines.check discovery into the shared status, so Settings, the Composer and the dialogs agree with it. */
@@ -332,6 +372,7 @@ export function refreshProviders(force = false): Promise<void> {
   if (loadRequest) return force ? loadRequest.then(() => refreshProviders(true)) : loadRequest;
   patch({ refreshing: true });
   const userSeq = userChoiceSeq; // before any request starts, so a choice made while they are pending is seen
+  const defaultAtLoad = snap.defaultPreference;
   loadRequest = (async () => {
     let failure: string | null = null;
     const [caps, statuses, pref] = await Promise.all([
@@ -362,19 +403,26 @@ export function refreshProviders(force = false): Promise<void> {
       .filter(([, c]) => c.conversation_runs)
       .map(([id, c]) => entryOf(id, known.find((s) => s.engine_id === id) ?? null, c));
     const stamps = known.map((s) => s.checked_at).filter((t): t is string => Boolean(t));
+    const workerDefault = pref && snap.defaultPreference === defaultAtLoad ? workerDefaultOf(pref) : null;
     patch({
       statuses: statusEntries,
       selectable: selectableEntries,
       error: failure,
       checkedAt: statuses ? (stamps.sort().at(-1) ?? new Date().toISOString()) : snap.checkedAt,
+      ...(workerDefault ? { defaultPreference: workerDefault } : {}),
     });
-    await applyWorkerDefault(pref, userSeq);
+    if (workerDefault) await applyWorkerDefault(workerDefault, userSeq);
     // Account changes and empty first answers must not stick: an explicit Refresh reloads every list that was loaded.
     if (force) await Promise.all(Object.keys(snap.models).map((id) => loadProviderModels(id, true)));
     await reconcileChoice();
   })().finally(() => {
     loadRequest = null;
     patch({ loading: false, refreshing: false });
+    // Label lookup should never delay composer readiness.
+    const inheritedEngine = snap.defaultPreference?.effective?.engine;
+    if (inheritedEngine && snap.selectable.some((entry) => entry.id === inheritedEngine && isUsable(entry))) {
+      void loadProviderModels(inheritedEngine);
+    }
   });
   return loadRequest;
 }
