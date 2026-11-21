@@ -69,6 +69,7 @@ function NavRow({
 
 export interface SidebarProps {
   open: boolean;
+  inert: boolean;
   onClose: () => void;
   rail: boolean;
   onToggleRail: () => void;
@@ -99,6 +100,7 @@ export function Sidebar(props: SidebarProps) {
   const asideRef = useRef<HTMLElement>(null);
   const [plusOpen, setPlusOpen] = useState(false);
   const plusRef = useRef<HTMLDivElement>(null);
+  const plusButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!plusOpen) return;
@@ -207,6 +209,7 @@ export function Sidebar(props: SidebarProps) {
   return (
     <aside
       ref={asideRef}
+      inert={props.inert}
       tabIndex={-1}
       aria-label="Chats and navigation"
       data-sidebar
@@ -242,6 +245,7 @@ export function Sidebar(props: SidebarProps) {
               <div className="relative" ref={plusRef}>
                 <button
                   type="button"
+                  ref={plusButtonRef}
                   data-sidebar-new
                   onClick={() => setPlusOpen((o) => !o)}
                   aria-haspopup="menu"
@@ -275,6 +279,7 @@ export function Sidebar(props: SidebarProps) {
                       role="menuitem"
                       data-new-agent
                       onClick={() => {
+                        plusButtonRef.current?.focus();
                         setPlusOpen(false);
                         props.onNewAgent();
                       }}

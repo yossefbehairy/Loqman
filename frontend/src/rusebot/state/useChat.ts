@@ -195,6 +195,7 @@ export interface ChatState {
   retry: (() => void) | null;
   /** The selected chat's messages could not be read: it is not empty, it just did not load. */
   threadError: string | null;
+  threadLoading: boolean;
   retryThread: () => void;
   /** Stop was pressed and the worker has not confirmed yet. */
   stopping: boolean;
@@ -1494,6 +1495,7 @@ ${prompt}`;
     },
     retry,
     threadError,
+    threadLoading: Boolean(selectedId && !selectedId.startsWith('legacy:') && thread.cid !== selectedId && !threadError),
     retryThread,
     stopping: Boolean(currentRun && stoppingRuns[currentRun.runId]),
     sending: sendLocks.has(selectedOwnerKey),

@@ -24,7 +24,7 @@ import {
   type CeoAction,
   type Mission,
 } from './data/worker';
-import { useMediaQuery, SIDEBAR_AND_PANEL_FIT } from './lib/use-media-query';
+import { useMediaQuery, SIDEBAR_AND_PANEL_FIT, SIDEBAR_INLINE } from './lib/use-media-query';
 import type { Agent } from './types';
 import type { ApiError } from '../api/transport';
 import type { DecideResult } from './components/ApprovalCard';
@@ -48,6 +48,8 @@ export function Shell() {
   const reloadAgents = company.reload;
   const [view, setView] = useState<View>('chat');
   const [drawer, setDrawer] = useState(false);
+  const drawerToggle = useRef<HTMLButtonElement>(null);
+  const sidebarInline = useMediaQuery(SIDEBAR_INLINE, true);
   const [rail, setRail] = useState(() => readText(KEY_RAIL, '0') === '1');
   const [panelOpen, setPanelOpen] = useState(false);
   const [settings, setSettings] = useState<PageId | null>(null);
@@ -134,10 +136,17 @@ export function Shell() {
     return out;
   }, [chat.messages, chat.selectedId]);
 
+  const closeDrawer = () => {
+    if (drawer && !sidebarInline && document.activeElement?.closest('[data-sidebar]')) {
+      drawerToggle.current?.focus();
+    }
+    setDrawer(false);
+  };
+
   const goView = (next: View) => {
     chat.invalidateNavigation();
     setView(next);
-    setDrawer(false);
+    closeDrawer();
     if (next !== 'team' && next !== 'contracts') setPanelOpen(false);
   };
 
@@ -174,18 +183,20 @@ export function Shell() {
     <div className="flex h-full flex-col" data-rusebot-shell>
       <div className="relative flex min-h-0 flex-1">
         <button
+          ref={drawerToggle}
           type="button"
           aria-label="Open chat list"
           aria-expanded={drawer}
-          onClick={() => setDrawer((o) => !o)}
+          onClick={() => drawer ? closeDrawer() : setDrawer(true)}
           className="absolute left-3 top-3 z-30 rounded-md p-1.5 text-ink-secondary hover:bg-raised hover:text-ink md:hidden"
         >
           <Menu size={18} />
         </button>
-        {drawer && <div aria-hidden="true" className="absolute inset-0 z-30 bg-black/30 md:hidden" onClick={() => setDrawer(false)} />}
+        {drawer && <div aria-hidden="true" className="absolute inset-0 z-30 bg-black/30 md:hidden" onMouseDown={(event) => event.preventDefault()} onClick={closeDrawer} />}
         <Sidebar
           open={drawer}
-          onClose={() => setDrawer(false)}
+          inert={!sidebarInline && !drawer}
+          onClose={closeDrawer}
           rail={collapsed}
           onToggleRail={() => {
             const next = !rail;

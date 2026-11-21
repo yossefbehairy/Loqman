@@ -426,7 +426,10 @@ export function ChatView({
                     </button>
                   </div>
                 )}
-                {ready && !chat.threadError && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
+                {chat.threadLoading && (
+                  <p role="status" className="py-3 text-center text-[13px] text-ink-secondary">Loading conversation…</p>
+                )}
+                {ready && !chat.threadLoading && !chat.threadError && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
                   <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description={unknownRecipient
                     ? 'Sending is paused until the chat list includes this conversation.'
                     : 'Send a message to start the conversation.'} />

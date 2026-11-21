@@ -6,6 +6,7 @@
  * engines.models), About.
  */
 import { useEffect, useRef, useState } from 'react';
+import { FocusScope } from '@radix-ui/react-focus-scope';
 import { Download, Info, Palette, Search, Sparkles, User, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { AppearanceSettings } from './AppearanceSettings';
@@ -130,11 +131,9 @@ export function SettingsModal({
   const photoInput = useRef<HTMLInputElement>(null);
   const [page, setPage] = useState<PageId>(initialPage);
   const [search, setSearch] = useState('');
-  const dialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    dialogRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && !e.defaultPrevented && onClose();
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
@@ -148,8 +147,9 @@ export function SettingsModal({
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
     >
       <div aria-hidden="true" className="glass-scrim pointer-events-none absolute inset-0" />
-      <div
-        ref={dialogRef}
+      <FocusScope
+        trapped
+        loop
         role="dialog"
         aria-modal="true"
         aria-labelledby="app-settings-title"
@@ -273,7 +273,7 @@ export function SettingsModal({
             )}
           </div>
         </div>
-      </div>
+      </FocusScope>
     </div>
   );
 }

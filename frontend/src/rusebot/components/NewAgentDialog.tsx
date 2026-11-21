@@ -3,6 +3,7 @@
  * the agent is real (persisted, usable in missions and in its own chat).
  */
 import { useEffect, useRef, useState } from 'react';
+import { FocusScope } from '@radix-ui/react-focus-scope';
 import { UserPlus, X } from 'lucide-react';
 import { createProfile, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
@@ -41,8 +42,7 @@ export function NewAgentDialog({
   };
 
   useEffect(() => {
-    nameRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && !e.defaultPrevented && onClose();
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
@@ -78,7 +78,14 @@ export function NewAgentDialog({
   return (
     <div className="glass-popup-frame" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div aria-hidden="true" className="glass-scrim pointer-events-none absolute inset-0" />
-      <div
+      <FocusScope
+        trapped
+        loop
+        onMountAutoFocus={(event) => {
+          if (!nameRef.current) return;
+          event.preventDefault();
+          nameRef.current.focus();
+        }}
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-agent-title"
@@ -139,7 +146,7 @@ export function NewAgentDialog({
             </button>
           </div>
         </form>
-      </div>
+      </FocusScope>
     </div>
   );
 }
