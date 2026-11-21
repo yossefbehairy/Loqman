@@ -10,11 +10,13 @@ export function ProviderPicker({
   idPrefix,
   value,
   onChange,
+  onEngineIntent,
   className,
 }: {
   idPrefix: string;
   value: EngineChoice | null;
   onChange: (next: EngineChoice) => void;
+  onEngineIntent?: (engine: string) => void;
   className?: string;
 }) {
   const s = useProviders();
@@ -30,6 +32,7 @@ export function ProviderPicker({
   const latestPick = useRef(0);
   const pickEngine = async (id: string) => {
     const mine = ++latestPick.current;
+    onEngineIntent?.(id);
     const list = await loadProviderModels(id);
     if (mine !== latestPick.current) return;
     onChange({ engine: id, model: defaultModelFor(id, list) });
