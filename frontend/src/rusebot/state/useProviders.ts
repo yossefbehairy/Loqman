@@ -155,6 +155,17 @@ export function currentExecutionChoice(): EngineChoice | null {
   return isExecutableChoice(snap.choice) ? snap.choice : null;
 }
 
+/** Check a saved Retry choice independently of the current composer choice. */
+export function retryProviderReadiness(choice: EngineChoice, providers = snap) {
+  const catalog = providers.models[choice.engine];
+  if (providers.loading || providers.refreshing || catalog?.status === 'loading') return 'checking';
+  const engine = providers.selectable.find(entry => entry.id === choice.engine);
+  if (providers.error || catalog?.status === 'error' || engine?.state === 'error') return 'failed';
+  if (!engine || !isUsable(engine)) return 'unavailable';
+  if (!catalog) return 'needs-catalog';
+  return catalog.list.some(model => model.id === choice.model) ? 'ready' : 'unavailable';
+}
+
 // ---- models -------------------------------------------------------------------------
 
 const modelRequests = new Map<string, Promise<EngineModel[]>>();
@@ -234,6 +245,13 @@ function rememberChoice(next: EngineChoice): void {
 
 let defaultSaveQueue = Promise.resolve();
 let latestDefaultSave = 0;
+let latestDefaultSelection = 0;
+
+/** Register an explicit Settings pick before catalog discovery, even across Settings remounts. */
+export function beginDefaultProviderSelection(): () => boolean {
+  const ticket = ++latestDefaultSelection;
+  return () => ticket === latestDefaultSelection;
+}
 
 export function saveDefaultProvider(next: EngineChoice): Promise<void> {
   if (next.engine === 'mock' || !next.model) {
@@ -376,9 +394,12 @@ export function refreshProviders(force = false): Promise<void> {
   loadRequest = (async () => {
     let failure: string | null = null;
     const [caps, statuses, pref] = await Promise.all([
-      engineCapabilities().catch(() => null),
+      engineCapabilities().catch((e: unknown) => {
+        failure ??= e instanceof Error ? e.message : String(e);
+        return null;
+      }),
       engineStatuses(force).catch((e: unknown) => {
-        failure = e instanceof Error ? e.message : String(e);
+        failure ??= e instanceof Error ? e.message : String(e);
         return null;
       }),
       workerDefaultRead

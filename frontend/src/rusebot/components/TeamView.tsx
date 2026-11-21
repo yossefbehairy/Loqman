@@ -213,20 +213,23 @@ export function AgentPanel({
 }) {
   const drawerModel = effectiveModel(useProviders(), profile?.engine, profile?.default_model_id ?? agent.model);
   const [task, setTask] = useState('');
+  const taskRevision = useRef(0);
   const [instructions, setInstructions] = useState(profile?.instructions ?? '');
   const [note, setNote] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
   const delegate = async () => {
-    if (!task.trim()) return;
+    const assignment = task.trim();
+    if (!assignment) return;
+    const submittedRevision = taskRevision.current;
     setBusy(true);
     setNote(null);
     try {
       if (!profile) throw new Error('This agent has no profile to run the work under.');
       // The worker resolves the engine and model: the agent's own engine, else the default chosen in Settings.
-      const mission = await delegateToAgent(profile, task.trim());
+      const mission = await delegateToAgent(profile, assignment);
       setNote({ kind: 'ok', text: `Delegated. Mission ${mission.status}.` });
-      setTask('');
+      if (taskRevision.current === submittedRevision) setTask('');
       onChanged();
     } catch (e) {
       setNote({ kind: 'error', text: messageOf(e) });
@@ -323,7 +326,17 @@ export function AgentPanel({
 
         <section className="agent-details-section">
           <h3><label htmlFor="rb-delegate">Delegate a task</label></h3>
-          <textarea id="rb-delegate" value={task} onChange={e => setTask(e.target.value)} rows={3} dir="auto" placeholder={`What should ${agent.name} do?`} />
+          <textarea
+            id="rb-delegate"
+            value={task}
+            onChange={e => {
+              taskRevision.current++;
+              setTask(e.target.value);
+            }}
+            rows={3}
+            dir="auto"
+            placeholder={`What should ${agent.name} do?`}
+          />
           <button type="button" disabled={busy || !task.trim()} onClick={() => void delegate()} className="ui-button ui-button-sm">
             Delegate
           </button>

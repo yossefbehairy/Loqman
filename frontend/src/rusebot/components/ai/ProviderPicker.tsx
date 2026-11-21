@@ -11,12 +11,15 @@ export function ProviderPicker({
   value,
   onChange,
   onEngineIntent,
+  onSelectionIntent,
   className,
 }: {
   idPrefix: string;
   value: EngineChoice | null;
   onChange: (next: EngineChoice) => void;
   onEngineIntent?: (engine: string) => void;
+  /** Start tracking a selection across picker instances and return a check for its ownership. */
+  onSelectionIntent?: () => () => boolean;
   className?: string;
 }) {
   const s = useProviders();
@@ -32,14 +35,16 @@ export function ProviderPicker({
   const latestPick = useRef(0);
   const pickEngine = async (id: string) => {
     const mine = ++latestPick.current;
+    const isCurrent = onSelectionIntent?.();
     onEngineIntent?.(id);
     const list = await loadProviderModels(id);
-    if (mine !== latestPick.current) return;
+    if (mine !== latestPick.current || isCurrent?.() === false) return;
     onChange({ engine: id, model: defaultModelFor(id, list) });
   };
   const pickModel = (model: string) => {
     if (!value) return;
     latestPick.current += 1;
+    onSelectionIntent?.();
     onChange({ engine: value.engine, model });
   };
 

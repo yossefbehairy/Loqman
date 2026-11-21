@@ -200,16 +200,24 @@ function EmptyChat({ name, role, description }: { name: string; role?: string; d
   );
 }
 
-export function ChatErrorBanner({ message, onDismiss, onRetry }: { message: string | null; onDismiss: () => void; onRetry?: (() => void) | null }) {
+export function ChatErrorBanner({ message, onDismiss, onRetry, providerCheck }: {
+  message: string | null;
+  onDismiss: () => void;
+  onRetry?: (() => void) | null;
+  providerCheck: ChatState['retryProviderCheck'];
+}) {
   if (!message) return null;
   return (
     <div className="w-full px-5">
       <div role="alert" className="mb-2 flex items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[13px] text-danger">
         <div className="min-w-0 flex-1 break-words">
           <p dir="auto">{message}</p>
+          {providerCheck === 'checking' && <p role="status">Checking the original engine and model…</p>}
+          {providerCheck === 'unavailable' && <p>The original engine and model are currently unavailable. Restore them in Settings → AI before retrying.</p>}
+          {providerCheck === 'failed' && <p>Could not check the original engine and model. Retry to check again, or refresh providers in Settings → AI.</p>}
         </div>
         {onRetry && (
-          <button type="button" data-chat-retry onClick={onRetry} className="shrink-0 rounded px-1.5 font-medium underline hover:bg-danger/10">
+          <button type="button" data-chat-retry onClick={onRetry} disabled={providerCheck === 'checking'} className="shrink-0 rounded px-1.5 font-medium underline hover:bg-danger/10 disabled:opacity-60">
             Retry
           </button>
         )}
@@ -466,7 +474,7 @@ export function ChatView({
         <div className="chat-column-dock relative z-[2] w-full shrink-0">
           <div className="pointer-events-none relative px-5 pb-3">
             <div className="pointer-events-auto">
-              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} onRetry={chat.retry} />
+              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} onRetry={chat.retry} providerCheck={chat.retryProviderCheck} />
             </div>
             <div className="pointer-events-auto relative w-full">
               <div className="relative">

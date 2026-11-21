@@ -41,6 +41,8 @@ import {
   currentExecutionChoice,
   isExecutableChoice,
   loadProviderModels,
+  refreshProviders,
+  retryProviderReadiness,
   selectProviderEngine,
   setProviderChoice,
   useProviders,
@@ -193,6 +195,7 @@ export interface ChatState {
   dismissError: () => void;
   /** Runs the failed step again (resend the message, reload the chat or the list); null when there is nothing to retry. */
   retry: (() => void) | null;
+  retryProviderCheck: 'checking' | 'unavailable' | 'failed' | null;
   /** The selected chat's messages could not be read: it is not empty, it just did not load. */
   threadError: string | null;
   threadLoading: boolean;
@@ -352,6 +355,7 @@ export function useChat(
   onAgentsChanged?: () => void,
   onCeoActionsChanged?: () => void
 ): ChatState {
+  const providers = useProviders();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const rememberConversation = useCallback((chat: Conversation) => {
     setConversations((prev) => {
@@ -953,6 +957,8 @@ export function useChat(
         raise(errorOwner, `${missingSettings}: ${prompt}`, attempt);
         return;
       }
+      // Send can also recover an unchanged draft. Check the live store for both entry points.
+      if (attempt.requestId && agentId !== CEO_PROFILE_ID && retryProviderReadiness(execution) !== 'ready') return;
       if (agentId === CEO_PROFILE_ID && prompt.length > CEO_MAX_CHARS) {
         raise(
           errorOwner,
@@ -1015,8 +1021,8 @@ export function useChat(
       };
       try {
         if (!persist(ownsDraft(key))) return;
-        // A restored attempt may target an engine whose catalog has not loaded in this session.
-        if (attempt.requestId && !isExecutableChoice(execution)) await loadProviderModels(execution.engine);
+        // CEO recovery still loads its original catalog on demand.
+        if (attempt.requestId && agentId === CEO_PROFILE_ID && !isExecutableChoice(execution)) await loadProviderModels(execution.engine);
         const requireOriginalModel = () => {
           if (!isExecutableChoice(execution)) throw new Error('The original engine and model are currently unavailable');
         };
@@ -1422,6 +1428,14 @@ ${prompt}`;
   const errorKey = errors[selectedOwnerKey] ? selectedOwnerKey : submissionKey ?? '';
   const shownError = errors[errorKey];
   const threadError = selectedId ? (threadErrors[selectedId] ?? null) : null;
+  const recovery = shownError?.retry;
+  const retryChoice = recovery && recovery !== 'load' && recovery.agentId !== CEO_PROFILE_ID ? recovery.execution : null;
+  const retryReadiness = retryChoice ? retryProviderReadiness(retryChoice, providers) : 'ready';
+  const retryEngine = retryChoice?.engine;
+  useEffect(() => {
+    // Startup typically loads the composer catalog, which may use a different engine.
+    if (retryReadiness === 'needs-catalog' && retryEngine) void loadProviderModels(retryEngine);
+  }, [retryReadiness, retryEngine]);
 
   const retry = useMemo(() => {
     if (!shownError?.retry) return null;
@@ -1436,13 +1450,17 @@ ${prompt}`;
             return;
           }
         }
+        if (retryChoice && retryProviderReadiness(retryChoice) === 'failed') {
+          void refreshProviders(true);
+          return;
+        }
         void sendAttempt(action, errorKey);
         return;
       }
       clearError(errorKey || null);
       void refreshConversations().catch((e) => raise(null, `Could not load your chats. ${messageOf(e)}`, 'load'));
     };
-  }, [shownError, conversations, sendAttempt, clearError, errorKey, refreshConversations, raise]);
+  }, [shownError, conversations, sendAttempt, clearError, errorKey, refreshConversations, raise, retryChoice]);
 
   const retryThread = useCallback(() => {
     const cid = selectedRef.current;
@@ -1494,6 +1512,7 @@ ${prompt}`;
       clearError(errorKey || null);
     },
     retry,
+    retryProviderCheck: retryReadiness === 'ready' ? null : retryReadiness === 'needs-catalog' ? 'checking' : retryReadiness,
     threadError,
     threadLoading: Boolean(selectedId && !selectedId.startsWith('legacy:') && thread.cid !== selectedId && !threadError),
     retryThread,

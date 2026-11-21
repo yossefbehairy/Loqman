@@ -19,6 +19,7 @@ async function fixture(page: Page) {
   let saved = alpha;
   let rejectSave = false;
   let heldSave: { received: ReturnType<typeof deferred>; reply: ReturnType<typeof deferred> } | undefined;
+  let heldCodexCatalog: { received: ReturnType<typeof deferred>; reply: ReturnType<typeof deferred> } | undefined;
   const writes: Preference[] = [];
   const reads: Preference[] = [];
   const executions: Rpc[] = [];
@@ -37,6 +38,10 @@ async function fixture(page: Page) {
       })) });
     }
     if (call.method === 'engines.models') {
+      if (call.params.engine_id === beta.engine && heldCodexCatalog) {
+        heldCodexCatalog.received.release();
+        await heldCodexCatalog.reply.promise;
+      }
       const models = catalogs[call.params.engine_id as keyof typeof catalogs] ?? [];
       return reply({ models: models.map(({ model_id }) => ({ id: model_id, name: model_id })) });
     }
@@ -68,6 +73,7 @@ async function fixture(page: Page) {
     saved: () => saved,
     failSave: () => { rejectSave = true; },
     holdSave: () => (heldSave = { received: deferred(), reply: deferred() }),
+    holdCodexCatalog: () => (heldCodexCatalog = { received: deferred(), reply: deferred() }),
   };
 }
 
@@ -187,6 +193,45 @@ test('an acknowledged default survives reopening and is read back from worker pr
   await displayedDefault(page, beta);
   expect(worker.writes).toEqual([beta]);
   expect(worker.reads).toEqual([alpha, beta]);
+});
+
+test('UX-01: a pending provider choice cannot overwrite a newer default after Settings reopens', async ({ page }) => {
+  const worker = await fixture(page);
+  await openHome(page);
+  await openGeneral(page);
+  const oldCatalog = worker.holdCodexCatalog();
+  try {
+    await pick(defaults(page).locator('#ai-default-engine'), beta.engine);
+    await oldCatalog.received.promise;
+    await closeGeneral(page);
+    await openGeneral(page);
+    await pick(defaults(page).locator('#ai-default-model'), alternate.model_id);
+    await displayedDefault(page, alternate);
+    expect(worker.saved()).toEqual(alternate);
+
+    const catalogResponse = page.waitForResponse(response => {
+      const request = response.request();
+      if (!request.url().endsWith('/__agentos/call') || request.method() !== 'POST') return false;
+      const call = request.postDataJSON() as Rpc;
+      return call.method === 'engines.models' && call.params.engine_id === beta.engine;
+    });
+    oldCatalog.reply.release();
+    expect(await (await catalogResponse).finished()).toBeNull();
+
+    // Choosing B in Chat confirms its catalog is now available without saving a default.
+    await closeGeneral(page);
+    await overrideChat(page, beta);
+    await openGeneral(page);
+    expect(worker.saved()).toEqual(alternate);
+    await displayedDefault(page, alternate);
+    await page.reload();
+    await openGeneral(page);
+    await displayedDefault(page, alternate);
+    expect(worker.reads.at(-1)).toEqual(alternate);
+    expect(worker.writes).toEqual([alternate]);
+  } finally {
+    oldCatalog.reply.release();
+  }
 });
 
 test('agent labels use the worker default for inheritance and keep explicit settings', async ({ page }) => {

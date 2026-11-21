@@ -13,7 +13,7 @@ import { AppearanceSettings } from './AppearanceSettings';
 import { AiProviders } from './AiProviders';
 import { ProviderPicker } from './ai/ProviderPicker';
 import { SettingsSelect } from './ai/SettingsSelect';
-import { saveDefaultProvider, useProviders } from '../state/useProviders';
+import { beginDefaultProviderSelection, saveDefaultProvider, useProviders } from '../state/useProviders';
 import type { ProfilePhoto } from '../state/useProfilePhoto';
 import { UserAvatar } from './UserAvatar';
 
@@ -244,7 +244,7 @@ export function SettingsModal({
                 </Card>
                 <Card title="Default for new chats" subtitle="Used by the chat box, by Loqman, for missions and as the starting point for new agents. You can still change it per chat.">
                   <div data-providers-default>
-                    <ProviderPicker idPrefix="ai-default" value={savedDefault ?? effectiveDefault} onChange={(next) => void saveDefaultProvider(next)} />
+                    <ProviderPicker idPrefix="ai-default" value={savedDefault ?? effectiveDefault} onSelectionIntent={beginDefaultProviderSelection} onChange={(next) => void saveDefaultProvider(next)} />
                     {!savedDefault && effectiveDefault && (
                       <p className="mt-2 text-[12px] text-ink-secondary">No saved default. The worker uses {effectiveDefault.engine} · {effectiveDefault.model}.</p>
                     )}
