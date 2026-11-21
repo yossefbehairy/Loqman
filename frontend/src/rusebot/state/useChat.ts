@@ -158,6 +158,12 @@ export interface RunState {
   connectionWarning?: boolean;
 }
 
+interface ResultsDrafts {
+  list: Draft[] | null;
+  loading: boolean;
+  error: string | null;
+}
+
 export interface ChatState {
   conversations: Conversation[];
   legacy: LegacyThread[];
@@ -174,6 +180,7 @@ export interface ChatState {
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
   drafts: Record<string, Draft[]>;
+  resultsDrafts: ResultsDrafts;
   error: string | null;
   dismissError: () => void;
   /** Runs the failed step again (resend the message, reload the chat or the list); null when there is nothing to retry. */
@@ -193,7 +200,7 @@ export interface ChatState {
   newChat: () => void;
   decide: (approval: Approval, decision: 'approve' | 'deny') => Promise<void>;
   makeDeliverable: (runId: string) => Promise<void>;
-  reviewDraft: (draft: Draft, decision: 'approve' | 'reject') => Promise<void>;
+  reviewDraft: (draft: Draft, decision: 'approve' | 'reject') => Promise<string | void>;
   downloadDraft: (draft: Draft) => Promise<void>;
   loaded: boolean;
   activeRunIds: Record<string, string>;
@@ -428,6 +435,8 @@ export function useChat(
   );
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
+  const [resultsDrafts, setResultsDrafts] = useState<ResultsDrafts>({ list: null, loading: true, error: null });
+  const resultsRead = useRef({ ticket: 0, pending: false });
   // Keep the legacy '' entry in storage for recovery. Its agent is unknown.
   const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
   const [submissions] = useState(readSubmissions);
@@ -1323,46 +1332,57 @@ ${prompt}`;
   }, [raise]);
 
   const loadAllDrafts = useCallback(async () => {
-    const next: Record<string, Draft[]> = {};
-    const fromWorker = await listAllDrafts().catch(() => null);
-    if (fromWorker) {
+    const ticket = ++resultsRead.current.ticket;
+    resultsRead.current.pending = true;
+    setResultsDrafts((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const fromWorker = await listAllDrafts();
+      if (!mounted.current || ticket !== resultsRead.current.ticket) return;
+      const next: Record<string, Draft[]> = {};
       for (const d of fromWorker) (next[d.run_id] ??= []).push(d);
       for (const list of Object.values(next)) list.reverse(); // the worker lists newest first; cards read oldest first
-    } else {
-      const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
-      for (const id of Object.values(all).flat()) {
-        const list = await listDrafts(id).catch(() => []);
-        if (list.length) next[id] = list;
+      setResultsDrafts({ list: Object.values(next).flat(), loading: false, error: null });
+    } catch (e) {
+      if (mounted.current && ticket === resultsRead.current.ticket) {
+        setResultsDrafts((prev) => ({ ...prev, loading: false, error: messageOf(e) }));
       }
+    } finally {
+      if (ticket === resultsRead.current.ticket) resultsRead.current.pending = false;
     }
-    setDrafts((prev) => ({ ...prev, ...next }));
   }, []);
 
   const reviewDraft = useCallback(async (draft: Draft, decision: 'approve' | 'reject') => {
+    const updated = await decideDraft(draft.run_id, draft.id, decision, draft.content_sha256);
+    const replace = (item: Draft) => item.id === updated.id ? { ...item, ...updated } : item;
+    setDrafts((prev) => {
+      const list = prev[draft.run_id];
+      return list ? { ...prev, [draft.run_id]: list.map(replace) } : prev;
+    });
+    setResultsDrafts((prev) => prev.list ? { ...prev, list: prev.list.map(replace) } : prev);
+    // A read started before the decision may still carry the pre-review state.
+    if (resultsRead.current.pending) void loadAllDrafts();
     try {
-      await decideDraft(draft.run_id, draft.id, decision, draft.content_sha256);
+      const list = await listDrafts(draft.run_id);
+      setDrafts((prev) => ({ ...prev, [draft.run_id]: list }));
     } catch (e) {
-      raise(selectedRef.current, messageOf(e));
+      return messageOf(e);
     }
-    const list = await listDrafts(draft.run_id).catch(() => []);
-    setDrafts((prev) => ({ ...prev, [draft.run_id]: list }));
-  }, [raise]);
+  }, [loadAllDrafts]);
 
   const downloadDraft = useCallback(async (draft: Draft) => {
+    const out = await draftContent(draft.run_id, draft.id);
+    const url = URL.createObjectURL(new Blob([out.content], { type: out.media_type }));
+    const link = document.createElement('a');
     try {
-      const out = await draftContent(draft.run_id, draft.id);
-      const url = URL.createObjectURL(new Blob([out.content], { type: out.media_type }));
-      const link = document.createElement('a');
       link.href = url;
       link.download = out.filename;
       document.body.appendChild(link);
       link.click();
+    } finally {
       link.remove();
       URL.revokeObjectURL(url);
-    } catch (e) {
-      raise(selectedRef.current, messageOf(e));
     }
-  }, [raise]);
+  }, []);
 
   const messages = thread.cid !== null && thread.cid === selectedId ? thread.list : NO_MESSAGES;
   const runsBySeq = runsThread.cid !== null && runsThread.cid === selectedId ? runsThread.map : NO_RUNS;
@@ -1423,6 +1443,7 @@ ${prompt}`;
     runsBySeq,
     approvals,
     drafts,
+    resultsDrafts,
     error: shownError?.message ?? (currentRun?.connectionWarning ? runConnectionWarning : null),
     dismissError: () => {
       if (!shownError && selectedId && currentRun?.connectionWarning) {

@@ -7,7 +7,7 @@
 import { PackageCheck } from 'lucide-react';
 import { ApprovalCard, type DecideResult } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
-import type { Approval, CeoAction, Draft } from '../data/worker';
+import type { Approval, CeoAction } from '../data/worker';
 import type { ChatState } from '../state/useChat';
 import { useKeepDecided } from '../state/useKeepDecided';
 
@@ -20,7 +20,7 @@ export function ResultsView({
   ceoActions: CeoAction[];
   onCeoDecide: (action: CeoAction, decision: 'approve' | 'deny') => Promise<DecideResult>;
 }) {
-  const drafts: Draft[] = Object.values(chat.drafts).flat();
+  const { list: drafts, loading, error } = chat.resultsDrafts;
   const { shown: approvals, decide: decideApproval } = useKeepDecided<Approval>(chat.approvals);
   const { shown: managerActions, decide: decideAction } = useKeepDecided<CeoAction>(ceoActions);
   const waiting = chat.approvals.length + ceoActions.length;
@@ -31,7 +31,7 @@ export function ResultsView({
           <div className="flex items-center gap-2.5">
             <PackageCheck size={18} />
             <h1 className="text-[17px] font-semibold">Results</h1>
-            <span className="ml-1 text-[11px] text-ink-secondary">{drafts.length} deliverables</span>
+            {drafts && <span className="ml-1 text-[11px] text-ink-secondary">{drafts.length} deliverables</span>}
           </div>
           <p className="mt-1 text-[12px] text-ink-secondary">What needs your decision, and the work your team has handed in.</p>
         </div>
@@ -63,12 +63,23 @@ export function ResultsView({
           </section>
           <section aria-label="Deliverables" className="flex flex-col gap-2">
             <h2 className="text-[13px] font-semibold">Deliverables</h2>
-            {drafts.length === 0 && (
+            {loading && <p role="status" className="text-[13px] text-ink-secondary">
+              {drafts ? 'Refreshing deliverables…' : 'Loading deliverables…'}
+            </p>}
+            {error && (
+              <div className="flex items-start gap-2 text-[13px] text-danger">
+                <p role="alert" dir="auto">
+                  {drafts ? 'Could not refresh deliverables. Showing the last loaded results.' : 'Could not load deliverables.'} {error}
+                </p>
+                <button type="button" className="shrink-0 font-medium underline" onClick={() => void chat.loadAllDrafts()}>Retry</button>
+              </div>
+            )}
+            {!loading && !error && drafts?.length === 0 && (
               <p className="text-[13px] text-ink-secondary">
                 No deliverables yet. Save a finished reply from a chat to review it here.
               </p>
             )}
-            {drafts.map((d) => (
+            {drafts?.map((d) => (
               <DeliverableCard key={d.id} draft={d} onReview={chat.reviewDraft} onDownload={chat.downloadDraft} />
             ))}
           </section>
