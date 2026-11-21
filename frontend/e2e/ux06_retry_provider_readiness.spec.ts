@@ -37,20 +37,46 @@ async function recoverableChat(page: Page, discovery: Discovery, legacy = false)
   const enginesReleased = gate();
   const modelsArrived = gate();
   const modelsReleased = gate();
+  const fallbackArrived = gate();
+  const fallbackReleased = gate();
+  const recheckModelsArrived = gate();
+  const recheckModelsReleased = gate();
+  const recheckFallbackReleased = gate();
   const calls: Rpc[] = [];
   const executions = () => calls.filter(call => ['conversations.bind_profile', 'runs.start_turn'].includes(call.method));
   let reloading = false;
+  let rechecking = false;
   let original: Rpc | undefined;
   await page.route('**/__agentos/call', async route => {
     const call = route.request().postDataJSON() as Rpc;
     calls.push(call);
     const reject = (status: number, detail: string) => route.fulfill({ status, json: { status, detail } });
+    const reply = (result: unknown) => route.fulfill({ json: { result } });
     if (reloading && call.method === 'engines.status' && !call.params.force) {
       enginesArrived.release();
       await enginesReleased.promise;
       if (discovery === 'engine failure') return reject(503, 'Provider discovery fixture is offline.');
     }
+    if (reloading && discovery === 'catalog failure') {
+      if (call.method === 'engines.capabilities') {
+        return reply({ mock: { conversation_runs: true }, codex: { conversation_runs: true } });
+      }
+      if (call.method === 'engines.status') {
+        rechecking ||= call.params.force === true;
+        return reply({ engines: [{ engine_id: 'codex', state: 'ready', install_state: 'installed', auth_state: 'authenticated' }] });
+      }
+      if (call.method === 'engines.models' && call.params.engine_id === 'codex') {
+        fallbackArrived.release();
+        await (rechecking ? recheckFallbackReleased : fallbackReleased).promise;
+        return reply({ models: [{ id: 'fixture-codex-model', name: 'Fixture Codex model' }] });
+      }
+    }
     if (reloading && call.method === 'models.free') {
+      if (discovery === 'catalog failure' && rechecking) {
+        recheckModelsArrived.release();
+        await recheckModelsReleased.promise;
+        return reply(catalog);
+      }
       modelsArrived.release();
       await modelsReleased.promise;
       if (discovery === 'catalog failure') return reject(503, 'Model catalog fixture is offline.');
@@ -94,7 +120,8 @@ async function recoverableChat(page: Page, discovery: Discovery, legacy = false)
     return { submitted, record, saved };
   }
 
-  return { chat, profile, preference, calls, executions, startReload, enginesReleased, modelsArrived, modelsReleased };
+  return { chat, profile, preference, calls, executions, startReload, enginesReleased, modelsArrived, modelsReleased,
+    fallbackArrived, fallbackReleased, recheckModelsArrived, recheckModelsReleased, recheckFallbackReleased };
 }
 
 for (const legacy of [false, true]) {
@@ -139,10 +166,11 @@ for (const discovery of ['missing', 'engine failure', 'catalog failure'] as cons
   test('UX-06: restored Retry reports ' + discovery + ' and preserves recovery', async ({ page }) => {
     const fixture = await recoverableChat(page, discovery);
     try {
-      const { record, saved } = await fixture.startReload();
+      const { submitted, record, saved } = await fixture.startReload();
       const before = fixture.executions();
       fixture.enginesReleased.release();
       fixture.modelsReleased.release();
+      if (discovery === 'catalog failure') await fixture.fallbackArrived.promise;
       const notice = page.getByRole('alert').filter({ hasText: discovery === 'missing' ? unavailable : failed });
       await expect(notice).toBeVisible();
       await expect(notice).toContainText('Settings');
@@ -152,9 +180,51 @@ for (const discovery of ['missing', 'engine failure', 'catalog failure'] as cons
       await expect(composer(page)).toHaveValue(prompt);
       expect(fixture.executions()).toEqual(before);
       expect(await record()).toBe(saved);
+
+      if (discovery === 'catalog failure') {
+        const forcedChecks = () => fixture.calls.filter(call => call.method === 'engines.status' && call.params.force === true);
+        const checking = page.getByRole('status').filter({ hasText: pending });
+        // On failure Retry only rechecks providers. Rapid clicks must not queue another recheck.
+        await retry(page).evaluate((button: HTMLButtonElement) => {
+          button.click();
+          button.click();
+        });
+        await expect(checking).toBeVisible();
+        await expect(retry(page)).toBeDisabled();
+        await expect(notice).toHaveCount(0);
+        expect(fixture.executions()).toEqual(before);
+
+        fixture.fallbackReleased.release();
+        await fixture.recheckModelsArrived.promise;
+        await expect(checking).toBeVisible();
+        await expect(notice).toHaveCount(0);
+        expect(forcedChecks()).toHaveLength(1);
+        expect(await record()).toBe(saved);
+        expect(fixture.executions()).toEqual(before);
+
+        fixture.recheckModelsReleased.release();
+        await expect(retry(page)).toBeEnabled();
+        await expect(notice).toHaveCount(0);
+        expect(fixture.executions()).toEqual(before);
+        expect(await record()).toBe(saved);
+        await retry(page).click();
+        await expect.poll(record).toBeNull();
+        const fallbackResponse = page.waitForResponse(response => {
+          if (!response.url().endsWith('/__agentos/call')) return false;
+          const call = response.request().postDataJSON() as Rpc;
+          return call.method === 'engines.models' && call.params.engine_id === 'codex';
+        });
+        fixture.recheckFallbackReleased.release();
+        expect((await fallbackResponse).ok()).toBe(true);
+        expect(fixture.executions()).toEqual([...before, submitted]);
+        expect(forcedChecks()).toHaveLength(1);
+      }
     } finally {
       fixture.enginesReleased.release();
       fixture.modelsReleased.release();
+      fixture.fallbackReleased.release();
+      fixture.recheckModelsReleased.release();
+      fixture.recheckFallbackReleased.release();
     }
   });
 }

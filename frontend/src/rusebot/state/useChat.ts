@@ -357,7 +357,10 @@ export function useChat(
 ): ChatState {
   const providers = useProviders();
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  // List reads and locally acknowledged conversation records share one publication order.
+  const conversationListRevision = useRef(0);
   const rememberConversation = useCallback((chat: Conversation) => {
+    conversationListRevision.current++;
     setConversations((prev) => {
       const existing = prev.find((row) => row.id === chat.id);
       if (!existing) return [chat, ...prev];
@@ -578,9 +581,22 @@ export function useChat(
     return list.filter((c) => c.id !== history.id);
   }, []);
 
-  const refreshConversations = useCallback(async () => {
-    setConversations(await withoutEmptyHistory(await listConversations()));
+  const readConversationList = useCallback(async (isActive = () => mounted.current) => {
+    const revision = ++conversationListRevision.current;
+    const isCurrent = () => isActive() && revision === conversationListRevision.current;
+    try {
+      const list = await withoutEmptyHistory(await listConversations());
+      if (isCurrent()) setConversations(list);
+      return list;
+    } catch (error) {
+      if (isCurrent()) throw error;
+      return null;
+    }
   }, [withoutEmptyHistory]);
+
+  const refreshConversations = useCallback(async () => {
+    await readConversationList();
+  }, [readConversationList]);
 
   // Every read of a chat takes a number; an older answer that arrives after a newer one is dropped,
   // and an answer for a chat that is no longer open is never shown.
@@ -832,10 +848,9 @@ export function useChat(
     (async () => {
       try {
         await importLegacyCeo().catch(() => undefined);
-        const all0 = await listConversations();
-        const list = await withoutEmptyHistory(all0);
         if (!alive) return;
-        setConversations(list);
+        const list = await readConversationList(() => alive);
+        if (!alive || !list) return;
         const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
         // Recover from the cache, and ask the worker about recent chats the cache does not know (cleared storage).
         const lastRun: Record<string, string | undefined> = {};
@@ -872,7 +887,7 @@ export function useChat(
       alive = false;
       for (const id of open.keys()) closeFollower(id);
     };
-  }, [closeFollower, follow, withoutEmptyHistory, raise, refreshApprovals, updateRuns]);
+  }, [closeFollower, follow, readConversationList, raise, refreshApprovals, updateRuns]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -1188,6 +1203,7 @@ export function useChat(
             return null;
           });
           if (bound) {
+            conversationListRevision.current++;
             setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
             if (bound.profile_id !== agentId) throw new Error('The conversation is bound to a different agent.');
             if (missingLegacyProfiles.delete(agentId)) writeJson(missingLegacyProfilesKey, [...missingLegacyProfiles]);

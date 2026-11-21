@@ -64,6 +64,7 @@ export interface ModelsEntry {
   status: 'loading' | 'ready' | 'error';
   list: EngineModel[];
   error: string | null;
+  recheck?: symbol;
 }
 
 export interface ProvidersSnapshot {
@@ -79,6 +80,7 @@ export interface ProvidersSnapshot {
   /** True until the first load and the default pick have finished. */
   loading: boolean;
   refreshing: boolean;
+  recheck: symbol | null;
   error: string | null;
   checkedAt: string | null;
   /** Why the last attempt to save the default to the worker failed, if it did. */
@@ -112,6 +114,7 @@ let snap: ProvidersSnapshot = {
   preferred: readJson<Record<string, string>>(KEY_PREFERRED, {}),
   loading: true,
   refreshing: false,
+  recheck: null,
   error: null,
   checkedAt: null,
   defaultError: null,
@@ -158,9 +161,14 @@ export function currentExecutionChoice(): EngineChoice | null {
 /** Check a saved Retry choice independently of the current composer choice. */
 export function retryProviderReadiness(choice: EngineChoice, providers = snap) {
   const catalog = providers.models[choice.engine];
-  if (providers.loading || providers.refreshing || catalog?.status === 'loading') return 'checking';
+  const catalogIsCurrent = !providers.recheck || catalog?.recheck === providers.recheck;
+  // The saved pair's catalog can fail while startup is still finding a composer fallback.
+  if (catalogIsCurrent && catalog?.status === 'error') return 'failed';
+  // After startup, a recheck can settle this pair while other catalogs are still refreshing.
+  const checkingProviders = providers.loading || (!providers.recheck && providers.refreshing);
+  if (checkingProviders || !catalogIsCurrent || catalog?.status === 'loading') return 'checking';
   const engine = providers.selectable.find(entry => entry.id === choice.engine);
-  if (providers.error || catalog?.status === 'error' || engine?.state === 'error') return 'failed';
+  if (providers.error || engine?.state === 'error') return 'failed';
   if (!engine || !isUsable(engine)) return 'unavailable';
   if (!catalog) return 'needs-catalog';
   return catalog.list.some(model => model.id === choice.model) ? 'ready' : 'unavailable';
@@ -171,12 +179,12 @@ export function retryProviderReadiness(choice: EngineChoice, providers = snap) {
 const modelRequests = new Map<string, Promise<EngineModel[]>>();
 
 /** Load (once) and cache an engine's models. Errors are kept so the UI can show them and retry. `force` reloads. */
-export function loadProviderModels(engine: string, force = false): Promise<EngineModel[]> {
+export function loadProviderModels(engine: string, force = false, recheck?: symbol): Promise<EngineModel[]> {
   const cached = snap.models[engine];
   if (!force && cached?.status === 'ready') return Promise.resolve(cached.list);
   const inflight = modelRequests.get(engine);
   // A forced reload queues behind a running request so the newer answer is always the one that sticks.
-  if (inflight) return force ? inflight.then(() => loadProviderModels(engine, true)) : inflight;
+  if (inflight) return force ? inflight.then(() => loadProviderModels(engine, true, recheck)) : inflight;
   patch({ models: { ...snap.models, [engine]: { status: 'loading', list: cached?.list ?? [], error: null } } });
   const request = (engine === 'mock' ? freeModels() : engineModels(engine))
     .then((list) => {
@@ -184,13 +192,13 @@ export function loadProviderModels(engine: string, force = false): Promise<Engin
       const kept = snap.preferred[engine];
       const stale = list.length > 0 && kept !== undefined && !list.some((m) => m.id === kept);
       const preferred = stale ? Object.fromEntries(Object.entries(snap.preferred).filter(([k]) => k !== engine)) : snap.preferred;
-      patch({ models: { ...snap.models, [engine]: { status: 'ready', list, error: null } }, preferred });
+      patch({ models: { ...snap.models, [engine]: { status: 'ready', list, error: null, recheck } }, preferred });
       if (stale) writeJson(KEY_PREFERRED, preferred);
       return list;
     })
     .catch((e: unknown) => {
       patch({
-        models: { ...snap.models, [engine]: { status: 'error', list: [], error: e instanceof Error ? e.message : String(e) } },
+        models: { ...snap.models, [engine]: { status: 'error', list: [], error: e instanceof Error ? e.message : String(e), recheck } },
       });
       return [] as EngineModel[];
     })
@@ -383,11 +391,24 @@ export function applyEngineCheck(engineId: string, discovery: EngineCheckResult[
 // ---- loading ------------------------------------------------------------------------
 
 let loadRequest: Promise<void> | null = null;
+let recheckRequest: Promise<void> | null = null;
 let workerDefaultRead = false;
 
 /** Load statuses and capabilities. `force` makes the worker re-probe instead of using its ~30 s cache. */
 export function refreshProviders(force = false): Promise<void> {
-  if (loadRequest) return force ? loadRequest.then(() => refreshProviders(true)) : loadRequest;
+  if (recheckRequest) return recheckRequest;
+  if (!force) return loadRequest ?? loadProviders();
+  const recheck = Symbol();
+  // Queue at most one explicit recheck behind startup, without overlapping discovery writes.
+  recheckRequest = (loadRequest ?? Promise.resolve()).then(() => loadProviders(recheck)).finally(() => {
+    recheckRequest = null;
+    patch({ recheck: null });
+  });
+  patch({ recheck });
+  return recheckRequest;
+}
+
+function loadProviders(recheck?: symbol): Promise<void> {
   patch({ refreshing: true });
   const userSeq = userChoiceSeq; // before any request starts, so a choice made while they are pending is seen
   const defaultAtLoad = snap.defaultPreference;
@@ -398,7 +419,7 @@ export function refreshProviders(force = false): Promise<void> {
         failure ??= e instanceof Error ? e.message : String(e);
         return null;
       }),
-      engineStatuses(force).catch((e: unknown) => {
+      engineStatuses(Boolean(recheck)).catch((e: unknown) => {
         failure ??= e instanceof Error ? e.message : String(e);
         return null;
       }),
@@ -434,7 +455,7 @@ export function refreshProviders(force = false): Promise<void> {
     });
     if (workerDefault) await applyWorkerDefault(workerDefault, userSeq);
     // Account changes and empty first answers must not stick: an explicit Refresh reloads every list that was loaded.
-    if (force) await Promise.all(Object.keys(snap.models).map((id) => loadProviderModels(id, true)));
+    if (recheck) await Promise.all(Object.keys(snap.models).map((id) => loadProviderModels(id, true, recheck)));
     await reconcileChoice();
   })().finally(() => {
     loadRequest = null;
