@@ -13,6 +13,7 @@ import {
   createDraft,
   followRun,
   getRun,
+  hasConversationMessages,
   importLegacyCeo,
   isTerminal,
   listApprovals,
@@ -58,6 +59,7 @@ export const CEO_MAX_CHARS = 2000;
 
 /** The conversation the legacy import creates for old CEO exchanges; hidden while it has nothing in it. */
 const CEO_HISTORY_ID = 'legacy-ceo-history';
+const WORKER_CONVERSATION_LIMIT = 500;
 const CEO_PROGRESS_MS = 1500;
 const RUN_STREAM_IDLE_MS = 15_000;
 const RUN_STATUS_RETRY_MAX_MS = 15_000;
@@ -196,7 +198,8 @@ export interface ChatState {
   activeRunIds: Record<string, string>;
   selectedAgentId: string | null;
   agentFor: (conversationId: string | null) => Agent | null;
-  openAgentChat: (agent: Agent) => Promise<string>;
+  openAgentChat: (agent: Agent, onOpen: () => void, onError: (message: string) => void) => Promise<void>;
+  invalidateNavigation: () => void;
   reloadConversations: () => Promise<void>;
   loadAllDrafts: () => Promise<void>;
 }
@@ -289,8 +292,52 @@ function cacheRuns(conversationId: string, ids: string[]): void {
   writeJson(KEY_RUNS, all);
 }
 
+function newestFirst(field: 'created_at' | 'updated_at') {
+  return (a: Conversation, b: Conversation) => {
+    // Worker timestamps are UTC ISO strings. Keep their sub-millisecond precision.
+    if (a[field] !== b[field]) return a[field] < b[field] ? 1 : -1;
+    return a.id.localeCompare(b.id);
+  };
+}
+
+async function findSpecialistChat(agentId: string, stillOpening: () => boolean): Promise<Conversation | undefined> {
+  const chats = await listConversations();
+  if (!stillOpening()) return;
+  if (!Array.isArray(chats) || chats.some((chat) => typeof chat?.id !== 'string' || !chat.id ||
+    (chat.profile_id !== null && typeof chat.profile_id !== 'string'))) {
+    throw new Error('The worker returned incomplete conversation information.');
+  }
+  if (chats.length >= WORKER_CONVERSATION_LIMIT) {
+    throw new Error('There are too many chats to verify this Agent’s conversations in the worker list.');
+  }
+  const candidates = chats.filter((chat) => chat.profile_id === agentId && chat.id !== CEO_HISTORY_ID);
+  if (candidates.length <= 1) return candidates[0];
+  if (candidates.some((chat) => !Number.isFinite(Date.parse(chat.created_at)) || !Number.isFinite(Date.parse(chat.updated_at)))) {
+    throw new Error('The worker returned incomplete conversation timestamps.');
+  }
+  for (const chat of candidates.sort(newestFirst('updated_at'))) {
+    if (!stillOpening()) return;
+    // A new empty chat also has an updated_at. A single row proves message activity.
+    if (await hasConversationMessages(chat.id)) return chat;
+  }
+  return candidates.sort(newestFirst('created_at'))[0];
+}
+
+interface AgentOpen {
+  intent: { revision: number };
+  result: Promise<Conversation | null>;
+}
+
 export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAgentsChanged?: () => void): ChatState {
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const rememberConversation = useCallback((chat: Conversation) => {
+    setConversations((prev) => {
+      const existing = prev.find((row) => row.id === chat.id);
+      if (!existing) return [chat, ...prev];
+      if (!existing.profile_id && chat.profile_id) return prev.map((row) => row.id === chat.id ? chat : row);
+      return prev;
+    });
+  }, []);
   const [legacy] = useState<LegacyThread[]>(() => readLegacyThreads());
   const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
   // The messages and runs of ONE chat, tagged with it: after a switch the old chat's text is never shown in the new one.
@@ -431,6 +478,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   }, []);
   const draftRevisions = useRef(new Map<string, symbol | undefined>());
   const selectionRevision = useRef(0);
+  const agentOpens = useRef(new Map<string, AgentOpen>());
   const raise = useCallback((cid: string | null, message: string, retry: ChatErrorEntry['retry'] = null) => {
     setErrors((prev) => ({ ...prev, [cid ?? '']: { message, retry } }));
   }, []);
@@ -804,14 +852,18 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     return () => window.clearInterval(timer);
   }, [anyActive]);
 
-  const select = useCallback((id: string | null) => {
+  const invalidateNavigation = useCallback(() => {
     selectionRevision.current++;
+  }, []);
+
+  const select = useCallback((id: string | null) => {
+    invalidateNavigation();
     selectedRef.current = id;
     setDraftAgentId(null);
     setSelectedId(id);
     writeJson(KEY_SELECTED, id);
     setPendingUser(null);
-  }, []);
+  }, [invalidateNavigation]);
 
   const setDraft = useCallback(
     (text: string) => {
@@ -938,7 +990,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           const sourceEdited = sourceRevision !== draftRevision;
           cid = created.id;
           boundProfile = created.profile_id;
-          setConversations((prev) => (prev.some((chat) => chat.id === created.id) ? prev : [created, ...prev]));
+          rememberConversation(created);
           bindAgent(cid, agentId);
           if (sending.current.has(cid)) {
             // The destination has its own send. Offer an explicit Retry at the source, targeting the created ID.
@@ -1150,7 +1202,7 @@ ${prompt}`;
         releaseLock();
       }
     },
-    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun]
+    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun, rememberConversation]
   );
 
   const send = useCallback((text: string) => {
@@ -1174,24 +1226,47 @@ ${prompt}`;
   }, [recipientIdFor, sendAttempt, errors, engine]);
 
   const openAgentChat = useCallback(
-    async (agent: Agent) => {
-      const existing = Object.entries(agentMapRef.current).find(
-        ([cid, id]) => id === agent.id && conversations.some((c) => c.id === cid && (c.profile_id ?? id) === agent.id)
-      )?.[0];
-      if (existing) {
-        select(existing);
-        return existing;
+    async (agent: Agent, onOpen: () => void, onError: (message: string) => void) => {
+      const revision = ++selectionRevision.current;
+      const current = (ticket: number) => mounted.current && selectionRevision.current === ticket;
+      let pending = agentOpens.current.get(agent.id);
+      if (pending) {
+        pending.intent.revision = revision;
+      } else {
+        const intent = { revision };
+        const stillOpening = () => current(intent.revision);
+        const result = (async () => {
+          const isCeo = agent.id === CEO_PROFILE_ID;
+          // Keep Loqman's existing history lookup. Specialist ownership must come from the worker.
+          const existing = isCeo
+            ? Object.keys(agentMapRef.current)
+                .filter((id) => agentMapRef.current[id] === CEO_PROFILE_ID)
+                .map((id) => conversations.find((chat) => chat.id === id && (chat.profile_id ?? CEO_PROFILE_ID) === CEO_PROFILE_ID))
+                .find((chat) => chat !== undefined)
+            : await findSpecialistChat(agent.id, stillOpening);
+          if (!stillOpening()) return null;
+          const chat = existing ?? await createConversation(
+            `${agent.name} — ${agent.role}`.slice(0, 120), isCeo ? undefined : agent.id
+          );
+          if (!mounted.current) return null;
+          if (!isCeo && chat.profile_id !== agent.id) throw new Error('The worker did not confirm the Agent binding.');
+          if (isCeo && !existing) bindAgent(chat.id, agent.id);
+          rememberConversation(chat);
+          return chat;
+        })().finally(() => agentOpens.current.delete(agent.id));
+        pending = { intent, result };
+        agentOpens.current.set(agent.id, pending);
       }
-      const created = await createConversation(
-        `${agent.name} — ${agent.role}`.slice(0, 120),
-        agent.id !== CEO_PROFILE_ID ? agent.id : undefined
-      );
-      bindAgent(created.id, agent.id);
-      setConversations((prev) => [created, ...prev]);
-      select(created.id);
-      return created.id;
+      try {
+        const chat = await pending.result;
+        if (!chat || !current(revision)) return;
+        select(chat.id);
+        onOpen();
+      } catch (error) {
+        if (current(revision)) onError(`Could not verify the chat with ${agent.name}. ${messageOf(error)} Open a chat from the sidebar or retry Open Chat.`);
+      }
     },
-    [conversations, bindAgent, select]
+    [conversations, bindAgent, rememberConversation, select]
   );
 
   const stop = useCallback(async () => {
@@ -1381,6 +1456,7 @@ ${prompt}`;
     selectedAgentId,
     agentFor,
     openAgentChat,
+    invalidateNavigation,
     reloadConversations: refreshConversations,
     loadAllDrafts,
   };

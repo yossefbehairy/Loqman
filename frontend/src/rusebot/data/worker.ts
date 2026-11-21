@@ -194,18 +194,29 @@ export const bindConversationProfile = (conversationId: string, profileId: strin
 const MESSAGE_PAGE = 500;
 const MESSAGE_PAGES_MAX = 100;
 
+function readMessagePage(conversationId: string, limit: number, after = 0) {
+  return call<{ messages: ConvMessage[] }>('conversations.messages', {
+    conversation_id: conversationId, limit, ...(after ? { after } : {}),
+  }).then((r) => r.messages);
+}
+
+export async function hasConversationMessages(conversationId: string): Promise<boolean> {
+  const messages = await readMessagePage(conversationId, 1);
+  if (!Array.isArray(messages) || messages.length > 1 || messages.some((message) =>
+    message?.conversation_id !== conversationId || (message.role !== 'user' && message.role !== 'assistant'))) {
+    throw new Error('The worker returned incomplete message information.');
+  }
+  return messages.length > 0;
+}
+
 /** Every message of a conversation, oldest first, paged with the worker's `after` cursor. */
 export async function listMessages(conversationId: string): Promise<ConvMessage[]> {
   const all: ConvMessage[] = [];
   for (let page = 0; page < MESSAGE_PAGES_MAX; page++) {
     const after = all.length ? all[all.length - 1].seq : 0;
-    const r = await call<{ messages: ConvMessage[] }>('conversations.messages', {
-      conversation_id: conversationId,
-      limit: MESSAGE_PAGE,
-      ...(after ? { after } : {}),
-    });
-    all.push(...r.messages);
-    if (r.messages.length < MESSAGE_PAGE) break;
+    const messages = await readMessagePage(conversationId, MESSAGE_PAGE, after);
+    all.push(...messages);
+    if (messages.length < MESSAGE_PAGE) break;
   }
   return all;
 }

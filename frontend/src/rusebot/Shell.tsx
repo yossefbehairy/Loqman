@@ -131,18 +131,15 @@ export function Shell() {
   }, [chat.messages, chat.selectedId]);
 
   const goView = (next: View) => {
+    chat.invalidateNavigation();
     setView(next);
     setDrawer(false);
     if (next !== 'team' && next !== 'contracts') setPanelOpen(false);
   };
 
-  const openChatWith = async (agent: Agent) => {
-    try {
-      await chat.openAgentChat(agent);
-      goView('chat');
-    } catch (e) {
-      setNotice(messageOf(e));
-    }
+  const openChatWith = (agent: Agent) => {
+    setNotice(null);
+    void chat.openAgentChat(agent, () => goView('chat'), setNotice);
   };
 
   const decideCeo = async (action: CeoAction, decision: 'approve' | 'deny'): Promise<DecideResult> => {
@@ -210,7 +207,7 @@ export function Shell() {
           }}
           onNewAgent={() => setNewAgent(true)}
           agents={company.agents}
-          onOpenAgent={(a) => void openChatWith(a)}
+          onOpenAgent={openChatWith}
           onSettings={() => setSettings('general')}
           activeRunIds={chat.activeRunIds}
           needsYou={needsYou}
@@ -240,7 +237,7 @@ export function Shell() {
             agents={company.agents}
             profiles={profiles}
             missions={missions}
-            onOpenChat={(a) => void openChatWith(a)}
+            onOpenChat={openChatWith}
             onPollMissions={refreshMissions}
             onChanged={() => {
               void refreshCompany();
