@@ -46,7 +46,6 @@ export function Shell() {
   const engines = useEngines();
   const company = useCompany();
   const reloadAgents = company.reload;
-  const chat = useChat(engines.choice, company.agents, company.reload);
   const [view, setView] = useState<View>('chat');
   const [drawer, setDrawer] = useState(false);
   const [rail, setRail] = useState(() => readText(KEY_RAIL, '0') === '1');
@@ -72,22 +71,32 @@ export function Shell() {
   }, []);
   const fits = useMediaQuery(SIDEBAR_AND_PANEL_FIT, true);
 
+  const ceoActionsRequest = useRef(0);
+  const refreshCeoActions = useCallback(async () => {
+    const ticket = ++ceoActionsRequest.current;
+    try {
+      const actions = await listCeoActions();
+      if (ticket !== ceoActionsRequest.current) return;
+      setCeoActions(actions);
+      note('proposals', null);
+    } catch (error) {
+      if (ticket === ceoActionsRequest.current) note('proposals', messageOf(error));
+    }
+  }, [note]);
+  const chat = useChat(engines.choice, company.agents, reloadAgents, refreshCeoActions);
+
   // Every missions request takes a number; only the newest one may update the list, so a slow older answer
   // (for example a late "running" snapshot) never overwrites a newer one.
   const missionsRequest = useRef(0);
 
   const refreshCompany = useCallback(async () => {
     const ticket = ++missionsRequest.current;
-    const [, m, c] = await Promise.allSettled([reloadAgents(), listMissions(), listCeoActions()]);
+    const [, m] = await Promise.allSettled([reloadAgents(), listMissions(), refreshCeoActions()]);
     if (m.status === 'fulfilled') {
       if (ticket === missionsRequest.current) setMissions(m.value);
       note('missions', null);
     } else note('missions', messageOf(m.reason));
-    if (c.status === 'fulfilled') {
-      setCeoActions(c.value);
-      note('proposals', null);
-    } else note('proposals', messageOf(c.reason));
-  }, [note, reloadAgents]);
+  }, [note, reloadAgents, refreshCeoActions]);
 
   /** Resolves when the request settles, so the caller can schedule the next poll after it. */
   const refreshMissions = useCallback(async () => {

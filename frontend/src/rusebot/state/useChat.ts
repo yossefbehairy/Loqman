@@ -328,7 +328,12 @@ interface AgentOpen {
   result: Promise<Conversation | null>;
 }
 
-export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAgentsChanged?: () => void): ChatState {
+export function useChat(
+  engine: EngineChoice | null,
+  agents: Agent[] = [],
+  onAgentsChanged?: () => void,
+  onCeoActionsChanged?: () => void
+): ChatState {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const rememberConversation = useCallback((chat: Conversation) => {
     setConversations((prev) => {
@@ -1105,6 +1110,8 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
             clearDraft(chatId);
             if (retainedSourceKey) clearDraft(retainedSourceKey);
             if (answer.agents_created.length) onAgentsChanged?.();
+            // The ask is acknowledged. Read the worker's pending list after any automatic decisions.
+            if (answer.actions_proposed.length || answer.agents_created.length) onCeoActionsChanged?.();
           } catch (e) {
             failure = messageOf(e);
             fail(failure, e);
@@ -1202,7 +1209,7 @@ ${prompt}`;
         releaseLock();
       }
     },
-    [follow, agents, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun, rememberConversation]
+    [follow, agents, bindAgent, onAgentsChanged, onCeoActionsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun, rememberConversation]
   );
 
   const send = useCallback((text: string) => {
