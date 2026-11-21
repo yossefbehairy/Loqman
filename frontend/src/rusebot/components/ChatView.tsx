@@ -19,7 +19,7 @@ import { stripContract, type ChatState, type EngineState } from '../state/useCha
 import { hasLiveContent, type LiveTurn } from '../state/liveTurn';
 import type { Agent } from '../types';
 import { useKeepDecided } from '../state/useKeepDecided';
-import type { Conversation } from '../data/worker';
+import type { Conversation, RunSnapshot } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
 
@@ -79,7 +79,40 @@ function dayLabel(iso: string): string {
 
 const USER_BUBBLE_STYLE = userBubbleStyle('chrome');
 
-function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string; iso: string }) {
+// Render only known worker summaries. Older or unexpected diagnostics may contain sensitive detail.
+const PUBLIC_RUN_ERRORS = new Set([
+  'Internal error.',
+  'Output did not match the profile schema.',
+  'Run interrupted by server restart or shutdown; it was not re-executed.',
+  'Task ended without a verified tool result.',
+  'Report was not published. Approval was denied or publication is incomplete.',
+  'Task ended with unread file pages.',
+  'A source file changed before completion.',
+  ...[
+    'auth', 'busy', 'cancelled', 'cli_missing', 'model_unavailable', 'offline', 'output_limit',
+    'protocol_error', 'quota', 'rate_limited', 'request_refused', 'runtime_error', 'timeout',
+    'unsupported_capability', 'upstream_unavailable',
+  ].map((code) => `Engine request failed (${code}).`),
+]);
+
+function SavedRunOutcome({ run }: { run: RunSnapshot }) {
+  if (run.status !== 'failed' && run.status !== 'interrupted') return null;
+  const failed = run.status === 'failed';
+  const detail = run.error && PUBLIC_RUN_ERRORS.has(run.error) ? run.error : null;
+  return (
+    <p
+      data-saved-run-outcome={run.status}
+      role="note"
+      dir="auto"
+      className={cn('mt-1 max-w-[min(var(--chat-bubble-max),var(--chat-bubble-pct))] px-4 text-[12.5px]', failed ? 'text-danger' : 'text-ink-secondary')}
+    >
+      <span className="font-medium">{failed ? 'Run failed' : 'Run interrupted'}</span>
+      {detail && ` · ${detail}`}
+    </p>
+  );
+}
+
+function Bubble({ role, text, iso, savedRun }: { role: 'user' | 'assistant'; text: string; iso: string; savedRun?: RunSnapshot }) {
   const mine = role === 'user';
   return (
     <div data-message-row="" data-role={role} className={cn('group flex w-full flex-col', mine ? 'animate-msg-in items-end' : 'items-start')}>
@@ -114,6 +147,7 @@ function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string;
           {clock(iso)}
         </span>
       </div>
+      {mine && savedRun && <SavedRunOutcome run={savedRun} />}
     </div>
   );
 }
@@ -255,21 +289,22 @@ export function ChatView({
   const rows = chat.messages.map((m, i) => {
     const prev = chat.messages[i - 1];
     const showDay = !prev || parseWorkerTime(prev.created_at).toDateString() !== parseWorkerTime(m.created_at).toDateString();
-    const run = m.role === 'assistant' ? chat.runsBySeq[m.seq] : undefined;
-    const drafts = run ? (chat.drafts[run.id] ?? []) : [];
+    const run = chat.runsBySeq[m.seq];
+    const replyRun = m.role === 'assistant' ? run : undefined;
+    const drafts = replyRun ? (chat.drafts[replyRun.id] ?? []) : [];
     return (
       <div className="contents" key={m.seq} data-mid={m.seq}>
         {(i === 0 || showDay) && <div className="py-3 text-center text-[13px] text-ink-secondary">{dayLabel(m.created_at)}</div>}
-        <Bubble role={m.role} text={stripContract(m.content)} iso={m.created_at} />
-        {run && (
-          <div className="flex w-full flex-col items-start gap-2" data-run-id={run.id}>
+        <Bubble role={m.role} text={stripContract(m.content)} iso={m.created_at} savedRun={run} />
+        {replyRun && (
+          <div className="flex w-full flex-col items-start gap-2" data-run-id={replyRun.id}>
             {drafts.map((d) => (
               <DeliverableCard key={d.id} draft={d} onReview={chat.reviewDraft} onDownload={chat.downloadDraft} />
             ))}
-            {run.status === 'succeeded' && drafts.length === 0 && (
+            {replyRun.status === 'succeeded' && drafts.length === 0 && (
               <button
                 type="button"
-                onClick={() => void chat.makeDeliverable(run.id)}
+                onClick={() => void chat.makeDeliverable(replyRun.id)}
                 className="ui-chip text-[12.5px] text-ink-secondary hover:text-ink"
               >
                 Save reply as deliverable for review

@@ -170,6 +170,7 @@ export interface ChatState {
   run: RunState | null;
   /** The reply as it streams in (normalised driver events) in the selected chat; null when nothing is streaming. */
   live: LiveTurn | null;
+  /** Saved assistant replies and terminal outcomes for user messages without replies. */
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
   drafts: Record<string, Draft[]>;
@@ -595,8 +596,11 @@ export function useChat(
     const bySeq: Record<number, RunSnapshot> = {};
     const nextDrafts: Record<string, Draft[]> = {};
     for (const snap of snaps) {
-      if (!snap) continue;
+      if (!snap || snap.conversation_id !== conversationId) continue;
       if (snap.assistant_message_seq != null) bySeq[snap.assistant_message_seq] = snap;
+      else if (snap.user_message_seq != null && (snap.status === 'failed' || snap.status === 'interrupted')) {
+        bySeq[snap.user_message_seq] = snap;
+      }
       if (snap.status === 'succeeded') nextDrafts[snap.id] = await listDrafts(snap.id).catch(() => []);
     }
     if (selectedRef.current === conversationId && readSeq.current.get(conversationId) === ticket) {
