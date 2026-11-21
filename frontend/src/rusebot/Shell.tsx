@@ -21,10 +21,8 @@ import {
   denyCeoAction,
   listCeoActions,
   listMissions,
-  listProfiles,
   type CeoAction,
   type Mission,
-  type Profile,
 } from './data/worker';
 import { useMediaQuery, SIDEBAR_AND_PANEL_FIT } from './lib/use-media-query';
 import type { Agent } from './types';
@@ -56,7 +54,6 @@ export function Shell() {
   const [settings, setSettings] = useState<PageId | null>(null);
   const [newAgent, setNewAgent] = useState(false);
   const [userName, setUserName] = useState(() => readText(KEY_NAME, 'You'));
-  const [profiles, setProfiles] = useState<Profile[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [ceoActions, setCeoActions] = useState<CeoAction[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
@@ -81,11 +78,7 @@ export function Shell() {
 
   const refreshCompany = useCallback(async () => {
     const ticket = ++missionsRequest.current;
-    const [p, m, c] = await Promise.allSettled([listProfiles(), listMissions(), listCeoActions()]);
-    if (p.status === 'fulfilled') {
-      setProfiles(p.value);
-      note('team', null);
-    } else note('team', messageOf(p.reason));
+    const [, m, c] = await Promise.allSettled([reloadAgents(), listMissions(), listCeoActions()]);
     if (m.status === 'fulfilled') {
       if (ticket === missionsRequest.current) setMissions(m.value);
       note('missions', null);
@@ -94,7 +87,7 @@ export function Shell() {
       setCeoActions(c.value);
       note('proposals', null);
     } else note('proposals', messageOf(c.reason));
-  }, [note]);
+  }, [note, reloadAgents]);
 
   /** Resolves when the request settles, so the caller can schedule the next poll after it. */
   const refreshMissions = useCallback(async () => {
@@ -111,8 +104,7 @@ export function Shell() {
 
   useEffect(() => {
     void refreshCompany();
-    void reloadAgents();
-  }, [refreshCompany, reloadAgents, view]);
+  }, [refreshCompany, view]);
 
   const failedParts = [...(company.error ? ['agents'] : []), ...Object.keys(failures)];
   const failureDetail = company.error ?? Object.values(failures)[0] ?? '';
@@ -235,14 +227,11 @@ export function Shell() {
             loaded={company.loaded}
             teams={company.teams}
             agents={company.agents}
-            profiles={profiles}
+            profiles={company.profiles}
             missions={missions}
             onOpenChat={openChatWith}
             onPollMissions={refreshMissions}
-            onChanged={() => {
-              void refreshCompany();
-              void company.reload();
-            }}
+            onChanged={() => void refreshCompany()}
             onNewAgent={() => setNewAgent(true)}
             onPanelChange={setPanelOpen}
           />
@@ -261,10 +250,7 @@ export function Shell() {
               type="button"
               data-load-retry
               className="shrink-0 font-medium underline"
-              onClick={() => {
-                void refreshCompany();
-                void company.reload();
-              }}
+              onClick={() => void refreshCompany()}
             >
               Retry
             </button>
@@ -284,7 +270,7 @@ export function Shell() {
           onClose={() => setNewAgent(false)}
           onCreated={async () => {
             setNewAgent(false);
-            await Promise.all([company.reload(), refreshCompany()]);
+            await refreshCompany();
           }}
         />
       )}
