@@ -164,6 +164,12 @@ interface ResultsDrafts {
   error: string | null;
 }
 
+interface ApprovalRead {
+  list: Approval[] | null;
+  loading: boolean;
+  error: string | null;
+}
+
 export interface ChatState {
   conversations: Conversation[];
   legacy: LegacyThread[];
@@ -179,6 +185,8 @@ export interface ChatState {
   /** Saved assistant replies and terminal outcomes for user messages without replies. */
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
+  approvalRead: ApprovalRead;
+  refreshApprovals: () => Promise<void>;
   drafts: Record<string, Draft[]>;
   resultsDrafts: ResultsDrafts;
   error: string | null;
@@ -293,6 +301,7 @@ interface ChatErrorEntry {
 
 const NO_MESSAGES: ConvMessage[] = [];
 const NO_RUNS: Record<number, RunSnapshot> = {};
+const NO_APPROVALS: Approval[] = [];
 
 function cacheRuns(conversationId: string, ids: string[]): void {
   const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -433,7 +442,25 @@ export function useChat(
     },
     []
   );
-  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [approvalRead, setApprovalRead] = useState<ApprovalRead>({ list: null, loading: true, error: null });
+  const approvalsRequest = useRef({ ticket: 0, pending: false });
+  const refreshApprovals = useCallback(async () => {
+    const ticket = ++approvalsRequest.current.ticket;
+    approvalsRequest.current.pending = true;
+    setApprovalRead((prev) => prev.loading ? prev : { ...prev, loading: true });
+    try {
+      const list = await listApprovals();
+      if (mounted.current && ticket === approvalsRequest.current.ticket) {
+        setApprovalRead({ list, loading: false, error: null });
+      }
+    } catch (e) {
+      if (mounted.current && ticket === approvalsRequest.current.ticket) {
+        setApprovalRead((prev) => ({ ...prev, loading: false, error: messageOf(e) }));
+      }
+    } finally {
+      if (ticket === approvalsRequest.current.ticket) approvalsRequest.current.pending = false;
+    }
+  }, []);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
   const [resultsDrafts, setResultsDrafts] = useState<ResultsDrafts>({ list: null, loading: true, error: null });
   const resultsRead = useRef({ ticket: 0, pending: false });
@@ -673,9 +700,8 @@ export function useChat(
       });
     }
     if (!ownsRun()) return;
-    const pending = await listApprovals().catch(() => []);
-    if (ownsRun()) setApprovals(pending);
-  }, [clearStopping, closeFollower, dropLive, fetchMessages, loadThread, raise, refreshConversations, updateRuns]);
+    await refreshApprovals();
+  }, [clearStopping, closeFollower, dropLive, fetchMessages, loadThread, raise, refreshApprovals, refreshConversations, updateRuns]);
 
   const follow = useCallback((conversationId: string, runId: string) => {
     if (!mounted.current || streams.current.has(runId) || currentRuns.current[conversationId]?.runId !== runId) return;
@@ -829,11 +855,10 @@ export function useChat(
             if (current.runId === snap.id && !isTerminal(current.status)) follow(cid, snap.id);
           }
         }
-        if (!alive) return;
-        setApprovals(await listApprovals().catch(() => []));
       } catch (e) {
         if (alive) raise(null, `Could not load your chats. ${messageOf(e)}`, 'load');
       } finally {
+        if (alive) await refreshApprovals();
         if (alive) setLoaded(true);
       }
     })();
@@ -842,7 +867,7 @@ export function useChat(
       alive = false;
       for (const id of open.keys()) closeFollower(id);
     };
-  }, [closeFollower, follow, withoutEmptyHistory, raise, updateRuns]);
+  }, [closeFollower, follow, withoutEmptyHistory, raise, refreshApprovals, updateRuns]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -863,12 +888,10 @@ export function useChat(
   useEffect(() => {
     if (!anyActive) return;
     const timer = window.setInterval(() => {
-      listApprovals()
-        .then(setApprovals)
-        .catch(() => undefined);
+      if (!approvalsRequest.current.pending) void refreshApprovals();
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [anyActive]);
+  }, [anyActive, refreshApprovals]);
 
   const invalidateNavigation = useCallback(() => {
     selectionRevision.current++;
@@ -1316,10 +1339,13 @@ ${prompt}`;
   const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny') => {
     try {
       await decideApproval(approval.run_id, approval.id, decision);
+      setApprovalRead((prev) => prev.list
+        ? { ...prev, list: prev.list.filter((item) => item.id !== approval.id) }
+        : prev);
     } finally {
-      setApprovals(await listApprovals().catch(() => []));
+      await refreshApprovals();
     }
-  }, []);
+  }, [refreshApprovals]);
 
   const makeDeliverable = useCallback(async (runId: string) => {
     try {
@@ -1441,7 +1467,9 @@ ${prompt}`;
     run: currentRun,
     live: selectedId ? (live[selectedId] ?? null) : null,
     runsBySeq,
-    approvals,
+    approvals: approvalRead.list ?? NO_APPROVALS,
+    approvalRead,
+    refreshApprovals,
     drafts,
     resultsDrafts,
     error: shownError?.message ?? (currentRun?.connectionWarning ? runConnectionWarning : null),

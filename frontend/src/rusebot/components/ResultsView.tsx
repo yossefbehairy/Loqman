@@ -14,16 +14,19 @@ import { useKeepDecided } from '../state/useKeepDecided';
 export function ResultsView({
   chat,
   ceoActions,
+  ceoActionsConfirmed,
   onCeoDecide,
 }: {
   chat: ChatState;
   ceoActions: CeoAction[];
+  ceoActionsConfirmed: boolean;
   onCeoDecide: (action: CeoAction, decision: 'approve' | 'deny') => Promise<DecideResult>;
 }) {
   const { list: drafts, loading, error } = chat.resultsDrafts;
   const { shown: approvals, decide: decideApproval } = useKeepDecided<Approval>(chat.approvals);
   const { shown: managerActions, decide: decideAction } = useKeepDecided<CeoAction>(ceoActions);
   const waiting = chat.approvals.length + ceoActions.length;
+  const approvalRead = chat.approvalRead;
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app" data-view="results">
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-hairline/40 px-6 py-4 max-md:pl-12">
@@ -40,7 +43,29 @@ export function ResultsView({
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-6 py-6">
           <section aria-label="Needs you" className="flex flex-col gap-2">
             <h2 className="text-[13px] font-semibold">Needs you ({waiting})</h2>
-            {waiting === 0 && <p className="text-[13px] text-ink-secondary">Nothing is waiting on you.</p>}
+            {approvalRead.loading && !approvalRead.list && !approvalRead.error && (
+              <p role="status" className="text-[13px] text-ink-secondary">Loading tool approvals…</p>
+            )}
+            {approvalRead.error && (
+              <div className="flex items-start gap-2 text-[13px] text-danger">
+                <p role="alert" dir="auto">
+                  {approvalRead.list
+                    ? 'Could not refresh tool approvals. Showing the last loaded tool approvals.'
+                    : 'Could not load tool approvals.'} {approvalRead.error}
+                </p>
+                <button
+                  type="button"
+                  className="shrink-0 font-medium underline disabled:opacity-60"
+                  disabled={approvalRead.loading}
+                  onClick={() => void chat.refreshApprovals()}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+            {waiting === 0 && ceoActionsConfirmed && approvalRead.list && !approvalRead.loading && !approvalRead.error && (
+              <p className="text-[13px] text-ink-secondary">Nothing is waiting on you.</p>
+            )}
             {approvals.map((a) => (
               <ApprovalCard
                 key={a.id}

@@ -55,6 +55,7 @@ export function Shell() {
   const [userName, setUserName] = useState(() => readText(KEY_NAME, 'You'));
   const [missions, setMissions] = useState<Mission[]>([]);
   const [ceoActions, setCeoActions] = useState<CeoAction[]>([]);
+  const [ceoActionsConfirmed, setCeoActionsConfirmed] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   // What failed to load (key -> message). The last data that did load stays on screen; Retry reads it all again.
   const [failures, setFailures] = useState<Record<string, string>>({});
@@ -74,10 +75,12 @@ export function Shell() {
   const ceoActionsRequest = useRef(0);
   const refreshCeoActions = useCallback(async () => {
     const ticket = ++ceoActionsRequest.current;
+    setCeoActionsConfirmed(false);
     try {
       const actions = await listCeoActions();
       if (ticket !== ceoActionsRequest.current) return;
       setCeoActions(actions);
+      setCeoActionsConfirmed(true);
       note('proposals', null);
     } catch (error) {
       if (ticket === ceoActionsRequest.current) note('proposals', messageOf(error));
@@ -245,7 +248,7 @@ export function Shell() {
             onPanelChange={setPanelOpen}
           />
         )}
-        {view === 'results' && <ResultsView chat={chat} ceoActions={ceoActions} onCeoDecide={decideCeo} />}
+        {view === 'results' && <ResultsView chat={chat} ceoActions={ceoActions} ceoActionsConfirmed={ceoActionsConfirmed} onCeoDecide={decideCeo} />}
         {failedParts.length > 0 && (
           <div
             role="alert"
