@@ -114,6 +114,84 @@ async function reopen(page: Page, mode: 'saved' | 'switching' | 'incomplete') {
     holdNextHistory, stopDuplicateBeforeExecution: () => { rejectDuplicate = true; } };
 }
 
+test('AUD-02: transcript Retry recovers an acknowledged CEO exchange without sending again', async ({ page }) => {
+  const original = await rpc<Conversation>(page, 'conversations.create', { title: 'AUD-02 acknowledged CEO chat' });
+  const other = await rpc<Conversation>(page, 'conversations.create', { title: 'AUD-02 independent chat' });
+  const earlier = await rpc<Message>(page, 'conversations.add_message', {
+    conversation_id: original.id, role: 'assistant', content: 'Earlier AUD-02 project update',
+  });
+  const otherMessage = await rpc<Message>(page, 'conversations.add_message', {
+    conversation_id: other.id, role: 'assistant', content: 'AUD-02 independent update',
+  });
+  const asks: Rpc[] = [];
+  const historyFailure = 'Fixture lost the saved CEO history refresh.';
+  let rejectHistory = false;
+  await page.route('**/__agentos/call', async route => {
+    const call = route.request().postDataJSON() as Rpc;
+    if (call.method === 'ceo.ask') {
+      asks.push(call);
+      const response = await route.fetch();
+      expect(response.ok()).toBe(true);
+      rejectHistory = true;
+      return route.fulfill({ response });
+    }
+    if (rejectHistory && call.method === 'conversations.messages' && call.params.conversation_id === original.id) {
+      return route.fulfill({ status: 503, json: { detail: historyFailure } });
+    }
+    return route.continue();
+  });
+  await page.goto('/');
+  await switchTo(page, original);
+  await expect(row(page, earlier.seq)).toBeVisible();
+  await page.getByRole('textbox', { name: 'Message Loqman' }).fill(question);
+  await send(page).click();
+
+  const alert = transcript(page).getByRole('alert').filter({ hasText: historyFailure });
+  await expect(alert, 'A successful ask with a failed history read must offer transcript Retry').toBeVisible();
+  expect(asks).toHaveLength(1);
+  expect(asks[0].params.conversation_id).toBe(original.id);
+  const requestId = asks[0].params.request_id;
+  expect(requestId).toMatch(/^ceo-/);
+  const record = () => page.evaluate(key => localStorage.getItem(key), 'agentos.rusebot.submission.v1.' + requestId);
+  expect(JSON.parse((await record()) ?? 'null')).toMatchObject({ requestId, cid: original.id, acknowledged: true });
+  const history = () => rpc<{ messages: Message[] }>(page, 'conversations.messages', { conversation_id: original.id });
+  const { messages } = await history();
+  expect(messages.map(message => [message.role, message.client_message_id])).toEqual([
+    ['assistant', null], ['user', `ask:${requestId}:user`], ['assistant', `ask:${requestId}:assistant`],
+  ]);
+  const [, savedUser, savedReply] = messages;
+  expect(savedUser.content).toBe(question);
+  expect(savedReply.content).not.toBe('');
+  await expect(row(page, savedReply.seq)).toHaveCount(0);
+
+  await switchTo(page, other);
+  await expect(row(page, otherMessage.seq)).toBeVisible();
+  await expect(row(page, savedReply.seq)).toHaveCount(0);
+  await expect(alert).toHaveCount(0);
+  const returnFailure = page.waitForResponse(response => {
+    const request = response.request();
+    if (request.method() !== 'POST' || new URL(request.url()).pathname !== '/__agentos/call') return false;
+    const call = request.postDataJSON() as Rpc;
+    return response.status() === 503 && call.method === 'conversations.messages' && call.params.conversation_id === original.id;
+  });
+  await switchTo(page, original);
+  await returnFailure;
+  await expect(alert).toBeVisible();
+  rejectHistory = false;
+  await alert.getByRole('button', { name: 'Retry', exact: true }).click();
+
+  await expect(row(page, savedUser.seq)).toHaveCount(1);
+  await expect(row(page, savedUser.seq)).toContainText(question);
+  await expect(row(page, savedReply.seq)).toHaveCount(1);
+  await expect(row(page, savedReply.seq)).toHaveText(new RegExp(savedReply.content.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+')));
+  expect(await transcript(page).locator('[data-mid]').evaluateAll(rows => rows.map(el => Number(el.getAttribute('data-mid')))))
+    .toEqual(messages.map(message => message.seq));
+  await expect(alert).toHaveCount(0);
+  await expect.poll(record).toBeNull();
+  expect(asks).toHaveLength(1);
+  expect((await history()).messages).toEqual(messages);
+});
+
 test('UX-03: explicit CEO Retry shows the durable reply once without another ask', async ({ page }) => {
   const fixture = await reopen(page, 'saved');
   const { messages } = await fixture.history();

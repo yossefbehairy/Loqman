@@ -260,23 +260,31 @@ export function Shell() {
           />
         )}
         {view === 'results' && <ResultsView chat={chat} ceoActions={ceoActions} ceoActionsConfirmed={ceoActionsConfirmed} onCeoDecide={decideCeo} />}
-        {failedParts.length > 0 && (
-          <div
-            role="alert"
-            data-load-error
-            className="absolute left-1/2 top-3 z-40 flex max-w-[min(640px,calc(100%-24px))] -translate-x-1/2 items-start gap-2 rounded-lg border border-danger/30 bg-card px-3 py-2 text-[13px] text-danger shadow-lg"
-          >
-            <p dir="auto" className="min-w-0 break-words">
-              Could not refresh {failedParts.join(', ')}. Showing the last data that loaded. {failureDetail}
-            </p>
-            <button
-              type="button"
-              data-load-retry
-              className="shrink-0 font-medium underline"
-              onClick={() => void refreshCompany()}
-            >
-              Retry
-            </button>
+        {(chat.conversationListError || failedParts.length > 0) && (
+          <div className="absolute left-1/2 top-3 z-40 flex max-w-[min(640px,calc(100%-24px))] -translate-x-1/2 flex-col gap-2 rounded-lg border border-danger/30 bg-card px-3 py-2 text-[13px] text-danger shadow-lg">
+            {chat.conversationListError && (
+              <div role="alert" className="flex items-start gap-2">
+                <p dir="auto" className="min-w-0 break-words">{chat.conversationListError}</p>
+                <button
+                  type="button"
+                  className="shrink-0 font-medium underline disabled:opacity-60"
+                  disabled={chat.retryingConversationList}
+                  onClick={chat.retryConversationList}
+                >
+                  {chat.retryingConversationList ? 'Retrying…' : 'Retry'}
+                </button>
+              </div>
+            )}
+            {failedParts.length > 0 && (
+              <div role="alert" data-load-error className="flex items-start gap-2">
+                <p dir="auto" className="min-w-0 break-words">
+                  Could not refresh {failedParts.join(', ')}. Showing the last data that loaded. {failureDetail}
+                </p>
+                <button type="button" data-load-retry className="shrink-0 font-medium underline" onClick={() => void refreshCompany()}>
+                  Retry
+                </button>
+              </div>
+            )}
           </div>
         )}
         {notice && (

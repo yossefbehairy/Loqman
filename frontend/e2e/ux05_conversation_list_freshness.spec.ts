@@ -101,6 +101,67 @@ async function finishHeldRefresh(page: Page, held: HeldList) {
   await handled;
 }
 
+test('AUD-01: Retry restores the initial chat list and resumes startup discovery', async ({ page }) => {
+  const recipient = await agent(page, 'AUD-01 remembered specialist');
+  const remembered = await create(page, 'AUD-01 remembered chat', recipient);
+  const other = await create(page, 'AUD-01 background chat', recipient);
+  const retryArrived = gate();
+  const releaseRetry = gate();
+  const calls: Rpc[] = [];
+  const listFailure = 'Fixture lost the initial conversation list.';
+  let listReads = 0;
+  await page.route('**/__agentos/call', async route => {
+    const call = route.request().postDataJSON() as Rpc;
+    calls.push(call);
+    if (call.method !== 'conversations.list') return route.continue();
+    listReads++;
+    if (listReads === 1) return route.fulfill({ status: 503, json: { detail: listFailure } });
+    retryArrived.release();
+    await releaseRetry.promise;
+    return route.continue();
+  });
+  await page.addInitScript(cid => {
+    localStorage.setItem('agentos.rusebot.selected.v1', JSON.stringify(cid));
+    localStorage.setItem('agentos.rusebot.convAgents.v1', JSON.stringify({ [cid]: 'custom' }));
+  }, remembered.id);
+
+  const alert = page.getByRole('alert').filter({ hasText: listFailure });
+  const mutations = () => calls.filter(call =>
+    ['conversations.create', 'conversations.bind_profile', 'conversations.add_message', 'ceo.ask', 'runs.start_turn'].includes(call.method));
+  try {
+    await page.goto('/');
+    await expect(alert).toBeVisible();
+    expect(await selected(page)).toBe(remembered.id);
+    await expect(row(page, remembered.id)).toHaveCount(0);
+    expect(mutations()).toEqual([]);
+    const importsBeforeRetry = calls.filter(call => call.method === 'conversations.import_ceo').length;
+
+    await alert.getByRole('button', { name: 'Retry', exact: true }).click();
+    await retryArrived.promise;
+    await expect(alert, 'Keep the startup error visible until the list succeeds').toBeVisible();
+    expect(mutations()).toEqual([]);
+    releaseRetry.release();
+
+    await expectChat(page, remembered.id, recipient);
+    await expect(row(page, other.id)).toBeVisible();
+    await expect(alert).toHaveCount(0);
+    await expect.poll(() => calls.filter(call => call.method === 'runs.list' && call.params.conversation_id === other.id))
+      .toEqual([{ method: 'runs.list', params: { conversation_id: other.id, limit: 1 } }]);
+    expect(calls.filter(call => call.method === 'conversations.import_ceo')).toHaveLength(importsBeforeRetry);
+    expect(listReads).toBe(2);
+    expect(mutations()).toEqual([]);
+
+    const started = nextResponse(page, 'runs.start_turn');
+    await send(page, 'Continue with the remembered specialist.');
+    expect((await started).ok()).toBe(true);
+    expect(mutations()).toEqual([expect.objectContaining({
+      method: 'runs.start_turn', params: expect.objectContaining({ conversation_id: remembered.id }),
+    })]);
+  } finally {
+    releaseRetry.release();
+  }
+});
+
 for (const failOld of [false, true]) {
   test(failOld ? 'UX-05: a failed background refresh preserves a newly opened chat' : 'UX-05: an older list cannot erase a newly opened chat', async ({ page }) => {
     const first = await agent(page, 'UX-05 refresh owner');

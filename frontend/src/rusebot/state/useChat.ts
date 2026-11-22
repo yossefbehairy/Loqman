@@ -174,6 +174,9 @@ interface ApprovalRead {
 
 export interface ChatState {
   conversations: Conversation[];
+  conversationListError: string | null;
+  retryingConversationList: boolean;
+  retryConversationList: () => void;
   legacy: LegacyThread[];
   selectedId: string | null;
   select: (id: string | null) => void;
@@ -193,7 +196,7 @@ export interface ChatState {
   resultsDrafts: ResultsDrafts;
   error: string | null;
   dismissError: () => void;
-  /** Runs the failed step again (resend the message, reload the chat or the list); null when there is nothing to retry. */
+  /** Retries an unconfirmed submission, or is null when there is nothing to retry. */
   retry: (() => void) | null;
   retryProviderCheck: 'checking' | 'unavailable' | 'failed' | null;
   /** The selected chat's messages could not be read: it is not empty, it just did not load. */
@@ -254,6 +257,7 @@ interface SubmissionRecord extends ExecutionSettings {
   prompt: string;
   requestId: string;
   ownsDraft: boolean;
+  acknowledged?: boolean;
   rejected?: boolean;
   createdCeoChat?: boolean;
   deferredSource?: string;
@@ -301,7 +305,7 @@ function chatOwnerKey(cid: string | null, agentId: string): string {
 /** An error shown in the chat, with what "Retry" does about it. */
 interface ChatErrorEntry {
   message: string;
-  retry: SendAttempt | 'load' | null;
+  retry: SendAttempt | null;
 }
 
 interface ChatApprovalOrigin {
@@ -324,6 +328,10 @@ function mergeRecoveredMessages(history: ConvMessage[], recovered: ConvMessage[]
   const bySeq = new Map(recovered.map((message) => [message.seq, message]));
   for (const message of history) bySeq.set(message.seq, message);
   return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}
+
+function hasSavedCeoReply(messages: ConvMessage[], requestId: string): boolean {
+  return messages.some((message) => message.role === 'assistant' && message.client_message_id === `ask:${requestId}:assistant`);
 }
 
 function cacheRuns(conversationId: string, ids: string[]): void {
@@ -376,6 +384,9 @@ export function useChat(
 ): ChatState {
   const providers = useProviders();
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationListError, setConversationListError] = useState<string | null>(null);
+  const [retryingConversationList, setRetryingConversationList] = useState(false);
+  const conversationListRetryInFlight = useRef(false);
   // List reads and locally acknowledged conversation records share one publication order.
   const conversationListRevision = useRef(0);
   const rememberConversation = useCallback((chat: Conversation) => {
@@ -391,6 +402,7 @@ export function useChat(
   const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
   // The messages and runs of ONE chat, tagged with it: after a switch the old chat's text is never shown in the new one.
   const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[]; recovered?: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
+  const lastReconciledThread = useRef<{ cid: string; list: ConvMessage[] } | null>(null);
   const [runsThread, setRunsThread] = useState<{ cid: string | null; map: Record<number, RunSnapshot> }>({ cid: null, map: NO_RUNS });
   const [pendingUser, setPendingUser] = useState<string | null>(null);
   const [ceoStep, setCeoStep] = useState<{ cid: string; text: string } | null>(null);
@@ -534,6 +546,7 @@ export function useChat(
       };
     }
     for (const record of submissions.values()) {
+      if (record.acknowledged) continue;
       const owner = chatOwnerKey(record.cid, record.agentId);
       const draft = draftMap[owner];
       const notice = !record.execution ? missingSettings : missingLegacyProfiles.has(record.agentId) ? missingLegacyProfile :
@@ -557,14 +570,14 @@ export function useChat(
   const draftRevisions = useRef(new Map<string, symbol | undefined>());
   const selectionRevision = useRef(0);
   const agentOpens = useRef(new Map<string, AgentOpen>());
-  const raise = useCallback((cid: string | null, message: string, retry: ChatErrorEntry['retry'] = null) => {
-    setErrors((prev) => ({ ...prev, [cid ?? '']: { message, retry } }));
+  const raise = useCallback((owner: string, message: string, retry: ChatErrorEntry['retry'] = null) => {
+    setErrors((prev) => ({ ...prev, [owner]: { message, retry } }));
   }, []);
-  const clearError = useCallback((cid: string | null) => {
+  const clearError = useCallback((owner: string) => {
     setErrors((prev) => {
-      if (!((cid ?? '') in prev)) return prev;
+      if (!(owner in prev)) return prev;
       const next = { ...prev };
-      delete next[cid ?? ''];
+      delete next[owner];
       return next;
     });
   }, []);
@@ -614,7 +627,8 @@ export function useChat(
     const isCurrent = () => isActive() && revision === conversationListRevision.current;
     try {
       const list = await withoutEmptyHistory(await listConversations());
-      if (isCurrent()) setConversations(list);
+      if (!isCurrent()) return null;
+      setConversations(list);
       return list;
     } catch (error) {
       if (isCurrent()) throw error;
@@ -643,13 +657,53 @@ export function useChat(
       return { cid, list: mergeRecoveredMessages(list, missing), recovered: missing };
     });
   }, []);
-  const fetchMessages = useCallback(async (conversationId: string): Promise<ConvMessage[] | null> => {
+  const reconcileThread = useCallback((cid: string, list: ConvMessage[]) => {
+    lastReconciledThread.current = { cid, list };
+    publishThread(cid, list);
+    setThreadErrors((prev) => {
+      if (!(cid in prev)) return prev;
+      const next = { ...prev };
+      delete next[cid];
+      return next;
+    });
+    // Only a saved assistant message with this ask ID reconciles its submission.
+    for (const record of submissions.values()) {
+      if (record.cid !== cid || record.agentId !== CEO_PROFILE_ID ||
+          (!record.acknowledged && sending.current.has(cid)) ||
+          !hasSavedCeoReply(list, record.requestId)) continue;
+      forgetSubmission(record.requestId);
+      clearError(SUBMISSION_PREFIX + record.requestId);
+      if (record.ownsDraft) setDraftMap((prev) => {
+        if (prev[cid]?.trim() !== record.prompt) return prev;
+        const next = { ...prev };
+        delete next[cid];
+        writeJson(KEY_DRAFTS, next);
+        return next;
+      });
+    }
+  }, [publishThread, submissions, forgetSubmission, clearError]);
+  const readThreadMessages = useCallback(async (cid: string, ticket: number, errorPrefix: string) => {
+    try {
+      return await listMessages(cid);
+    } catch (error) {
+      if (mounted.current && readSeq.current.get(cid) === ticket) {
+        setThreadErrors((prev) => ({ ...prev, [cid]: errorPrefix + messageOf(error) }));
+      }
+      return null;
+    }
+  }, []);
+  const fetchMessages = useCallback(async (conversationId: string, acknowledgedCeo = false): Promise<ConvMessage[] | null> => {
     const ticket = nextRead(conversationId);
-    const list = await listMessages(conversationId);
-    if (readSeq.current.get(conversationId) !== ticket) return null;
-    if (selectedRef.current === conversationId) publishThread(conversationId, list);
+    const list = acknowledgedCeo
+      ? await readThreadMessages(conversationId, ticket, 'Loqman answered, but the conversation could not be refreshed. ')
+      : await listMessages(conversationId);
+    if (!list || !mounted.current || readSeq.current.get(conversationId) !== ticket) return null;
+    if (selectedRef.current === conversationId) {
+      if (acknowledgedCeo) reconcileThread(conversationId, list);
+      else publishThread(conversationId, list);
+    }
     return list;
-  }, [publishThread]);
+  }, [publishThread, reconcileThread, readThreadMessages]);
 
   const loadThread = useCallback(async (
     conversationId: string,
@@ -657,31 +711,12 @@ export function useChat(
   ) => {
     const ticket = nextRead(conversationId);
     const previousRun = currentRuns.current[conversationId];
-    setThreadErrors((prev) => {
-      if (!(conversationId in prev)) return prev;
-      const next = { ...prev };
-      delete next[conversationId];
-      return next;
-    });
-    const list = await listMessages(conversationId);
+    const list = await readThreadMessages(conversationId, ticket, '');
+    if (!list || !mounted.current) return;
     if (readSeq.current.get(conversationId) === ticket && selectedRef.current === conversationId) {
-      publishThread(conversationId, list);
+      reconcileThread(conversationId, list);
       const run = currentRuns.current[conversationId];
       if (run?.status === 'succeeded' && liveRuns.current.has(run.runId)) dropLive(conversationId, run.runId);
-      // CEO replies carry the ask ID. A matching prompt alone cannot identify a submission.
-      for (const record of submissions.values()) {
-        if (record.cid !== conversationId || record.agentId !== CEO_PROFILE_ID || sending.current.has(conversationId) ||
-            !list.some((m) => m.role === 'assistant' && m.client_message_id === `ask:${record.requestId}:assistant`)) continue;
-        forgetSubmission(record.requestId);
-        clearError(SUBMISSION_PREFIX + record.requestId);
-        if (record.ownsDraft) setDraftMap((prev) => {
-          if (prev[conversationId]?.trim() !== record.prompt) return prev;
-          const next = { ...prev };
-          delete next[conversationId];
-          writeJson(KEY_DRAFTS, next);
-          return next;
-        });
-      }
     }
     // The worker knows this conversation's runs; the browser index is only a fallback when it is unreachable.
     let snaps: Array<RunSnapshot | null> | null = await listRuns(conversationId, 30).catch(() => null);
@@ -725,7 +760,7 @@ export function useChat(
       setDrafts((prev) => ({ ...prev, ...Object.fromEntries(currentDrafts) }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
-  }, [submissions, forgetSubmission, clearError, dropLive, publishThread, readRunDrafts]);
+  }, [dropLive, reconcileThread, readRunDrafts, readThreadMessages]);
 
   const remember = (conversationId: string, runId: string) => {
     const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -925,38 +960,57 @@ export function useChat(
     follow(conversationId, snap.id);
   }, [finishRun, follow, updateRuns]);
 
+  const loadStartupConversations = useCallback(async (isActive: () => boolean) => {
+    let list: Conversation[] | null;
+    try {
+      list = await readConversationList(isActive);
+    } catch (error) {
+      if (isActive()) setConversationListError(`Could not load your chats. ${messageOf(error)}`);
+      return;
+    }
+    if (!list || !isActive()) return;
+    setConversationListError(null);
+
+    const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+    // Discover recent runs that were unavailable while the conversation list was missing.
+    const lastRun: Record<string, string | undefined> = {};
+    const discoveredRuns = new Map<string, RunSnapshot>();
+    for (const [cid, ids] of Object.entries(all)) lastRun[cid] = ids[ids.length - 1];
+    const unknown = list.filter((c) => !(c.id in lastRun)).slice(0, 10);
+    await Promise.all(unknown.map(async (c) => {
+      const [latest] = await listRuns(c.id, 1).catch(() => []);
+      if (latest?.conversation_id !== c.id) return;
+      lastRun[c.id] = latest.id;
+      discoveredRuns.set(c.id, latest);
+    }));
+    for (const [cid, last] of Object.entries(lastRun)) {
+      if (!isActive()) return;
+      if (!last) continue;
+      const snap = await getRun(last).catch(() => discoveredRuns.get(cid));
+      if (!isActive()) return;
+      if (snap?.id === last) observeRun(cid, snap);
+    }
+  }, [observeRun, readConversationList]);
+
+  const retryConversationList = useCallback(async () => {
+    if (conversationListRetryInFlight.current) return;
+    conversationListRetryInFlight.current = true;
+    setRetryingConversationList(true);
+    try {
+      await loadStartupConversations(() => mounted.current);
+    } finally {
+      conversationListRetryInFlight.current = false;
+      if (mounted.current) setRetryingConversationList(false);
+    }
+  }, [loadStartupConversations]);
+
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
         await importLegacyCeo().catch(() => undefined);
         if (!alive) return;
-        const list = await readConversationList(() => alive);
-        if (!alive || !list) return;
-        const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
-        // Recover from the cache, and ask the worker about recent chats the cache does not know (cleared storage).
-        const lastRun: Record<string, string | undefined> = {};
-        const discoveredRuns = new Map<string, RunSnapshot>();
-        for (const [cid, ids] of Object.entries(all)) lastRun[cid] = ids[ids.length - 1];
-        const unknown = list.filter((c) => !(c.id in lastRun)).slice(0, 10);
-        await Promise.all(
-          unknown.map(async (c) => {
-            const found = await listRuns(c.id, 1).catch(() => []);
-            const latest = found[0];
-            if (latest?.conversation_id !== c.id) return;
-            lastRun[c.id] = latest.id;
-            discoveredRuns.set(c.id, latest);
-          })
-        );
-        if (!alive) return;
-        for (const [cid, last] of Object.entries(lastRun)) {
-          if (!last) continue;
-          const snap = await getRun(last).catch(() => discoveredRuns.get(cid));
-          if (!alive) return;
-          if (snap?.id === last) observeRun(cid, snap);
-        }
-      } catch (e) {
-        if (alive) raise(null, `Could not load your chats. ${messageOf(e)}`, 'load');
+        await loadStartupConversations(() => alive);
       } finally {
         if (alive) await refreshApprovals();
         if (alive) setLoaded(true);
@@ -967,7 +1021,7 @@ export function useChat(
       alive = false;
       for (const id of open.keys()) closeFollower(id);
     };
-  }, [closeFollower, observeRun, readConversationList, raise, refreshApprovals]);
+  }, [closeFollower, loadStartupConversations, refreshApprovals]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -1261,7 +1315,16 @@ export function useChat(
             // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
             requireOriginalModel();
             const answer = await askCeo(prompt, execution.engine, execution.model, ticket, chatId);
-            forgetSubmission(requestId);
+            const record = submissions.get(requestId);
+            const reconciled = lastReconciledThread.current;
+            if (reconciled?.cid === chatId && hasSavedCeoReply(reconciled.list, requestId)) {
+              forgetSubmission(requestId);
+            } else if (record) {
+              // Keep the original ID for history reconciliation, while disarming the send Retry.
+              record.acknowledged = true;
+              writeJson(submissionKey, record);
+            }
+            clearError(submissionKey);
             clearDraft(chatId);
             if (retainedSourceKey) clearDraft(retainedSourceKey);
             if (answer.agents_created.length) onAgentsChanged?.();
@@ -1279,7 +1342,7 @@ export function useChat(
             // The answer is settled. A slow history refresh must not swallow the next Retry.
             releaseLock();
             await refreshConversations().catch(() => undefined);
-            await fetchMessages(chatId).catch(() => null);
+            await fetchMessages(chatId, !failure).catch(() => null);
           }
           return;
         }
@@ -1576,7 +1639,7 @@ ${prompt}`;
   const shownError = errors[errorKey];
   const threadError = selectedId ? (threadErrors[selectedId] ?? null) : null;
   const recovery = shownError?.retry;
-  const retryChoice = recovery && recovery !== 'load' && recovery.agentId !== CEO_PROFILE_ID ? recovery.execution : null;
+  const retryChoice = recovery && recovery.agentId !== CEO_PROFILE_ID ? recovery.execution : null;
   const retryReadiness = retryChoice ? retryProviderReadiness(retryChoice, providers) : 'ready';
   const retryEngine = retryChoice?.engine;
   useEffect(() => {
@@ -1587,27 +1650,22 @@ ${prompt}`;
   const retry = useMemo(() => {
     if (!shownError?.retry) return null;
     const action = shownError.retry;
-    if (typeof action === 'object' && !action.execution) return null;
+    if (!action.execution) return null;
     return () => {
-      if (action !== 'load') {
-        if (action.cid && !action.cid.startsWith('legacy:')) {
-          const chat = conversations.find((c) => c.id === action.cid);
-          if (!chat || (chat.profile_id && chat.profile_id !== action.agentId)) {
-            raise(errorKey, 'The original conversation or its agent is no longer available.', action.requestId ? action : null);
-            return;
-          }
-        }
-        if (retryChoice && retryProviderReadiness(retryChoice) === 'failed') {
-          void refreshProviders(true);
+      if (action.cid && !action.cid.startsWith('legacy:')) {
+        const chat = conversations.find((c) => c.id === action.cid);
+        if (!chat || (chat.profile_id && chat.profile_id !== action.agentId)) {
+          raise(errorKey, 'The original conversation or its agent is no longer available.', action.requestId ? action : null);
           return;
         }
-        void sendAttempt(action, errorKey);
+      }
+      if (retryChoice && retryProviderReadiness(retryChoice) === 'failed') {
+        void refreshProviders(true);
         return;
       }
-      clearError(errorKey || null);
-      void refreshConversations().catch((e) => raise(null, `Could not load your chats. ${messageOf(e)}`, 'load'));
+      void sendAttempt(action, errorKey);
     };
-  }, [shownError, conversations, sendAttempt, clearError, errorKey, refreshConversations, raise, retryChoice]);
+  }, [shownError, conversations, sendAttempt, errorKey, raise, retryChoice]);
 
   const retryThread = useCallback(() => {
     const cid = selectedRef.current;
@@ -1624,6 +1682,9 @@ ${prompt}`;
 
   return {
     conversations,
+    conversationListError,
+    retryingConversationList,
+    retryConversationList,
     legacy,
     selectedId,
     select,
@@ -1656,7 +1717,7 @@ ${prompt}`;
           return next;
         });
       }
-      clearError(errorKey || null);
+      clearError(errorKey);
     },
     retry,
     retryProviderCheck: retryReadiness === 'ready' ? null : retryReadiness === 'needs-catalog' ? 'checking' : retryReadiness,
