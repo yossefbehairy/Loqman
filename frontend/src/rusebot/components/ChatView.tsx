@@ -427,7 +427,7 @@ export function ChatView({
                 {chat.threadError && (
                   <div role="alert" data-thread-error className="flex flex-col items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-3 text-[13px] text-danger">
                     <p dir="auto" className="break-words">
-                      This chat could not be loaded, so its messages are not shown. {chat.threadError}
+                      This chat could not be loaded completely. {chat.threadError}
                     </p>
                     <button type="button" data-thread-retry onClick={chat.retryThread} className="ui-button ui-button-sm">
                       Retry

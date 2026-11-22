@@ -307,6 +307,13 @@ const NO_MESSAGES: ConvMessage[] = [];
 const NO_RUNS: Record<number, RunSnapshot> = {};
 const NO_APPROVALS: Approval[] = [];
 
+function mergeRecoveredMessages(history: ConvMessage[], recovered: ConvMessage[]): ConvMessage[] {
+  if (!recovered.length) return history;
+  const bySeq = new Map(recovered.map((message) => [message.seq, message]));
+  for (const message of history) bySeq.set(message.seq, message);
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}
+
 function cacheRuns(conversationId: string, ids: string[]): void {
   const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
   all[conversationId] = ids.slice(-30);
@@ -371,7 +378,7 @@ export function useChat(
   const [legacy] = useState<LegacyThread[]>(() => readLegacyThreads());
   const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
   // The messages and runs of ONE chat, tagged with it: after a switch the old chat's text is never shown in the new one.
-  const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
+  const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[]; recovered?: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
   const [runsThread, setRunsThread] = useState<{ cid: string | null; map: Record<number, RunSnapshot> }>({ cid: null, map: NO_RUNS });
   const [pendingUser, setPendingUser] = useState<string | null>(null);
   const [ceoStep, setCeoStep] = useState<{ cid: string; text: string } | null>(null);
@@ -395,6 +402,7 @@ export function useChat(
   const [live, setLive] = useState<Record<string, LiveTurn>>({});
   const liveRuns = useRef(new Map<string, LiveTurn>());
   const stoppedRuns = useRef(new Set<string>());
+  const terminalRuns = useRef(new Set<string>());
   const liveDirty = useRef(new Map<string, string>());
   const liveFrame = useRef<number | null>(null);
   const liveLastFlush = useRef(0);
@@ -606,16 +614,29 @@ export function useChat(
     readSeq.current.set(cid, n);
     return n;
   };
+  const publishThread = useCallback((cid: string, list: ConvMessage[]) => {
+    setThread((prev) => {
+      const recovered = prev.cid === cid ? prev.recovered : undefined;
+      if (!recovered?.length) return { cid, list };
+      const seen = new Set(list.map((message) => message.seq));
+      const missing = recovered.filter((message) => !seen.has(message.seq));
+      return { cid, list: mergeRecoveredMessages(list, missing), recovered: missing };
+    });
+  }, []);
   const fetchMessages = useCallback(async (conversationId: string): Promise<ConvMessage[] | null> => {
     const ticket = nextRead(conversationId);
     const list = await listMessages(conversationId);
     if (readSeq.current.get(conversationId) !== ticket) return null;
-    if (selectedRef.current === conversationId) setThread({ cid: conversationId, list });
+    if (selectedRef.current === conversationId) publishThread(conversationId, list);
     return list;
-  }, []);
+  }, [publishThread]);
 
-  const loadThread = useCallback(async (conversationId: string) => {
+  const loadThread = useCallback(async (
+    conversationId: string,
+    observeRun?: (conversationId: string, snap: RunSnapshot, previousRun?: RunState) => void,
+  ) => {
     const ticket = nextRead(conversationId);
+    const previousRun = currentRuns.current[conversationId];
     setThreadErrors((prev) => {
       if (!(conversationId in prev)) return prev;
       const next = { ...prev };
@@ -624,7 +645,7 @@ export function useChat(
     });
     const list = await listMessages(conversationId);
     if (readSeq.current.get(conversationId) === ticket && selectedRef.current === conversationId) {
-      setThread({ cid: conversationId, list });
+      publishThread(conversationId, list);
       const run = currentRuns.current[conversationId];
       if (run?.status === 'succeeded' && liveRuns.current.has(run.runId)) dropLive(conversationId, run.runId);
       // CEO replies carry the ask ID. A matching prompt alone cannot identify a submission.
@@ -644,11 +665,24 @@ export function useChat(
     }
     // The worker knows this conversation's runs; the browser index is only a fallback when it is unreachable.
     let snaps: Array<RunSnapshot | null> | null = await listRuns(conversationId, 30).catch(() => null);
+    const listAvailable = snaps !== null;
     if (snaps) {
       cacheRuns(conversationId, snaps.map((s) => s!.id));
     } else {
       const ids = readJson<Record<string, string[]>>(KEY_RUNS, {})[conversationId] ?? [];
       snaps = await Promise.all(ids.slice(-30).map((id) => getRun(id).catch(() => null)));
+    }
+    if (observeRun && readSeq.current.get(conversationId) === ticket) {
+      const latest = snaps.at(-1);
+      if (latest?.conversation_id === conversationId) {
+        observeRun(conversationId, latest, listAvailable ? previousRun : undefined);
+      }
+      if (!listAvailable) {
+        const current = currentRuns.current[conversationId];
+        if (!current || !streams.current.has(current.runId)) {
+          throw new Error('Could not verify the latest run with the worker.');
+        }
+      }
     }
     const bySeq: Record<number, RunSnapshot> = {};
     const nextDrafts: Record<string, Draft[]> = {};
@@ -665,7 +699,7 @@ export function useChat(
       setDrafts((prev) => ({ ...prev, ...nextDrafts }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
-  }, [submissions, forgetSubmission, clearError, dropLive]);
+  }, [submissions, forgetSubmission, clearError, dropLive, publishThread]);
 
   const remember = (conversationId: string, runId: string) => {
     const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -693,6 +727,7 @@ export function useChat(
     const ownsRun = () => mounted.current && currentRuns.current[conversationId]?.runId === runId;
     const current = currentRuns.current[conversationId];
     if (!mounted.current || (current && (current.runId !== runId || isTerminal(current.status)))) return;
+    terminalRuns.current.add(runId);
     closeFollower(runId);
     updateRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error } }));
     clearStopping(runId);
@@ -725,7 +760,9 @@ export function useChat(
   }, [clearStopping, closeFollower, dropLive, fetchMessages, loadThread, raise, refreshApprovals, refreshConversations, updateRuns]);
 
   const follow = useCallback((conversationId: string, runId: string) => {
-    if (!mounted.current || streams.current.has(runId) || currentRuns.current[conversationId]?.runId !== runId) return;
+    const run = currentRuns.current[conversationId];
+    if (!mounted.current || streams.current.has(runId) || terminalRuns.current.has(runId) ||
+        run?.runId !== runId || isTerminal(run.status)) return;
     let handle: StreamHandle | undefined;
     let subscription: symbol | undefined;
     let timer: number | undefined;
@@ -843,6 +880,25 @@ export function useChat(
     connect();
   }, [applyLive, finishRun, updateRuns]);
 
+  const observeRun = useCallback((conversationId: string, snap: RunSnapshot, previousRun?: RunState) => {
+    if (!mounted.current || snap.conversation_id !== conversationId) return;
+    const current = currentRuns.current[conversationId];
+    if (isTerminal(snap.status)) {
+      terminalRuns.current.add(snap.id);
+      if (current?.runId === snap.id && !isTerminal(current.status)) {
+        void finishRun(conversationId, snap.id, snap.status, snap.error);
+      }
+      return;
+    }
+    if (terminalRuns.current.has(snap.id)) return;
+    if (current?.runId !== snap.id) {
+      // Only a current list read may advance past an already settled run of this chat.
+      if (current && (current !== previousRun || !isTerminal(current.status))) return;
+      updateRuns((prev) => ({ ...prev, [conversationId]: { runId: snap.id, status: snap.status, error: null } }));
+    }
+    follow(conversationId, snap.id);
+  }, [finishRun, follow, updateRuns]);
+
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -854,26 +910,24 @@ export function useChat(
         const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
         // Recover from the cache, and ask the worker about recent chats the cache does not know (cleared storage).
         const lastRun: Record<string, string | undefined> = {};
+        const discoveredRuns = new Map<string, RunSnapshot>();
         for (const [cid, ids] of Object.entries(all)) lastRun[cid] = ids[ids.length - 1];
         const unknown = list.filter((c) => !(c.id in lastRun)).slice(0, 10);
         await Promise.all(
           unknown.map(async (c) => {
             const found = await listRuns(c.id, 1).catch(() => []);
-            if (found[0]) lastRun[c.id] = found[0].id;
+            const latest = found[0];
+            if (latest?.conversation_id !== c.id) return;
+            lastRun[c.id] = latest.id;
+            discoveredRuns.set(c.id, latest);
           })
         );
         if (!alive) return;
         for (const [cid, last] of Object.entries(lastRun)) {
           if (!last) continue;
-          const snap = await getRun(last).catch(() => null);
+          const snap = await getRun(last).catch(() => discoveredRuns.get(cid));
           if (!alive) return;
-          if (snap && !isTerminal(snap.status)) {
-            updateRuns((prev) => prev[cid] ? prev : {
-              ...prev, [cid]: { runId: snap.id, status: snap.status, error: null },
-            });
-            const current = currentRuns.current[cid];
-            if (current.runId === snap.id && !isTerminal(current.status)) follow(cid, snap.id);
-          }
+          if (snap?.id === last) observeRun(cid, snap);
         }
       } catch (e) {
         if (alive) raise(null, `Could not load your chats. ${messageOf(e)}`, 'load');
@@ -887,7 +941,7 @@ export function useChat(
       alive = false;
       for (const id of open.keys()) closeFollower(id);
     };
-  }, [closeFollower, follow, readConversationList, raise, refreshApprovals, updateRuns]);
+  }, [closeFollower, observeRun, readConversationList, raise, refreshApprovals]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -896,13 +950,13 @@ export function useChat(
       return;
     }
     let alive = true;
-    loadThread(selectedId).catch((e) => {
+    loadThread(selectedId, observeRun).catch((e) => {
       if (alive) setThreadErrors((prev) => ({ ...prev, [selectedId]: messageOf(e) }));
     });
     return () => {
       alive = false;
     };
-  }, [selectedId, loadThread]);
+  }, [selectedId, loadThread, observeRun]);
 
   const anyActive = Object.values(runs).some((r) => !isTerminal(r.status));
   useEffect(() => {
@@ -981,7 +1035,9 @@ export function useChat(
         );
         return;
       }
-      clearError(errorOwner);
+      // A saved CEO draft must keep its original Retry action until history can reconcile it.
+      const recoveringSavedCeo = agentId === CEO_PROFILE_ID && Boolean(attempt.requestId) && !needsConversation(cid);
+      if (!recoveringSavedCeo) clearError(errorOwner);
       const lock = Symbol();
       const locks = new Map(sending.current).set(key, lock);
       if (deferredSource) locks.set(deferredSource, lock);
@@ -1110,9 +1166,23 @@ export function useChat(
           // Loqman (the CEO) answers through the CEO loop, which is the path that can create agents.
           const ticket = requestId;
           if (attempt.requestId && attempt.cid === chatId) {
+            const readAtStart = readSeq.current.get(chatId);
             const history = await listMessages(chatId);
-            if (history.some((m) => m.role === 'assistant' && m.client_message_id === `ask:${ticket}:assistant`)) {
+            const exchange = history.filter((m) => m.conversation_id === chatId && m.client_message_id === `ask:${ticket}:${m.role}`);
+            if (exchange.some((m) => m.role === 'assistant')) {
+              // If the user left, normal history loading will reconcile and clear the record on return.
+              if (!mounted.current || selectedRef.current !== chatId) return;
+              const newerRead = readSeq.current.get(chatId) !== readAtStart;
+              if (!newerRead) nextRead(chatId);
+              setThread((prev) => {
+                const sameChat = prev.cid === chatId;
+                const list = newerRead && sameChat ? prev.list : history;
+                // A newer read can publish independently of recovery, even if it missed the recovered exchange.
+                const recovered = mergeRecoveredMessages(exchange, sameChat ? prev.recovered ?? NO_MESSAGES : NO_MESSAGES);
+                return { cid: chatId, list: mergeRecoveredMessages(list, recovered), recovered };
+              });
               forgetSubmission(ticket);
+              clearError(errorOwner);
               clearDraft(chatId);
               if (retainedSourceKey) clearDraft(retainedSourceKey);
               return;
@@ -1127,6 +1197,7 @@ export function useChat(
               return;
             }
           }
+          if (recoveringSavedCeo) clearError(errorOwner);
           if (selectedRef.current === chatId) setPendingUser(prompt);
           const recoveryKey = CEO_SUBMISSION_PREFIX + chatId;
           const hideSubmittedDraft = ownsDraft(chatId);
@@ -1242,7 +1313,8 @@ ${prompt}`;
         clearDraft(chatId);
         if (retainedSourceKey) clearDraft(retainedSourceKey);
         const current = currentRuns.current[chatId];
-        if (current && (current.runId === snap.id ? isTerminal(current.status) : isTerminal(snap.status))) {
+        if (terminalRuns.current.has(snap.id) ||
+            (current && (current.runId === snap.id ? isTerminal(current.status) : isTerminal(snap.status)))) {
           // A delayed acknowledgement cannot replace a settled run or take ownership from a newer run.
           if (previewedSpecialistPrompt && selectedRef.current === chatId) setPendingUser(null);
           await loadThread(chatId).catch(() => null);
@@ -1481,8 +1553,8 @@ ${prompt}`;
   const retryThread = useCallback(() => {
     const cid = selectedRef.current;
     if (!cid || cid.startsWith('legacy:')) return;
-    loadThread(cid).catch((e) => setThreadErrors((prev) => ({ ...prev, [cid]: messageOf(e) })));
-  }, [loadThread]);
+    loadThread(cid, observeRun).catch((e) => setThreadErrors((prev) => ({ ...prev, [cid]: messageOf(e) })));
+  }, [loadThread, observeRun]);
 
   const currentRun = selectedId ? (runs[selectedId] ?? null) : null;
   const activeRunIds = useMemo(() => {
