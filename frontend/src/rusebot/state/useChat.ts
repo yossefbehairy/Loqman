@@ -210,8 +210,9 @@ export interface ChatState {
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
   newChat: () => void;
-  decide: (approval: Approval, decision: 'approve' | 'deny') => Promise<void>;
-  makeDeliverable: (runId: string) => Promise<void>;
+  decide: (approval: Approval, decision: 'approve' | 'deny', origin?: ChatApprovalOrigin) => Promise<void>;
+  draftSaves: Record<string, { pending: boolean; error?: string }>;
+  makeDeliverable: (run: RunSnapshot) => Promise<void>;
   reviewDraft: (draft: Draft, decision: 'approve' | 'reject') => Promise<string | void>;
   downloadDraft: (draft: Draft) => Promise<void>;
   loaded: boolean;
@@ -303,9 +304,20 @@ interface ChatErrorEntry {
   retry: SendAttempt | 'load' | null;
 }
 
+interface ChatApprovalOrigin {
+  conversationId: string | null;
+  confirm: (approval: Approval) => void;
+}
+
 const NO_MESSAGES: ConvMessage[] = [];
 const NO_RUNS: Record<number, RunSnapshot> = {};
 const NO_APPROVALS: Approval[] = [];
+
+function upsertDraft(list: Draft[], draft: Draft): Draft[] {
+  return list.some((item) => item.id === draft.id)
+    ? list.map((item) => item.id === draft.id ? draft : item)
+    : [...list, draft];
+}
 
 function mergeRecoveredMessages(history: ConvMessage[], recovered: ConvMessage[]): ConvMessage[] {
   if (!recovered.length) return history;
@@ -478,6 +490,14 @@ export function useChat(
     }
   }, []);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
+  const [draftSaves, setDraftSaves] = useState<ChatState['draftSaves']>({});
+  const savingDrafts = useRef(new Set<string>());
+  const draftReads = useRef(new Map<string, number>());
+  const readRunDrafts = useCallback(async (runId: string) => {
+    const ticket = (draftReads.current.get(runId) ?? 0) + 1;
+    draftReads.current.set(runId, ticket);
+    return { ticket, list: await listDrafts(runId) };
+  }, []);
   const [resultsDrafts, setResultsDrafts] = useState<ResultsDrafts>({ list: null, loading: true, error: null });
   const resultsRead = useRef({ ticket: 0, pending: false });
   // Keep the legacy '' entry in storage for recovery. Its agent is unknown.
@@ -685,21 +705,27 @@ export function useChat(
       }
     }
     const bySeq: Record<number, RunSnapshot> = {};
-    const nextDrafts: Record<string, Draft[]> = {};
+    const nextDrafts: Record<string, Awaited<ReturnType<typeof readRunDrafts>>> = {};
     for (const snap of snaps) {
       if (!snap || snap.conversation_id !== conversationId) continue;
       if (snap.assistant_message_seq != null) bySeq[snap.assistant_message_seq] = snap;
       else if (snap.user_message_seq != null && (snap.status === 'failed' || snap.status === 'interrupted')) {
         bySeq[snap.user_message_seq] = snap;
       }
-      if (snap.status === 'succeeded') nextDrafts[snap.id] = await listDrafts(snap.id).catch(() => []);
+      if (snap.status === 'succeeded') {
+        const read = await readRunDrafts(snap.id).catch(() => null);
+        if (read) nextDrafts[snap.id] = read;
+      }
     }
     if (selectedRef.current === conversationId && readSeq.current.get(conversationId) === ticket) {
       setRunsThread({ cid: conversationId, map: bySeq });
-      setDrafts((prev) => ({ ...prev, ...nextDrafts }));
+      const currentDrafts = Object.entries(nextDrafts)
+        .filter(([id, read]) => draftReads.current.get(id) === read.ticket)
+        .map(([id, read]) => [id, read.list]);
+      setDrafts((prev) => ({ ...prev, ...Object.fromEntries(currentDrafts) }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
-  }, [submissions, forgetSubmission, clearError, dropLive, publishThread]);
+  }, [submissions, forgetSubmission, clearError, dropLive, publishThread, readRunDrafts]);
 
   const remember = (conversationId: string, runId: string) => {
     const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -1431,9 +1457,17 @@ ${prompt}`;
     clearStopping(run.runId);
   }, [clearStopping, finishRun, raise]);
 
-  const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny') => {
+  const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny', origin?: ChatApprovalOrigin) => {
+    if (origin) {
+      const cid = selectedRef.current;
+      const run = cid ? currentRuns.current[cid] : undefined;
+      if (cid !== origin.conversationId || run?.runId !== approval.run_id || isTerminal(run.status)) {
+        throw new Error('This approval no longer belongs to the active run in this chat.');
+      }
+    }
     try {
-      await decideApproval(approval.run_id, approval.id, decision);
+      const confirmed = await decideApproval(approval.run_id, approval.id, decision);
+      origin?.confirm(confirmed);
       setApprovalRead((prev) => prev.list
         ? { ...prev, list: prev.list.filter((item) => item.id !== approval.id) }
         : prev);
@@ -1441,16 +1475,6 @@ ${prompt}`;
       await refreshApprovals();
     }
   }, [refreshApprovals]);
-
-  const makeDeliverable = useCallback(async (runId: string) => {
-    try {
-      await createDraft(runId);
-    } catch (e) {
-      raise(selectedRef.current, messageOf(e));
-    }
-    const list = await listDrafts(runId).catch(() => []);
-    setDrafts((prev) => ({ ...prev, [runId]: list }));
-  }, [raise]);
 
   const loadAllDrafts = useCallback(async () => {
     const ticket = ++resultsRead.current.ticket;
@@ -1472,6 +1496,39 @@ ${prompt}`;
     }
   }, []);
 
+  const makeDeliverable = useCallback(async (run: RunSnapshot) => {
+    const { id: runId, conversation_id: origin } = run;
+    if (selectedRef.current !== origin || savingDrafts.current.has(runId)) return;
+    savingDrafts.current.add(runId);
+    setDraftSaves((prev) => ({ ...prev, [runId]: { pending: true } }));
+    try {
+      let created: Draft;
+      try {
+        created = await createDraft(runId);
+      } catch (e) {
+        if (mounted.current) setDraftSaves((prev) => ({ ...prev, [runId]: { pending: false, error: messageOf(e) } }));
+        return;
+      }
+      if (!mounted.current) return;
+      setDrafts((prev) => ({ ...prev, [runId]: upsertDraft(prev[runId] ?? [], created) }));
+      setResultsDrafts((prev) => prev.list ? { ...prev, list: upsertDraft(prev.list, created) } : prev);
+      setDraftSaves((prev) => {
+        const next = { ...prev };
+        delete next[runId];
+        return next;
+      });
+      if (resultsRead.current.pending) void loadAllDrafts();
+      // Creation is already confirmed. A read failure leaves the confirmed card available.
+      const read = await readRunDrafts(runId).catch(() => null);
+      if (mounted.current && read && read.ticket === draftReads.current.get(runId)) {
+        const list = read.list.some((draft) => draft.id === created.id) ? read.list : [...read.list, created];
+        setDrafts((prev) => ({ ...prev, [runId]: list }));
+      }
+    } finally {
+      savingDrafts.current.delete(runId);
+    }
+  }, [loadAllDrafts, readRunDrafts]);
+
   const reviewDraft = useCallback(async (draft: Draft, decision: 'approve' | 'reject') => {
     const updated = await decideDraft(draft.run_id, draft.id, decision, draft.content_sha256);
     const replace = (item: Draft) => item.id === updated.id ? { ...item, ...updated } : item;
@@ -1483,12 +1540,14 @@ ${prompt}`;
     // A read started before the decision may still carry the pre-review state.
     if (resultsRead.current.pending) void loadAllDrafts();
     try {
-      const list = await listDrafts(draft.run_id);
-      setDrafts((prev) => ({ ...prev, [draft.run_id]: list }));
+      const read = await readRunDrafts(draft.run_id);
+      if (read.ticket === draftReads.current.get(draft.run_id)) {
+        setDrafts((prev) => ({ ...prev, [draft.run_id]: read.list }));
+      }
     } catch (e) {
       return messageOf(e);
     }
-  }, [loadAllDrafts]);
+  }, [loadAllDrafts, readRunDrafts]);
 
   const downloadDraft = useCallback(async (draft: Draft) => {
     const out = await draftContent(draft.run_id, draft.id);
@@ -1617,6 +1676,7 @@ ${prompt}`;
       setDraftAgentId(current);
     },
     decide,
+    draftSaves,
     makeDeliverable,
     reviewDraft,
     downloadDraft,

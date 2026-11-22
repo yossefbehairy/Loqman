@@ -292,7 +292,8 @@ export function ChatView({
     () => chat.approvals.filter((a) => chat.run && a.run_id === chat.run.runId),
     [chat.approvals, chat.run]
   );
-  const { shown: approvals, decide: decideApproval } = useKeepDecided(runApprovals);
+  const { shown, decide: decideApproval, retained } = useKeepDecided(runApprovals);
+  const approvals = shown.filter(a => a.run_id === chat.run?.runId);
 
   const rows = chat.messages.map((m, i) => {
     const prev = chat.messages[i - 1];
@@ -300,6 +301,7 @@ export function ChatView({
     const run = chat.runsBySeq[m.seq];
     const replyRun = m.role === 'assistant' ? run : undefined;
     const drafts = replyRun ? (chat.drafts[replyRun.id] ?? []) : [];
+    const save = replyRun ? chat.draftSaves[replyRun.id] : undefined;
     return (
       <div className="contents" key={m.seq} data-mid={m.seq}>
         {(i === 0 || showDay) && <div className="py-3 text-center text-[13px] text-ink-secondary">{dayLabel(m.created_at)}</div>}
@@ -312,12 +314,14 @@ export function ChatView({
             {replyRun.status === 'succeeded' && drafts.length === 0 && (
               <button
                 type="button"
-                onClick={() => void chat.makeDeliverable(replyRun.id)}
+                disabled={save?.pending}
+                onClick={() => void chat.makeDeliverable(replyRun)}
                 className="ui-chip text-[12.5px] text-ink-secondary hover:text-ink"
               >
-                Save reply as deliverable for review
+                {save?.pending ? 'Saving deliverable…' : 'Save reply as deliverable for review'}
               </button>
             )}
+            {save?.error && <p role="alert" className="text-[13px] text-danger">Could not save deliverable. {save.error}</p>}
           </div>
         )}
       </div>
@@ -446,16 +450,26 @@ export function ChatView({
                 {chat.pendingUser && !chat.messages.some((m) => m.role === 'user' && m.content === chat.pendingUser) && (
                   <Bubble role="user" text={chat.pendingUser} iso={new Date().toISOString()} />
                 )}
-                {approvals.map((a) => (
-                  <ApprovalCard
-                    key={a.id}
-                    kind="tool"
-                    title={`${ASSISTANT_NAME} wants permission`}
-                    detail={a.action_summary}
-                    scope={a.scope}
-                    onDecide={(decision) => decideApproval(a, () => chat.decide(a, decision))}
-                  />
-                ))}
+                {approvals.map((a) => {
+                  const entry = retained[a.id];
+                  const status = entry?.item.status ?? a.status;
+                  const confirmed = status === 'approved' ? 'approve' : status === 'denied' ? 'deny' : undefined;
+                  return (
+                    <ApprovalCard
+                      key={a.id}
+                      kind="tool"
+                      title={`${ASSISTANT_NAME} wants permission`}
+                      detail={a.action_summary}
+                      scope={a.scope}
+                      confirmedDecision={confirmed}
+                      decisionPending={Boolean(entry && !confirmed)}
+                      onDecide={(decision) => decideApproval(a, (confirm) => chat.decide(a, decision, {
+                        conversationId: chat.selectedId,
+                        confirm,
+                      }))}
+                    />
+                  );
+                })}
                 {live && <LiveReply turn={live} />}
                 {running && !live && (
                   <div data-working className="flex items-center gap-2 px-1 text-[13px] text-ink-secondary" role="status">

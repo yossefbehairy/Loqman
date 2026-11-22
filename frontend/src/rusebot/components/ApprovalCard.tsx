@@ -24,16 +24,20 @@ export interface ApprovalCardProps {
   detail: string;
   scope?: string;
   kind: 'tool' | 'manager';
+  confirmedDecision?: 'approve' | 'deny';
+  decisionPending?: boolean;
   onDecide: (decision: 'approve' | 'deny') => Promise<DecideResult>;
 }
 
-export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalCardProps) {
+export function ApprovalCard({ title, detail, scope, kind, confirmedDecision, decisionPending, onDecide }: ApprovalCardProps) {
   const [busy, setBusy] = useState<null | 'approve' | 'deny'>(null);
-  const [outcome, setOutcome] = useState<null | 'approve' | 'deny'>(null);
+  const [localOutcome, setOutcome] = useState<null | 'approve' | 'deny'>(null);
+  const outcome = confirmedDecision ?? localOutcome;
   const [failure, setFailure] = useState<string | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
   const [byLoqman, setByLoqman] = useState(false);
   const decide = async (decision: 'approve' | 'deny') => {
+    if (outcome || busy || decisionPending) return;
     setBusy(decision);
     setFailure(null);
     setApplyError(null);
@@ -108,7 +112,7 @@ export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalC
           <span className="flex items-center gap-2">
             <button
               type="button"
-              disabled={busy !== null}
+              disabled={busy !== null || decisionPending}
               onClick={() => void decide('deny')}
               className={cn(APPROVAL_CONTROL, 'bg-control text-ink hover:bg-raised-hover')}
             >
@@ -116,7 +120,7 @@ export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalC
             </button>
             <button
               type="button"
-              disabled={busy !== null}
+              disabled={busy !== null || decisionPending}
               onClick={() => void decide('approve')}
               className={cn(APPROVAL_CONTROL, 'bg-accent text-accent-ink hover:brightness-110')}
             >
