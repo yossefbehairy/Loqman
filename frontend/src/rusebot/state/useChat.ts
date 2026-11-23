@@ -218,7 +218,7 @@ export interface ChatState {
   setDraft: (text: string) => void;
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
-  newChat: () => void;
+  newChat: (recipientId?: string) => void;
   decide: (approval: Approval, decision: ToolDecision, origin?: { conversationId: string | null }) => Promise<void>;
   draftSaves: Record<string, { pending: boolean; error?: string }>;
   makeDeliverable: (run: RunSnapshot) => Promise<void>;
@@ -1837,8 +1837,8 @@ ${prompt}`;
     setDraft,
     send,
     stop,
-    newChat: () => {
-      const current = recipientIdFor(selectedRef.current);
+    newChat: (recipientId) => {
+      const current = recipientId ?? recipientIdFor(selectedRef.current);
       const owner = chatOwnerKey(null, current ?? CEO_PROFILE_ID);
       if (!draftMap[owner] && !sending.current.has(owner) &&
           ![...submissions.values()].some(record => record.cid === null && chatOwnerKey(null, record.agentId) === owner)) {

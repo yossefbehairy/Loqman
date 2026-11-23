@@ -843,7 +843,7 @@ test.describe('agents: created by the user or by Loqman, no built-in specialists
     await open(page, '/?ui=rusebot', { asAgent: false });
     await openDrawerIfNarrow(page);
     await page.locator('[data-sidebar-new]').click();
-    await expect(page.getByRole('menuitem')).toHaveText(['New chat', 'New agent']);
+    await expect(page.getByRole('menuitem')).toHaveText(['New chat with Loqman', 'New agent']);
     await page.locator('[data-new-agent]').click();
     const name = `Maker${uid()}`;
     await page.locator('#na-name').fill(name);

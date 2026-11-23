@@ -17,6 +17,7 @@ import { useChat, messageOf } from './state/useChat';
 import { useCompany } from './state/useCompany';
 import {
   approveCeoAction,
+  CEO_PROFILE_ID,
   ceoActionOutcome,
   denyCeoAction,
   listCeoActions,
@@ -126,7 +127,9 @@ export function Shell() {
 
   const failedParts = [...(company.error ? ['agents'] : []), ...Object.keys(failures)];
   const failureDetail = company.error ?? Object.values(failures)[0] ?? '';
-  const collapsed = rail || (panelOpen && !fits);
+  const forcedRail = panelOpen && !fits;
+  const collapsed = rail || forcedRail;
+  const selectedAgent = chat.agentFor(chat.selectedId);
 
   const conversation = chat.conversations.find((c) => c.id === chat.selectedId) ?? null;
   const legacyThread = chat.selectedId?.startsWith('legacy:')
@@ -202,6 +205,7 @@ export function Shell() {
           inert={!sidebarInline && !drawer}
           onClose={closeDrawer}
           rail={collapsed}
+          canExpandRail={sidebarInline && !forcedRail}
           onToggleRail={() => {
             const next = !rail;
             setRail(next);
@@ -220,8 +224,9 @@ export function Shell() {
             chat.select(id);
             goView('chat');
           }}
-          onNewChat={() => {
-            chat.newChat();
+          specialist={selectedAgent?.id === CEO_PROFILE_ID ? null : selectedAgent}
+          onNewChat={(recipientId) => {
+            chat.newChat(recipientId);
             goView('chat');
           }}
           onNewAgent={() => setNewAgent(true)}
@@ -241,7 +246,7 @@ export function Shell() {
             engines={chat.engines}
             conversation={conversation}
             legacyThread={legacyThread}
-            agent={chat.agentFor(chat.selectedId)}
+            agent={selectedAgent}
             onOpenProfile={() => goView('team')}
             onNewAgent={() => setNewAgent(true)}
             onManageProviders={() => setSettings('ai')}
