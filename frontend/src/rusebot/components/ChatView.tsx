@@ -5,7 +5,7 @@
  * centred transcript column, message bubbles, copy action, working dots and
  * the floating composer dock. Messages, runs and approvals arrive as props.
  */
-import { useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { Check, Copy, Cpu, X } from 'lucide-react';
 import { CEO_PROFILE_ID } from '../data/worker';
 import { cn } from '../lib/cn';
@@ -19,7 +19,6 @@ import { stripContract, type ChatState } from '../state/useChat';
 import type { EngineState } from '../state/useChatEngines';
 import { hasLiveContent, type LiveTurn } from '../state/liveTurn';
 import type { Agent } from '../types';
-import { useKeepDecided } from '../state/useKeepDecided';
 import type { Conversation, RunSnapshot } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
@@ -292,12 +291,7 @@ export function ChatView({
 
   const live = hasLiveContent(chat.live) ? chat.live : null;
 
-  const runApprovals = useMemo(
-    () => chat.approvals.filter((a) => chat.run && a.run_id === chat.run.runId),
-    [chat.approvals, chat.run]
-  );
-  const { shown, decide: decideApproval, retained } = useKeepDecided(runApprovals);
-  const approvals = shown.filter(a => a.run_id === chat.run?.runId);
+  const approvals = chat.toolApprovalCards.filter(({ approval }) => approval.run_id === chat.run?.runId);
 
   const rows = chat.messages.map((m, i) => {
     const prev = chat.messages[i - 1];
@@ -454,26 +448,21 @@ export function ChatView({
                 {chat.pendingUser && !chat.messages.some((m) => m.role === 'user' && m.content === chat.pendingUser) && (
                   <Bubble role="user" text={chat.pendingUser} iso={new Date().toISOString()} />
                 )}
-                {approvals.map((a) => {
-                  const entry = retained[a.id];
-                  const status = entry?.item.status ?? a.status;
-                  const confirmed = status === 'approved' ? 'approve' : status === 'denied' ? 'deny' : undefined;
-                  return (
-                    <ApprovalCard
-                      key={a.id}
-                      kind="tool"
-                      title={`${ASSISTANT_NAME} wants permission`}
-                      detail={a.action_summary}
-                      scope={a.scope}
-                      confirmedDecision={confirmed}
-                      decisionPending={Boolean(entry && !confirmed)}
-                      onDecide={(decision) => decideApproval(a, (confirm) => chat.decide(a, decision, {
-                        conversationId: chat.selectedId,
-                        confirm,
-                      }))}
-                    />
-                  );
-                })}
+                {approvals.map(({ key, approval, outcome, locked, error, canRefresh }) => (
+                  <ApprovalCard
+                    key={key}
+                    kind="tool"
+                    title={`${ASSISTANT_NAME} wants permission`}
+                    detail={approval.action_summary}
+                    scope={approval.scope}
+                    confirmedDecision={outcome}
+                    decisionPending={locked}
+                    decisionError={error}
+                    onRetryStatus={canRefresh ? chat.refreshApprovals : undefined}
+                    refreshingStatus={chat.approvalRead.loading}
+                    onDecide={(decision) => chat.decide(approval, decision, { conversationId: chat.selectedId })}
+                  />
+                ))}
                 {live && <LiveReply turn={live} />}
                 {running && !live && (
                   <div data-working className="flex items-center gap-2 px-1 text-[13px] text-ink-secondary" role="status">

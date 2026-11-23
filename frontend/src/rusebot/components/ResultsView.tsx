@@ -7,7 +7,7 @@
 import { PackageCheck } from 'lucide-react';
 import { ApprovalCard, type DecideResult } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
-import type { Approval, CeoAction } from '../data/worker';
+import type { CeoAction } from '../data/worker';
 import type { ChatState } from '../state/useChat';
 import { useKeepDecided } from '../state/useKeepDecided';
 
@@ -23,7 +23,6 @@ export function ResultsView({
   onCeoDecide: (action: CeoAction, decision: 'approve' | 'deny') => Promise<DecideResult>;
 }) {
   const { list: drafts, loading, error } = chat.resultsDrafts;
-  const { shown: approvals, decide: decideApproval } = useKeepDecided<Approval>(chat.approvals);
   const { shown: managerActions, decide: decideAction } = useKeepDecided<CeoAction>(ceoActions);
   const waiting = chat.approvals.length + ceoActions.length;
   const approvalRead = chat.approvalRead;
@@ -66,14 +65,19 @@ export function ResultsView({
             {waiting === 0 && ceoActionsConfirmed && approvalRead.list && !approvalRead.loading && !approvalRead.error && (
               <p className="text-[13px] text-ink-secondary">Nothing is waiting on you.</p>
             )}
-            {approvals.map((a) => (
+            {chat.toolApprovalCards.map(({ key, approval, outcome, locked, error, canRefresh }) => (
               <ApprovalCard
-                key={a.id}
+                key={key}
                 kind="tool"
                 title="A run wants permission"
-                detail={a.action_summary}
-                scope={a.scope}
-                onDecide={(d) => decideApproval(a, () => chat.decide(a, d))}
+                detail={approval.action_summary}
+                scope={approval.scope}
+                confirmedDecision={outcome}
+                decisionPending={locked}
+                decisionError={error}
+                onRetryStatus={canRefresh ? chat.refreshApprovals : undefined}
+                refreshingStatus={approvalRead.loading}
+                onDecide={(decision) => chat.decide(approval, decision)}
               />
             ))}
             {managerActions.map((a) => (

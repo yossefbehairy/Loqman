@@ -26,10 +26,15 @@ export interface ApprovalCardProps {
   kind: 'tool' | 'manager';
   confirmedDecision?: 'approve' | 'deny';
   decisionPending?: boolean;
+  decisionError?: string;
+  onRetryStatus?: () => void;
+  refreshingStatus?: boolean;
   onDecide: (decision: 'approve' | 'deny') => Promise<DecideResult>;
 }
 
-export function ApprovalCard({ title, detail, scope, kind, confirmedDecision, decisionPending, onDecide }: ApprovalCardProps) {
+export function ApprovalCard({
+  title, detail, scope, kind, confirmedDecision, decisionPending, decisionError, onRetryStatus, refreshingStatus, onDecide,
+}: ApprovalCardProps) {
   const [busy, setBusy] = useState<null | 'approve' | 'deny'>(null);
   const [localOutcome, setOutcome] = useState<null | 'approve' | 'deny'>(null);
   const outcome = confirmedDecision ?? localOutcome;
@@ -38,6 +43,10 @@ export function ApprovalCard({ title, detail, scope, kind, confirmedDecision, de
   const [byLoqman, setByLoqman] = useState(false);
   const decide = async (decision: 'approve' | 'deny') => {
     if (outcome || busy || decisionPending) return;
+    if (kind === 'tool') {
+      await onDecide(decision);
+      return;
+    }
     setBusy(decision);
     setFailure(null);
     setApplyError(null);
@@ -57,6 +66,11 @@ export function ApprovalCard({ title, detail, scope, kind, confirmedDecision, de
     }
   };
   const settled = outcome !== null;
+  let waitingLabel = 'Waiting for your answer';
+  if (kind === 'tool' && decisionPending) {
+    waitingLabel = 'Submitting decision…';
+    if (decisionError) waitingLabel = onRetryStatus ? 'Decision unconfirmed' : 'Approval unavailable';
+  }
   return (
     <div
       data-approval-card={kind}
@@ -83,10 +97,20 @@ export function ApprovalCard({ title, detail, scope, kind, confirmedDecision, de
           {applyError}
         </p>
       )}
-      {failure && (
+      {(decisionError || failure) && (
         <p role="alert" className="mt-2 text-[12.5px] text-danger">
-          {failure}
+          {decisionError ?? failure}
         </p>
+      )}
+      {onRetryStatus && (
+        <button
+          type="button"
+          disabled={refreshingStatus}
+          onClick={onRetryStatus}
+          className="mt-1 text-[12.5px] font-medium underline disabled:opacity-60"
+        >
+          Retry status
+        </button>
       )}
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[13px] text-ink-secondary">
         <span className="flex items-center gap-1.5">
@@ -104,7 +128,7 @@ export function ApprovalCard({ title, detail, scope, kind, confirmedDecision, de
           ) : (
             <>
               <ShieldCheck size={14} className="text-accent" />
-              Waiting for your answer
+              {waitingLabel}
             </>
           )}
         </span>

@@ -152,6 +152,30 @@ interface ApprovalRead {
   error: string | null;
 }
 
+type ToolDecision = 'approve' | 'deny';
+type ToolDecisionRecord = { approval: Approval; index: number } & (
+  | { phase: 'pending'; requested: ToolDecision }
+  | { phase: 'confirmed'; outcome: ToolDecision }
+  | { phase: 'unavailable'; error: string }
+  | { phase: 'recovery'; error: string; readAfter: number; retryable: boolean }
+);
+
+function approvalKey(approval: Approval): string {
+  return JSON.stringify([approval.run_id, approval.id]);
+}
+
+const RETAINED_APPROVAL_OUTCOMES = 100;
+const isSettledApproval = (entry?: ToolDecisionRecord) => entry?.phase === 'confirmed' || entry?.phase === 'unavailable';
+
+interface ToolApprovalCard {
+  key: string;
+  approval: Approval;
+  locked: boolean;
+  outcome?: ToolDecision;
+  error?: string;
+  canRefresh: boolean;
+}
+
 export interface ChatState {
   engines: EngineState;
   conversations: Conversation[];
@@ -171,6 +195,7 @@ export interface ChatState {
   /** Saved assistant replies and terminal outcomes for user messages without replies. */
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
+  toolApprovalCards: ToolApprovalCard[];
   approvalRead: ApprovalRead;
   refreshApprovals: () => Promise<void>;
   drafts: Record<string, Draft[]>;
@@ -194,7 +219,7 @@ export interface ChatState {
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
   newChat: () => void;
-  decide: (approval: Approval, decision: 'approve' | 'deny', origin?: ChatApprovalOrigin) => Promise<void>;
+  decide: (approval: Approval, decision: ToolDecision, origin?: { conversationId: string | null }) => Promise<void>;
   draftSaves: Record<string, { pending: boolean; error?: string }>;
   makeDeliverable: (run: RunSnapshot) => Promise<void>;
   reviewDraft: (draft: Draft, decision: 'approve' | 'reject') => Promise<string | void>;
@@ -292,11 +317,6 @@ function chatOwnerKey(cid: string | null, agentId: string): string {
 interface ChatErrorEntry {
   message: string;
   retry: SendAttempt | null;
-}
-
-interface ChatApprovalOrigin {
-  conversationId: string | null;
-  confirm: (approval: Approval) => void;
 }
 
 const NO_MESSAGES: ConvMessage[] = [];
@@ -470,7 +490,37 @@ export function useChat(
     []
   );
   const [approvalRead, setApprovalRead] = useState<ApprovalRead>({ list: null, loading: true, error: null });
-  const approvalsRequest = useRef({ ticket: 0, pending: false });
+  const approvalsRequest = useRef({ ticket: 0, pending: false, list: NO_APPROVALS });
+  const [toolDecisions, setToolDecisions] = useState(() => new Map<string, ToolDecisionRecord>());
+  const toolDecisionsRef = useRef(toolDecisions);
+  const publishToolDecisions = useCallback((next: Map<string, ToolDecisionRecord>) => {
+    toolDecisionsRef.current = next;
+    setToolDecisions(next);
+  }, []);
+  const reconcileToolDecisions = useCallback((ticket: number, list: Approval[] | null) => {
+    const current = toolDecisionsRef.current;
+    if (!current.size) return;
+    const pending = new Set(list?.filter(item => item.status === 'pending').map(approvalKey));
+    const next = new Map(current);
+    const evictable: string[] = [];
+    let changed = false;
+    for (const [key, entry] of current) {
+      if (entry.phase === 'recovery' && ticket > entry.readAfter) {
+        const retryable = pending.has(key);
+        if (retryable !== entry.retryable) {
+          next.set(key, { ...entry, retryable });
+          changed = true;
+        }
+      }
+      // Evict older terminal feedback only after a successful read omits it.
+      if (list && isSettledApproval(entry) && !pending.has(key)) evictable.push(key);
+    }
+    for (const key of evictable.slice(0, Math.max(0, evictable.length - RETAINED_APPROVAL_OUTCOMES))) {
+      next.delete(key);
+      changed = true;
+    }
+    if (changed) publishToolDecisions(next);
+  }, [publishToolDecisions]);
   const refreshApprovals = useCallback(async () => {
     const ticket = ++approvalsRequest.current.ticket;
     approvalsRequest.current.pending = true;
@@ -478,16 +528,19 @@ export function useChat(
     try {
       const list = await listApprovals();
       if (mounted.current && ticket === approvalsRequest.current.ticket) {
+        approvalsRequest.current.list = list;
+        reconcileToolDecisions(ticket, list);
         setApprovalRead({ list, loading: false, error: null });
       }
     } catch (e) {
       if (mounted.current && ticket === approvalsRequest.current.ticket) {
+        reconcileToolDecisions(ticket, null);
         setApprovalRead((prev) => ({ ...prev, loading: false, error: messageOf(e) }));
       }
     } finally {
       if (ticket === approvalsRequest.current.ticket) approvalsRequest.current.pending = false;
     }
-  }, []);
+  }, [reconcileToolDecisions]);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
   const [draftSaves, setDraftSaves] = useState<ChatState['draftSaves']>({});
   const savingDrafts = useRef(new Set<string>());
@@ -1521,24 +1574,51 @@ ${prompt}`;
     clearStopping(run.runId);
   }, [clearStopping, finishRun, raise]);
 
-  const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny', origin?: ChatApprovalOrigin) => {
+  const decide = useCallback(async (approval: Approval, decision: ToolDecision, origin?: { conversationId: string | null }) => {
     if (origin) {
       const cid = selectedRef.current;
       const run = cid ? currentRuns.current[cid] : undefined;
-      if (cid !== origin.conversationId || run?.runId !== approval.run_id || isTerminal(run.status)) {
-        throw new Error('This approval no longer belongs to the active run in this chat.');
-      }
+      if (cid !== origin.conversationId || run?.runId !== approval.run_id || isTerminal(run.status)) return;
     }
+    const key = approvalKey(approval);
+    const existing = toolDecisionsRef.current.get(key);
+    if (existing && (existing.phase !== 'recovery' || !existing.retryable)) return;
+    const index = approvalsRequest.current.list.findIndex(item => item.status === 'pending' && approvalKey(item) === key);
+    if (index < 0) return;
+    const card = { approval, index: existing?.index ?? index };
+    const attempt: ToolDecisionRecord = { ...card, phase: 'pending', requested: decision };
+    // Claim synchronously before dispatch. Both views use the same record, even before either rerenders.
+    publishToolDecisions(new Map(toolDecisionsRef.current).set(key, attempt));
+
+    let settled: ToolDecisionRecord;
     try {
-      const confirmed = await decideApproval(approval.run_id, approval.id, decision);
-      origin?.confirm(confirmed);
-      setApprovalRead((prev) => prev.list
-        ? { ...prev, list: prev.list.filter((item) => item.id !== approval.id) }
-        : prev);
-    } finally {
-      await refreshApprovals();
+      const confirmed = await decideApproval(approval.run_id, approval.id, attempt.requested);
+      if (!confirmed || approvalKey(confirmed) !== key || (confirmed.status !== 'approved' && confirmed.status !== 'denied')) {
+        throw new Error('The worker did not return a confirmed approval outcome.');
+      }
+      settled = { ...card, phase: 'confirmed', outcome: confirmed.status === 'approved' ? 'approve' : 'deny' };
+    } catch (error) {
+      const status = error instanceof ApiError ? error.status : undefined;
+      const detail = messageOf(error);
+      settled = status === 404 || status === 409
+        ? { ...card, phase: 'unavailable', error: detail }
+        : {
+          ...card, phase: 'recovery', readAfter: approvalsRequest.current.ticket, retryable: false,
+          error: status === 422 ? detail : `Could not confirm the approval decision. ${detail}`,
+        };
     }
-  }, [refreshApprovals]);
+    if (!mounted.current || toolDecisionsRef.current.get(key) !== attempt) return;
+    const next = new Map(toolDecisionsRef.current);
+    next.delete(key);
+    next.set(key, settled);
+    publishToolDecisions(next);
+    if (isSettledApproval(settled)) {
+      const exclude = (list: Approval[]) => list.filter(item => approvalKey(item) !== key);
+      approvalsRequest.current.list = exclude(approvalsRequest.current.list);
+      setApprovalRead(prev => prev.list ? { ...prev, list: exclude(prev.list) } : prev);
+    }
+    await refreshApprovals();
+  }, [publishToolDecisions, refreshApprovals]);
 
   const loadAllDrafts = useCallback(async () => {
     const ticket = ++resultsRead.current.ticket;
@@ -1681,6 +1761,29 @@ ${prompt}`;
     return out;
   }, [runs]);
 
+  const { approvals, toolApprovalCards } = useMemo(() => {
+    const list = approvalRead.list ?? NO_APPROVALS;
+    const keys = new Set(list.map(approvalKey));
+    const shown = [...list];
+    const retained = [...toolDecisions].filter(([key]) => !keys.has(key)).map(([, entry]) => entry);
+    retained.sort((a, b) => a.index - b.index);
+    for (const entry of retained) shown.splice(Math.min(entry.index, shown.length), 0, entry.approval);
+    return {
+      approvals: list.filter(item => !isSettledApproval(toolDecisions.get(approvalKey(item)))),
+      toolApprovalCards: shown.map((approval): ToolApprovalCard => {
+        const key = approvalKey(approval);
+        const entry = toolDecisions.get(key);
+        const canRefresh = entry?.phase === 'recovery' && !entry.retryable;
+        return {
+          key, approval, canRefresh,
+          locked: entry?.phase === 'pending' || entry?.phase === 'unavailable' || canRefresh,
+          outcome: entry?.phase === 'confirmed' ? entry.outcome : undefined,
+          error: entry?.phase === 'recovery' || entry?.phase === 'unavailable' ? entry.error : undefined,
+        };
+      }),
+    };
+  }, [approvalRead.list, toolDecisions]);
+
   return {
     engines,
     conversations,
@@ -1696,7 +1799,8 @@ ${prompt}`;
     run: currentRun,
     live: selectedId ? (live[selectedId] ?? null) : null,
     runsBySeq,
-    approvals: approvalRead.list ?? NO_APPROVALS,
+    approvals,
+    toolApprovalCards,
     approvalRead,
     refreshApprovals,
     drafts,

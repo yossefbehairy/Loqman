@@ -575,18 +575,21 @@ test.describe('approvals and deliverables', () => {
 
   test('tool approval can be denied', async ({ page }) => {
     const decided: Array<Record<string, unknown>> = [];
+    const approval = { id: 'ap-2', run_id: 'run-fixture', action_summary: 'Run npm install', scope: 'shell', status: 'pending', expires_at: null };
+    let pending = true;
     await page.route('**/__agentos/call', async (route: Route) => {
       const req = JSON.parse(route.request().postData() ?? '{}');
       if (req.method === 'approvals.list') {
         await route.fulfill({
           contentType: 'application/json',
-          body: JSON.stringify({ result: { approvals: [{ id: 'ap-2', run_id: 'run-fixture', action_summary: 'Run npm install', scope: 'shell', status: 'pending', expires_at: null }] } }),
+          body: JSON.stringify({ result: { approvals: pending ? [approval] : [] } }),
         });
         return;
       }
       if (req.method === 'approvals.decide') {
         decided.push(req.params);
-        await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ result: {} }) });
+        pending = false;
+        await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ result: { ...approval, status: 'denied' } }) });
         return;
       }
       await route.continue();
