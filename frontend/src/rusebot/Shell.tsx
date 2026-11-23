@@ -13,7 +13,7 @@ import { TeamView } from './components/TeamView';
 import { ResultsView } from './components/ResultsView';
 import { SettingsModal, type PageId } from './components/SettingsModal';
 import { NewAgentDialog } from './components/NewAgentDialog';
-import { useChat, useEngines, messageOf } from './state/useChat';
+import { useChat, messageOf } from './state/useChat';
 import { useCompany } from './state/useCompany';
 import {
   approveCeoAction,
@@ -43,7 +43,6 @@ function readText(key: string, fallback: string): string {
 
 export function Shell() {
   const profilePhoto = useProfilePhoto();
-  const engines = useEngines();
   const company = useCompany();
   const reloadAgents = company.reload;
   const [view, setView] = useState<View>('chat');
@@ -88,7 +87,12 @@ export function Shell() {
       if (ticket === ceoActionsRequest.current) note('proposals', messageOf(error));
     }
   }, [note]);
-  const chat = useChat(engines.choice, company.agents, reloadAgents, refreshCeoActions);
+  const chat = useChat(company.agents, company.profiles, company.loaded && company.error === null, reloadAgents, refreshCeoActions);
+  const agentDefaultsNotice = chat.engines.needsAgentDefaults && company.loaded
+    ? company.error
+      ? 'Could not load this Agent’s Engine and Model. Retry Agent discovery above to send.'
+      : 'This Agent is missing from the Agent list. Open another chat or refresh the Agent list.'
+    : undefined;
 
   // Every missions request takes a number; only the newest one may update the list, so a slow older answer
   // (for example a late "running" snapshot) never overwrites a newer one.
@@ -234,13 +238,14 @@ export function Shell() {
         {view === 'chat' && (
           <ChatView
             chat={chat}
-            engines={engines}
+            engines={chat.engines}
             conversation={conversation}
             legacyThread={legacyThread}
             agent={chat.agentFor(chat.selectedId)}
             onOpenProfile={() => goView('team')}
             onNewAgent={() => setNewAgent(true)}
             onManageProviders={() => setSettings('ai')}
+            agentDefaultsNotice={agentDefaultsNotice}
             ready={chat.loaded && company.loaded}
           />
         )}

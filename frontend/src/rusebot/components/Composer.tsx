@@ -10,7 +10,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowUp, Plus, Server, Square, UserPlus } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { SettingsSelect } from './ai/SettingsSelect';
-import type { EngineState } from '../state/useChat';
+import type { EngineState } from '../state/useChatEngines';
 import { STATE_SHORT, selectable } from '../state/providerText';
 
 export interface ComposerProps {
@@ -27,12 +27,13 @@ export interface ComposerProps {
   sending: boolean;
   disabled?: boolean;
   engines: EngineState;
+  agentDefaultsNotice?: string;
   onNewAgent?: () => void;
   /** Opens Settings on the AI page. */
   onManageProviders?: () => void;
 }
 
-export function Composer({ placeholder, value, onChange, onSend, onStop, canStop = true, stopping = false, running, sending, disabled, engines, onNewAgent, onManageProviders }: ComposerProps) {
+export function Composer({ placeholder, value, onChange, onSend, onStop, canStop = true, stopping = false, running, sending, disabled, engines, agentDefaultsNotice, onNewAgent, onManageProviders }: ComposerProps) {
   const choice = engines.choice;
   const ref = useRef<HTMLTextAreaElement>(null);
   const [menu, setMenu] = useState(false);
@@ -76,6 +77,9 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
   const noProvider = !disabled && !engines.executionReady;
   const providerNotice = engines.catalogStatus === 'loading' ? 'Loading models for the selected provider.'
     : engines.catalogStatus === 'error' ? 'Could not load models for the selected provider.'
+    : engines.providerUnavailable ? 'The selected provider is unavailable.'
+    : choice?.model && engines.catalogStatus === 'ready' && !engines.models.some(model => model.id === choice.model)
+      ? 'The selected model is unavailable. Choose another model or refresh providers.'
     : choice ? 'Choose an available model for the selected provider.' : 'No AI provider is ready to answer.';
   const canSend = value.trim().length > 0 && !running && !sending && !disabled && !noProvider;
   const submit = async () => {
@@ -97,15 +101,24 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
     >
       {noProvider && (
         <p role="status" data-composer-no-provider className="px-3 pb-1 pt-1.5 text-[12.5px] leading-relaxed text-ink-secondary">
-          {providerNotice}{' '}
-          {onManageProviders ? (
-            <button type="button" onClick={onManageProviders} className="font-medium text-accent-text hover:underline">
-              Open Settings &gt; AI
-            </button>
-          ) : (
-            'Open Settings > AI'
-          )}{' '}
-          to manage providers.
+          {agentDefaultsNotice ?? (
+            <>
+              {providerNotice}{' '}
+              {onManageProviders ? (
+                <button type="button" onClick={onManageProviders} className="font-medium text-accent-text hover:underline">
+                  Open Settings &gt; AI
+                </button>
+              ) : (
+                'Open Settings > AI'
+              )}{' '}
+              to manage providers.
+            </>
+          )}
+        </p>
+      )}
+      {engines.storageFailed && (
+        <p role="status" className="px-3 pb-1 pt-1.5 text-[12.5px] leading-relaxed text-ink-secondary">
+          Could not save the provider selection on this device. It may change after a restart.
         </p>
       )}
       <div data-composer-row="true" className="flex items-end gap-1 @max-[30rem]/composer:flex-wrap">
@@ -155,6 +168,8 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
                   size="compact"
                   className="mb-2"
                   value={choice?.engine ?? ''}
+                  disabled={engines.engines.length === 0}
+                  selectedLabel={choice?.engine}
                   onValueChange={(id) => void engines.selectEngine(id)}
                   options={[
                     ...(!choice ? [{ value: '', label: 'Choose a provider', disabled: true }] : []),
@@ -172,6 +187,7 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
                   id="rb-model"
                   size="compact"
                   value={choice?.model ?? ''}
+                  selectedLabel={choice?.model || (engines.catalogStatus === 'loading' ? 'Loading models…' : undefined)}
                   onValueChange={(model) => choice && engines.setChoice({ engine: choice.engine, model })}
                   options={engines.models.map(m => ({ value: m.id, label: m.name }))}
                 />

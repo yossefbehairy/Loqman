@@ -9,7 +9,7 @@ const selectedKey = 'agentos.rusebot.selected.v1';
 const hintsKey = 'agentos.rusebot.convAgents.v1';
 const callsUrl = '**/__agentos/call';
 const noWrites = ['conversations.bind_profile', 'conversations.create', 'runs.start_turn', 'ceo.ask'];
-const selected = (page: Page) => page.evaluate(key => JSON.parse(localStorage.getItem(key) ?? 'null') as string | null, selectedKey);
+const selected = (page: Page) => page.evaluate(key => JSON.parse(localStorage.getItem(key) ?? 'null') as string | { draftOwner: string } | null, selectedKey);
 const card = (page: Page, agent: Agent) => page.locator('[data-agent-card="' + agent.id + '"]');
 const openButton = (page: Page, agent: Agent) => card(page, agent).getByRole('button', { name: 'Open chat with ' + agent.name, exact: true });
 const row = (page: Page, chat: Chat) => page.locator('[data-sidebar-thread-row="' + chat.id + '"]');
@@ -232,7 +232,7 @@ for (const navigation of ['saved chat', 'New Chat', 'another view'] as const) {
     expect(creates(calls)).toHaveLength(1);
     if (navigation === 'saved chat') await expectSelected(page, destination);
     if (navigation === 'New Chat') {
-      expect(await selected(page)).toBeNull();
+      expect(await selected(page)).toEqual({ draftOwner: 'new:' + other.id });
       await expect(composer(page)).toHaveValue('Keep this independent draft.');
     }
     if (navigation === 'another view') {
@@ -319,7 +319,7 @@ test('explicit New Chat sends into distinct durable chats and keeps each draft w
   const created: Chat[] = [];
   for (const suffix of ['first', 'second']) {
     await newChat(page);
-    await expect.poll(() => selected(page)).toBeNull();
+    await expect.poll(() => selected(page)).toEqual({ draftOwner: 'new:' + target.id });
     await expect(composer(page)).toHaveValue('');
     const prompt = 'FE-05 independent ' + suffix + ' message';
     await composer(page).fill(prompt);

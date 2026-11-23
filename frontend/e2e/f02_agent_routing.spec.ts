@@ -70,6 +70,14 @@ function composer(page: Page) {
   return page.locator('[data-tour="composer"]').getByRole('textbox');
 }
 
+const savedOverride = { engine: 'mock', model: 'deepseek-v4.1-flash-free' };
+
+async function rememberOverride(page: Page, chat: Conversation) {
+  await page.addInitScript(({ id, choice }) => {
+    localStorage.setItem('agentos.rusebot.chatExecution.v1.' + id, JSON.stringify(choice));
+  }, { id: chat.id, choice: savedOverride });
+}
+
 async function openSavedChat(page: Page, chat: Conversation, mappedId?: string) {
   await page.addInitScript(({ id, mapped }) => {
     localStorage.setItem('agentos.rusebot.selected.v1', JSON.stringify(id));
@@ -120,7 +128,7 @@ async function send(page: Page, chat: Conversation, text: string) {
   return response;
 }
 
-test('A: a failed profiles.list still allows a saved specialist turn', async ({ page, routing }) => {
+test('A: a failed profiles.list still allows a saved specialist turn with an explicit pair', async ({ page, routing }) => {
   const specialist = await createProfile(page, 'F-02 A specialist');
   const chat = await createChat(page, 'F-02 A known binding', specialist.id);
   expect((await listProfiles(page)).profiles).toContainEqual(expect.objectContaining({ id: specialist.id }));
@@ -130,11 +138,13 @@ test('A: a failed profiles.list still allows a saved specialist turn', async ({ 
     ? route.fulfill({ status: 503, json: { status: 503, detail: error } })
     : route.continue());
 
+  await rememberOverride(page, chat);
   await openSavedChat(page, chat);
   await expect(page.locator('[data-load-error]')).toContainText(error);
   const prompt = 'Summarize the blue inventory.';
   await send(page, chat, prompt);
   expect(routing).toEqual([expectedTurn(chat, prompt)]);
+  expect(routing[0].params).toMatchObject({ engine: savedOverride.engine, model_id: savedOverride.model });
 });
 
 for (const staleTarget of ['specialist', 'CEO'] as const) {
@@ -147,9 +157,10 @@ for (const staleTarget of ['specialist', 'CEO'] as const) {
     const catalog = (await listProfiles(page)).profiles;
     expect(catalog.map(({ id }) => id)).toEqual(expect.arrayContaining([a.id, b.id]));
     expect((await listChats(page)).conversations).toContainEqual(chat);
-    // Keep B in the browser catalog and omit only A so the current lookup reaches the browser hint.
+    // Keep B in the browser catalog and omit only A. The explicit execution pair lets this isolate recipient routing.
     await omitProfile(page, a);
 
+    await rememberOverride(page, chat);
     await openSavedChat(page, chat, b.id);
     const recipientLabel = await composer(page).getAttribute('aria-label');
     const prompt = 'Summarize the green inventory.';
@@ -161,7 +172,7 @@ for (const staleTarget of ['specialist', 'CEO'] as const) {
 }
 
 for (const metadata of ['missing', 'cached'] as const) {
-  test(`C: deleted specialist with ${metadata} metadata reports worker rejection and keeps the draft`, async ({ page, routing }, testInfo) => {
+  test(`C: deleted specialist with ${metadata} metadata keeps the draft and reports the missing Agent`, async ({ page, routing }, testInfo) => {
     const specialist = await createProfile(page, `F-02 C ${metadata} specialist`);
     const chat = await createChat(page, `F-02 C deleted ${metadata} profile`, specialist.id);
     const oldReply = 'Previously saved specialist reply.';
@@ -193,14 +204,19 @@ for (const metadata of ['missing', 'cached'] as const) {
     if (metadata === 'missing') await openSavedChat(page, chat);
     await expect(page.getByRole('log').getByText(oldReply, { exact: true })).toBeVisible();
     const prompt = 'Keep this unsent inventory question.';
-    const response = await send(page, chat, prompt);
-    expect.soft(routing).toEqual([expectedTurn(chat, prompt, 422)]);
-    if (response.status() === 200) {
-      await expect(page.getByRole('log').getByText(prompt, { exact: true })).toBeVisible();
-      await expect(page.locator('[data-working]')).toHaveCount(0);
+    if (metadata === 'missing') {
+      await composer(page).fill(prompt);
+      await expect(page.locator('[data-composer-no-provider]')).toContainText('This Agent is missing from the Agent list.');
+      await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+      await composer(page).press('Enter');
+      expect(routing).toEqual([]);
+    } else {
+      const response = await send(page, chat, prompt);
+      expect(response.status()).toBe(422);
+      expect(routing).toEqual([expectedTurn(chat, prompt, 422)]);
+      await expect(page.getByRole('alert').filter({ hasText: profileUnavailable })).toBeVisible();
     }
-    await expect.soft(page.getByRole('alert').filter({ hasText: profileUnavailable })).toBeVisible({ timeout: 2000 });
-    await expect.soft(composer(page)).toHaveValue(prompt, { timeout: 2000 });
+    await expect(composer(page)).toHaveValue(prompt);
     expect(await history(page, chat)).toEqual(before);
   });
 }

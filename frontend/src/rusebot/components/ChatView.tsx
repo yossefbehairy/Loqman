@@ -15,7 +15,8 @@ import { ChatMarkdown } from './ChatMarkdown';
 import { Composer } from './Composer';
 import { ApprovalCard } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
-import { stripContract, type ChatState, type EngineState } from '../state/useChat';
+import { stripContract, type ChatState } from '../state/useChat';
+import type { EngineState } from '../state/useChatEngines';
 import { hasLiveContent, type LiveTurn } from '../state/liveTurn';
 import type { Agent } from '../types';
 import { useKeepDecided } from '../state/useKeepDecided';
@@ -114,6 +115,8 @@ function SavedRunOutcome({ run }: { run: RunSnapshot }) {
 
 function Bubble({ role, text, iso, savedRun }: { role: 'user' | 'assistant'; text: string; iso: string; savedRun?: RunSnapshot }) {
   const mine = role === 'user';
+  const time = parseWorkerTime(iso).toLocaleString();
+  const executedWith = !mine && savedRun?.engine && savedRun.model_id ? `${savedRun.engine} · ${savedRun.model_id}` : null;
   return (
     <div data-message-row="" data-role={role} className={cn('group flex w-full flex-col', mine ? 'animate-msg-in items-end' : 'items-start')}>
       <div className={cn('flex w-full items-center gap-1.5', mine ? 'justify-end' : 'justify-start')}>
@@ -129,7 +132,7 @@ function Bubble({ role, text, iso, savedRun }: { role: 'user' | 'assistant'; tex
             mine ? 'bg-bubble-user whitespace-pre-wrap text-ink user-bubble-colored antialiased' : 'bg-card text-ink'
           )}
           style={mine ? USER_BUBBLE_STYLE : undefined}
-          title={parseWorkerTime(iso).toLocaleString()}
+          title={executedWith ? `${time} · ${executedWith}` : time}
         >
           {mine ? <div className="chat-text">{text}</div> : <ChatMarkdown text={text} />}
         </div>
@@ -238,6 +241,7 @@ export function ChatView({
   onOpenProfile,
   onNewAgent,
   onManageProviders,
+  agentDefaultsNotice,
   ready = true,
 }: {
   chat: ChatState;
@@ -248,6 +252,7 @@ export function ChatView({
   onOpenProfile: () => void;
   onNewAgent: () => void;
   onManageProviders?: () => void;
+  agentDefaultsNotice?: string;
   /** False until the conversation list and the agents are loaded, so the remembered chat is not shown as Loqman first. */
   ready?: boolean;
 }) {
@@ -258,7 +263,7 @@ export function ChatView({
   const fallbackName = unknownRecipient ? 'Recipient unavailable' : chat.selectedAgentId === CEO_PROFILE_ID ? 'Loqman' : 'Specialist';
   const ASSISTANT_NAME = ready ? (agent?.name ?? fallbackName) : '';
   const running = Boolean(chat.run && (chat.run.status === 'queued' || chat.run.status === 'running'));
-  const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? (unknownRecipient ? 'Saved conversation' : 'New chat'));
+  const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? (unknownRecipient && chat.selectedId ? 'Saved conversation' : 'New chat'));
 
   useLayoutEffect(() => {
     const viewport = scrollRef.current!;
@@ -280,11 +285,10 @@ export function ChatView({
     return () => observer.disconnect();
   }, [chat.selectedId]);
 
-  // A chat runs on the provider and model picked in the composer; the model saved on the agent is used for delegated tasks.
   const choice = engines.choice;
   const chatModel = choice ? (engines.models.find((m) => m.id === choice.model)?.name ?? choice.model) : '';
   const savedModel = agent && agent.id !== CEO_PROFILE_ID ? agent.model : '';
-  const overridden = Boolean(choice && savedModel && savedModel !== choice.model);
+  const overridden = engines.explicit;
 
   const live = hasLiveContent(chat.live) ? chat.live : null;
 
@@ -371,8 +375,8 @@ export function ChatView({
                       data-model-override={overridden ? 'true' : 'false'}
                       title={
                         overridden
-                          ? `This chat runs on ${choice.model}, chosen in the + menu. ${ASSISTANT_NAME} is saved with ${savedModel}, which is used for delegated tasks.`
-                          : `This chat runs on ${choice.model}, chosen in the + menu.`
+                          ? `Next message model: ${choice.model || 'waiting for catalog'}. Chat override.${savedModel ? ` ${ASSISTANT_NAME} is saved with ${savedModel}.` : ''}`
+                          : `Next message model: ${choice.model || 'waiting for catalog'}. Inherited default.`
                       }
                       className="hidden min-w-0 max-w-[180px] items-center gap-1 truncate whitespace-nowrap text-[11px] text-ink-secondary @4xl/chathead:flex"
                     >
@@ -443,7 +447,7 @@ export function ChatView({
                 )}
                 {ready && !chat.threadLoading && !chat.threadError && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
                   <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description={unknownRecipient
-                    ? 'Sending is paused until the chat list includes this conversation.'
+                    ? (chat.draftRecipientUnverified ? 'This Agent is missing from the Agent list.' : 'Sending is paused until the chat list includes this conversation.')
                     : 'Send a message to start the conversation.'} />
                 )}
                 {rows}
@@ -502,10 +506,11 @@ export function ChatView({
                   stopping={chat.stopping}
                   running={running}
                   sending={chat.sending}
-                  disabled={engines.loading || !ready || unknownRecipient}
+                  disabled={engines.loading || !ready || unknownRecipient || chat.draftRecipientUnverified}
                   engines={engines}
                   onNewAgent={onNewAgent}
                   onManageProviders={onManageProviders}
+                  agentDefaultsNotice={agentDefaultsNotice}
                 />
               </div>
             </div>

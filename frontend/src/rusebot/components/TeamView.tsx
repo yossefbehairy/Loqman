@@ -302,7 +302,7 @@ export function AgentPanel({
             <dd>{agent.status}</dd>
             <dt>Model</dt>
             <dd dir="auto">{drawerModel.label}</dd>
-            <dd data-model-note>Used for delegated tasks. A chat runs on the provider and model picked in the chat&apos;s + menu.</dd>
+            <dd data-model-note>Used for delegated tasks. Chats inherit available Agent settings unless changed in the + menu.</dd>
             <dt>Effort</dt>
             <dd>{agent.reason}</dd>
             <dt>Timeout</dt>

@@ -124,6 +124,188 @@ async function overrideChat(page: Page, pref: Preference) {
   await expect(pill(page, pref)).toBeVisible();
 }
 
+test('AUD-03: Settings and Agent defaults update inheritance while preserving explicit overrides', async ({ page }) => {
+  const worker = await fixture(page);
+  const profile = await rpc<{ id: string }>(page, 'profiles.create', {
+    name: 'AUD-03 configured Agent', role_type: 'custom', instructions: 'Reply briefly.',
+    engine: alpha.engine, default_model_id: latest.model_id,
+  });
+  const a = await rpc<{ id: string }>(page, 'conversations.create', { title: 'AUD-03 overrides CEO' });
+  const b = await rpc<{ id: string }>(page, 'conversations.create', { title: 'AUD-03 inherits CEO' });
+  const specialist = await rpc<{ id: string }>(page, 'conversations.create', { title: 'AUD-03 inherits Agent', profile_id: profile.id });
+  const specialistOverride = await rpc<{ id: string }>(page, 'conversations.create', {
+    title: 'AUD-03 overrides Agent', profile_id: profile.id,
+  });
+  const select = (id: string) => page.locator(`[data-sidebar-thread-row="${id}"]`).click();
+  await openHome(page);
+  await select(a.id);
+  await overrideChat(page, beta);
+  await openGeneral(page);
+  await pick(page.locator('#ai-default-model'), alternate.model_id);
+  await displayedDefault(page, alternate);
+  await closeGeneral(page);
+  await expect(pill(page, beta)).toBeVisible();
+  await select(b.id);
+  await expect(pill(page, alternate)).toBeVisible();
+  await select(specialist.id);
+  await expect(pill(page, latest)).toBeVisible();
+  await page.locator('[data-sidebar-new]').click();
+  await page.locator('[data-new-chat]').click();
+  await expect(pill(page, latest)).toBeVisible();
+  await select(specialistOverride.id);
+  await overrideChat(page, beta);
+  await rpc(page, 'profiles.update', { profile_id: profile.id, default_model_id: alternate.model_id });
+  await page.locator('[data-sidebar-nav=team]').click();
+  await select(specialist.id);
+  await expect(pill(page, alternate)).toBeVisible();
+  await page.locator('[data-sidebar-new]').click();
+  await page.locator('[data-new-chat]').click();
+  await expect(pill(page, alternate)).toBeVisible();
+  await select(specialistOverride.id);
+  await expect(pill(page, beta)).toBeVisible();
+  await select(a.id);
+  await expect(pill(page, beta)).toBeVisible();
+  expect(worker.writes).toEqual([alternate]);
+});
+
+test.describe('AUD03-F2: specialist profile discovery', () => {
+  const composer = (page: Page) => page.locator('[data-tour="composer"]').getByRole('textbox');
+  const send = (page: Page) => page.getByRole('button', { name: 'Send', exact: true });
+  const failure = (page: Page) => page.locator('[data-load-error]');
+  const profileError = 'Agent discovery is temporarily unavailable.';
+  const rejectProfiles = { status: 503, json: { status: 503, detail: profileError } };
+  const createSpecialist = (page: Page, name: string, configuration: { engine: string | null; default_model_id: string }) => rpc<{ id: string }>(
+    page, 'profiles.create', { name, role_type: 'custom', instructions: 'Reply briefly.', ...configuration },
+  );
+  const createChat = (page: Page, title: string, profile_id?: string) => rpc<{ id: string; profile_id: string | null }>(
+    page, 'conversations.create', { title, profile_id },
+  );
+  const expectedTurn = (id: string, pair: Preference, prompt: string) => ({
+    method: 'runs.start_turn',
+    params: { conversation_id: id, ...pair, prompt, request_key: expect.any(String) },
+  });
+  const selectionKey = 'agentos.rusebot.selected.v1';
+  const overridePrefix = 'agentos.rusebot.chatExecution.v1.';
+
+  test('A/B: blocks workspace fallback until the Agent read is retried and sends the configured pair once', async ({ page }) => {
+    const worker = await fixture(page);
+    const name = 'AUD03-F2 configured specialist';
+    const agent = await createSpecialist(page, name, { engine: beta.engine, default_model_id: beta.model_id });
+    const chat = await createChat(page, 'AUD03-F2 bound specialist', agent.id);
+    expect(chat.profile_id).toBe(agent.id);
+    const retryStarted = deferred();
+    const releaseRetry = deferred();
+    let recovering = false;
+    await page.route('**/__agentos/call', async route => {
+      if ((route.request().postDataJSON() as Rpc).method !== 'profiles.list') return route.fallback();
+      if (!recovering) return route.fulfill(rejectProfiles);
+      retryStarted.release();
+      await releaseRetry.promise;
+      return route.continue();
+    });
+    await page.addInitScript(({ key, id }) => localStorage.setItem(key, JSON.stringify(id)), { key: selectionKey, id: chat.id });
+
+    const rejectedPrompt = 'Keep this draft while Agent discovery is unavailable.';
+    const recoveredPrompt = 'Use the configured specialist pair after recovery.';
+    try {
+      await page.goto('/');
+      await expect(page.locator('[data-chathead-conversation]')).toHaveText('AUD03-F2 bound specialist');
+      await expect(failure(page)).toContainText(profileError);
+      const agentNotice = page.locator('[data-composer-no-provider]');
+      await expect(agentNotice).toContainText('Could not load this Agent’s Engine and Model');
+      await composer(page).fill(rejectedPrompt);
+      await expect(send(page)).toBeDisabled();
+      await expect(pill(page, alpha)).toHaveCount(0);
+      await composer(page).press('Enter');
+
+      recovering = true;
+      await failure(page).getByRole('button', { name: 'Retry', exact: true }).click();
+      await retryStarted.promise;
+      await expect(failure(page)).toBeVisible();
+      expect(worker.executions).toEqual([]);
+      releaseRetry.release();
+      await expect(failure(page)).toHaveCount(0);
+      await expect(agentNotice).toHaveCount(0);
+      await expect(composer(page)).toHaveAccessibleName('Message ' + name);
+      await expect(pill(page, beta)).toBeVisible();
+      await expect(composer(page)).toHaveValue(rejectedPrompt);
+      await composer(page).fill(recoveredPrompt);
+      await send(page).click();
+      await expect(page.locator('[data-chat-retry]')).toBeVisible();
+      expect(worker.executions).toEqual([expectedTurn(chat.id, beta, recoveredPrompt)]);
+      expect(worker.writes).toEqual([]);
+      expect(await page.evaluate(key => localStorage.getItem(key), overridePrefix + chat.id)).toBeNull();
+    } finally {
+      releaseRetry.release();
+    }
+  });
+
+  test('C: a discovered Agent with inherited settings sends the workspace pair', async ({ page }) => {
+    const worker = await fixture(page);
+    const name = 'AUD03-F2 inheriting specialist';
+    const agent = await createSpecialist(page, name, { engine: null, default_model_id: 'not-in-workspace-catalog' });
+    const chat = await createChat(page, 'AUD03-F2 inherited specialist', agent.id);
+    const discovery = deferred();
+    const releaseDiscovery = deferred();
+    await page.route('**/__agentos/call', async route => {
+      if ((route.request().postDataJSON() as Rpc).method !== 'profiles.list') return route.fallback();
+      discovery.release();
+      await releaseDiscovery.promise;
+      return route.continue();
+    });
+    await page.addInitScript(({ key, id }) => localStorage.setItem(key, JSON.stringify(id)), { key: selectionKey, id: chat.id });
+    try {
+      await page.goto('/');
+      await discovery.promise;
+      await expect(composer(page)).toHaveAccessibleName('Loading…');
+      await expect(send(page)).toBeDisabled();
+      releaseDiscovery.release();
+      await expect(composer(page)).toHaveAccessibleName('Message ' + name);
+      await expect(pill(page, alpha)).toBeVisible();
+      await composer(page).fill('Use the inherited workspace pair.');
+      await send(page).click();
+      await expect(page.locator('[data-chat-retry]')).toBeVisible();
+      expect(worker.executions).toEqual([expectedTurn(chat.id, alpha, 'Use the inherited workspace pair.')]);
+      expect(await page.evaluate(key => localStorage.getItem(key), overridePrefix + chat.id)).toBeNull();
+    } finally {
+      releaseDiscovery.release();
+    }
+  });
+
+  test('D: profile discovery failure preserves CEO and a saved specialist override', async ({ page }) => {
+    const worker = await fixture(page);
+    const agent = await createSpecialist(page, 'AUD03-F2 overridden specialist', { engine: alpha.engine, default_model_id: latest.model_id });
+    const specialist = await createChat(page, 'AUD03-F2 explicit override', agent.id);
+    const ceo = await createChat(page, 'AUD03-F2 CEO');
+    const override = JSON.stringify({ engine: beta.engine, model: beta.model_id });
+    await page.addInitScript(({ selection, id, key, value }) => {
+      localStorage.setItem(selection, JSON.stringify(id));
+      localStorage.setItem(key, value);
+    }, { selection: selectionKey, id: specialist.id, key: overridePrefix + specialist.id, value: override });
+    await page.route('**/__agentos/call', route => (route.request().postDataJSON() as Rpc).method === 'profiles.list'
+      ? route.fulfill(rejectProfiles) : route.fallback());
+
+    await page.goto('/');
+    await expect(failure(page)).toContainText(profileError);
+    await expect(page.locator('[data-chathead-conversation]')).toHaveText('AUD03-F2 explicit override');
+    await expect(pill(page, beta)).toBeVisible();
+    await composer(page).fill('Use this conversation override.');
+    await send(page).click();
+    await expect(page.locator('[data-chat-retry]')).toBeVisible();
+    await page.locator(`[data-sidebar-thread-row="${ceo.id}"]`).click();
+    await expect(composer(page)).toHaveAccessibleName('Message Loqman');
+    await expect(pill(page, alpha)).toBeVisible();
+    await composer(page).fill('Use the CEO workspace pair.');
+    await send(page).click();
+    await expect(page.locator('[data-chat-retry]')).toBeVisible();
+    expect(worker.executions).toEqual([
+      expectedTurn(specialist.id, beta, 'Use this conversation override.'),
+      { method: 'ceo.ask', params: { conversation_id: ceo.id, ...alpha, question: 'Use the CEO workspace pair.', request_id: expect.any(String) } },
+    ]);
+    expect(await page.evaluate(key => localStorage.getItem(key), overridePrefix + specialist.id)).toBe(override);
+  });
+});
+
 test('a chat override writes no preferences and General shows the acknowledged default', async ({ page }) => {
   const worker = await fixture(page);
   await openHome(page);
@@ -266,7 +448,8 @@ test('specialist Retry keeps its original execution settings after a default sav
   });
   const chat = await rpc<{ id: string; title: string }>(page, 'conversations.create', { title: 'FE-04 Retry chat', profile_id: agent.id });
   await page.addInitScript(id => localStorage.setItem('agentos.rusebot.selected.v1', JSON.stringify(id)), chat.id);
-  await openHome(page);
+  await page.goto('/?ui=rusebot');
+  await expect(pill(page, latest)).toBeVisible();
   await expect(page.locator('[data-chathead-conversation]')).toHaveText(chat.title);
   await overrideChat(page, alternate);
   const composer = page.locator('[data-tour="composer"]').getByRole('textbox');

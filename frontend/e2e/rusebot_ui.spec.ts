@@ -1742,25 +1742,38 @@ test.describe('P3: startup and Settings', () => {
 
   test('a model chosen while the worker default is still loading is not overwritten by it', async ({ page }) => {
     let answered = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
     await stubProviders(page, ENGINES, {
       'engines.capabilities': capsWithoutMock(ENGINES),
       'preferences.get': async () => {
-        await sleep(2500);
+        await held;
         answered = true;
         return { engine: 'ready-e', model_id: 'm1' };
       },
     });
-    await page.goto('/?ui=rusebot');
-    await expect(page.locator('[data-rusebot-shell]')).toBeVisible();
-    // The user's choice arrives while preferences.get is pending (the store module is the one the app uses).
-    await page.evaluate(async () => {
-      const store = await import(/* @vite-ignore */ '/src/rusebot/state/useProviders.ts');
-      store.setProviderChoice({ engine: 'unverified-e', model: 'm2' });
-    });
-    await expect.poll(() => answered, { timeout: 15000 }).toBe(true);
-    await page.waitForTimeout(800); // the late worker answer has been handled
-    await expect(page.locator('[data-chathead-pill] [title="unverified-e · m2"]')).toBeVisible();
-    await expect(page.locator('[data-chathead-pill] [title="ready-e · m1"]')).toHaveCount(0);
+    try {
+      await page.goto('/?ui=rusebot');
+      await page.getByRole('button', { name: 'Add', exact: true }).click();
+      const engine = page.locator('#rb-engine');
+      await engine.click();
+      await page.getByRole('option').and(page.locator('[data-value=unverified-e]')).click();
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm1');
+      await page.locator('#rb-model').click();
+      await page.getByRole('option').and(page.locator('[data-value=m2]')).click();
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm2');
+      await page.getByRole('textbox', { name: 'Message Loqman' }).fill('Wait for startup discovery.');
+      const send = page.getByRole('button', { name: 'Send', exact: true });
+      await expect(send).toBeDisabled();
+      expect(answered).toBe(false);
+      release();
+      await expect.poll(() => answered, { timeout: 15000 }).toBe(true);
+      await expect(send).toBeEnabled();
+      await expect(page.locator('[data-chathead-pill] [title="unverified-e · m2"]')).toBeVisible();
+      await expect(page.locator('[data-chathead-pill] [title="ready-e · m1"]')).toHaveCount(0);
+    } finally {
+      release();
+    }
   });
 
   const BRIDGE_INIT = (mode: string) => {
@@ -1879,42 +1892,84 @@ test.describe('P3: missions and Loqman', () => {
   });
 
   test('while Loqman answers, the current step is shown; polling never overlaps and stops with the answer', async ({ page }) => {
-    let polls = 0;
+    const pollIntervalMs = 1500;
+    const progressRequests: unknown[] = [];
     let inflight = 0;
     let maxInflight = 0;
     const asked: Array<Record<string, unknown>> = [];
+    let releaseAsk!: () => void;
+    let releaseFirstPoll!: () => void;
+    const askCompletion = new Promise<void>(resolve => { releaseAsk = resolve; });
+    const firstPollResponse = new Promise<void>(resolve => { releaseFirstPoll = resolve; });
     await page.route('**/__agentos/call', async (route: Route) => {
       const req = reqOf(route);
+      if (req.method === 'engines.status') return okJson(route, { engines: [] });
       if (req.method === 'ceo.ask') {
         asked.push(req.params ?? {});
-        await sleep(4200);
+        await askCompletion;
         return okJson(route, { reply: 'done', actions_proposed: [], agents_created: [], iterations: 2, fast: false });
       }
       if (req.method === 'ceo.ask_progress') {
-        polls += 1;
+        progressRequests.push(req.params?.request_id);
+        const first = progressRequests.length === 1;
         inflight += 1;
         maxInflight = Math.max(maxInflight, inflight);
-        await sleep(300);
-        inflight -= 1;
-        const first = polls === 1;
-        return okJson(route, { stage: first ? 'thinking' : 'tool', detail: first ? '' : 'web_search', iteration: first ? 1 : 2, done: false });
+        try {
+          if (first) await firstPollResponse;
+          await okJson(route, { stage: first ? 'thinking' : 'tool', detail: first ? '' : 'web_search', iteration: first ? 1 : 2, done: false });
+        } finally {
+          inflight -= 1;
+        }
+        return;
       }
       return route.continue();
     });
-    await openBare(page);
-    const box = page.getByRole('textbox', { name: 'Message Loqman' });
-    await box.fill(`progress-${uid()}`);
-    await box.press('Enter');
-    const working = page.locator('[data-working]');
-    await expect(working).toContainText('Working');
-    await expect(working).toContainText('Thinking', { timeout: 8000 });
-    await expect(working).toContainText('Using web_search (step 2)', { timeout: 8000 });
-    expect(String(asked[0].request_id)).toMatch(/^ceo-/);
-    await expect(working).toHaveCount(0, { timeout: 10000 });
-    const after = polls;
-    await page.waitForTimeout(3500);
-    expect(polls).toBe(after);
-    expect(maxInflight).toBe(1);
+    try {
+      await page.clock.install();
+      await openBare(page);
+      const box = page.getByRole('textbox', { name: 'Message Loqman' });
+      const send = page.getByRole('button', { name: 'Send', exact: true });
+      const prompt = `progress-${uid()}`;
+      await box.fill(prompt);
+      await expect(send).toBeEnabled({ timeout: 8000 });
+      await page.clock.pauseAt(await page.evaluate(() => Date.now() + 60_000));
+      await box.press('Enter');
+
+      const working = page.locator('[data-working]');
+      await expect(working).toContainText('Working');
+      await expect.poll(() => asked).toHaveLength(1);
+      const selectedChat = page.locator('[data-sidebar-thread-row][aria-current=page]');
+      await expect(selectedChat).toHaveAttribute('data-sidebar-thread-row', /.+/);
+      expect(asked[0]).toMatchObject({
+        question: prompt,
+        conversation_id: await selectedChat.getAttribute('data-sidebar-thread-row'),
+        request_id: expect.stringMatching(/^ceo-/),
+      });
+      const requestId = asked[0].request_id;
+
+      await page.clock.runFor(pollIntervalMs);
+      await expect.poll(() => progressRequests).toEqual([requestId]);
+      // Keep the first response pending past two poll intervals to catch overlapping requests.
+      await page.clock.runFor(2 * pollIntervalMs);
+      expect(progressRequests).toEqual([requestId]);
+      releaseFirstPoll();
+      await expect(working).toContainText('Thinking', { timeout: 8000 });
+
+      await page.clock.runFor(pollIntervalMs);
+      await expect(working).toContainText('Using web_search (step 2)', { timeout: 8000 });
+      expect(progressRequests).toEqual([requestId, requestId]);
+      releaseAsk();
+      await expect(working).toHaveCount(0, { timeout: 10000 });
+      await page.clock.runFor(2 * pollIntervalMs);
+      await expect(working).toHaveCount(0);
+      expect(progressRequests).toEqual([requestId, requestId]);
+      expect(asked).toHaveLength(1);
+      expect(maxInflight).toBe(1);
+    } finally {
+      releaseFirstPoll();
+      releaseAsk();
+      await page.unrouteAll({ behavior: 'wait' });
+    }
   });
 
   const HISTORY = { id: 'legacy-ceo-history', title: 'CEO history', workspace_id: null, profile_id: null, created_at: '2026-11-01T10:00:00+00:00', updated_at: '2026-11-01T10:00:00+00:00' };
@@ -2251,6 +2306,10 @@ test.describe('review fixes: chat state', () => {
     await page.goto('/?ui=rusebot');
     const chip = page.locator('[data-chathead-model]');
     await expect(chip).toBeVisible({ timeout: 30000 });
+    await expect(chip).toHaveAttribute('data-model-override', 'false');
+    await page.getByRole('button', { name: 'Add', exact: true }).click();
+    await page.locator('#rb-model').click();
+    await page.getByRole('option').nth(1).click();
     await expect(chip).toHaveAttribute('data-model-override', 'true');
     await expect(chip).toHaveAttribute('title', /saved-model-xyz/);
     await expect(chip).toContainText('override');
@@ -2603,7 +2662,7 @@ test.describe('General custom dropdowns', () => {
       for (const trigger of [provider, model]) {
         const arrow = trigger.locator('.settings-select-chevron');
         expect(await arrow.evaluate(el => getComputedStyle(el).right)).toBe('14px');
-        expect(await trigger.evaluate(el => el.offsetHeight)).toBe(36);
+        expect(await trigger.evaluate((el: HTMLButtonElement) => el.offsetHeight)).toBe(36);
         await trigger.click();
         await expect(page.getByRole('listbox')).toBeVisible();
         await page.keyboard.press('Escape');
@@ -2801,6 +2860,8 @@ test.describe('shared dropdown interactions', () => {
       await expect(parent).toBeVisible();
       await page.locator('[data-composer-new-agent]').click();
       const dialog = page.locator('[role=dialog][aria-labelledby=new-agent-title]');
+      await expect(dialog.locator('#na-model')).toHaveAttribute('data-value', 'm1');
+      await chooseSelect(dialog.locator('#na-model'), 'm80');
       await expect(dialog.locator('#na-model')).toHaveAttribute('data-value', 'm80');
       for (const id of ['na-engine', 'na-model']) {
         const trigger = dialog.locator(`#${id}`);

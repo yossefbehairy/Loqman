@@ -188,6 +188,7 @@ async function openMockChat(page: Page) {
 function createSpecialist(page: Page, name: string) {
   return call<{ id: string }>(page, 'profiles.create', {
     name, role_type: 'custom', description: 'F-01 regression', instructions: 'Answer briefly.',
+    default_model_id: 'deepseek-v4.1-flash-free',
   });
 }
 

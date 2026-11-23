@@ -27,10 +27,7 @@ import {
   type Conversation,
   type ConvMessage,
   type Draft,
-  type EngineCapabilities,
-  type EngineModel,
-  type EngineStateId,
-  type EngineStatus,
+  type Profile,
   type RunSnapshot,
 } from '../data/worker';
 import { ApiError, type StreamHandle } from '../../api/transport';
@@ -38,16 +35,14 @@ import { emptyLive, freezeLive, hasLiveContent, reduceLive, type LiveTurn } from
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
 import type { Agent } from '../types';
 import {
-  currentExecutionChoice,
   isExecutableChoice,
   loadProviderModels,
   refreshProviders,
   retryProviderReadiness,
-  selectProviderEngine,
-  setProviderChoice,
   useProviders,
   type EngineChoice,
 } from './useProviders';
+import { discardDraftChoice, getChatExecution, getDraftOverride, transferDraftChoice, useChatEngines, type EngineState } from './useChatEngines';
 
 const KEY_DRAFTS = 'agentos.rusebot.drafts.v1';
 const CEO_SUBMISSION_PREFIX = 'ceo-submission:';
@@ -55,6 +50,7 @@ const SUBMISSION_PREFIX = 'agentos.rusebot.submission.v1.';
 const KEY_RUNS = 'agentos.rusebot.runs.v1';
 const KEY_SELECTED = 'agentos.rusebot.selected.v1';
 const KEY_AGENTS = 'agentos.rusebot.convAgents.v1';
+const DRAFT_OWNER_PREFIX = 'new:';
 
 /** ceo.ask refuses longer questions (backend/pyworker/api/ceo.py), so refuse them before anything is saved. */
 export const CEO_MAX_CHARS = 2000;
@@ -113,44 +109,28 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
-export type { EngineChoice } from './useProviders';
-
-export interface EngineState {
-  engines: Array<{ id: string; status: EngineStatus | null; caps: EngineCapabilities; state: EngineStateId; title: string }>;
-  /** Models of the current provider. */
-  models: EngineModel[];
-  choice: EngineChoice | null;
-  catalogStatus: 'loading' | 'ready' | 'error' | undefined;
-  executionReady: boolean;
-  loading: boolean;
-  setChoice: (choice: EngineChoice) => void;
-  /** Switch provider and use its preferred model. */
-  selectEngine: (engine: string) => Promise<void>;
-  loadModels: (engine: string) => Promise<EngineModel[]>;
+interface ChatSelection {
+  id: string | null;
+  draftAgentId: string | null;
 }
 
-/** Thin adapter over the shared provider store (see useProviders.ts). */
-export function useEngines(): EngineState {
-  const s = useProviders();
-  const engines = useMemo(
-    () => s.selectable.map((e) => ({ id: e.id, status: e.status, caps: e.caps, state: e.state, title: e.title })),
-    [s.selectable]
-  );
-  const models = s.choice ? (s.models[s.choice.engine]?.list ?? NO_MODELS) : NO_MODELS;
-  return {
-    engines,
-    models,
-    choice: s.choice,
-    catalogStatus: s.choice ? s.models[s.choice.engine]?.status : undefined,
-    executionReady: isExecutableChoice(s.choice),
-    loading: s.loading,
-    setChoice: setProviderChoice,
-    selectEngine: selectProviderEngine,
-    loadModels: loadProviderModels,
-  };
+function isSelectionId(value: unknown, max: number): value is string {
+  if (typeof value !== 'string' || !value || value !== value.trim()) return false;
+  const characters = Array.from(value);
+  return characters.length <= max && characters.every(character => character >= ' ' && character !== '\u007f');
 }
 
-const NO_MODELS: EngineModel[] = [];
+function readChatSelection(): ChatSelection {
+  const stored = readJson<unknown>(KEY_SELECTED, null);
+  if (isSelectionId(stored, 160) && !stored.startsWith(DRAFT_OWNER_PREFIX)) {
+    return { id: stored, draftAgentId: null };
+  }
+  const owner = stored && typeof stored === 'object' && 'draftOwner' in stored ? stored.draftOwner : null;
+  const profileId = typeof owner === 'string' && owner.startsWith(DRAFT_OWNER_PREFIX)
+    ? owner.slice(DRAFT_OWNER_PREFIX.length)
+    : null;
+  return { id: null, draftAgentId: isSelectionId(profileId, 64) ? profileId : null };
+}
 
 export interface RunState {
   runId: string;
@@ -173,6 +153,7 @@ interface ApprovalRead {
 }
 
 export interface ChatState {
+  engines: EngineState;
   conversations: Conversation[];
   conversationListError: string | null;
   retryingConversationList: boolean;
@@ -221,6 +202,7 @@ export interface ChatState {
   loaded: boolean;
   activeRunIds: Record<string, string>;
   selectedAgentId: string | null;
+  draftRecipientUnverified: boolean;
   agentFor: (conversationId: string | null) => Agent | null;
   openAgentChat: (agent: Agent, onOpen: () => void, onError: (message: string) => void) => Promise<void>;
   invalidateNavigation: () => void;
@@ -247,6 +229,7 @@ interface SendAttempt extends ExecutionSettings {
   createdCeoChat?: boolean;
   requestId?: string;
   deferredSource?: string;
+  draftOverride?: EngineChoice;
   /** Source draft kept when the created chat already has independent work. */
   retainedSourceKey?: string;
 }
@@ -261,6 +244,7 @@ interface SubmissionRecord extends ExecutionSettings {
   rejected?: boolean;
   createdCeoChat?: boolean;
   deferredSource?: string;
+  draftOverride?: EngineChoice;
 }
 
 function readSubmissions(): Map<string, SubmissionRecord> {
@@ -280,6 +264,8 @@ function readSubmissions(): Map<string, SubmissionRecord> {
       if (typeof record.execution?.engine !== 'string' || !record.execution.engine ||
           typeof record.execution.model !== 'string' || !record.execution.model ||
           (record.wirePrompt !== undefined && typeof record.wirePrompt !== 'string')) delete record.execution;
+      if (typeof record.draftOverride?.engine !== 'string' || !record.draftOverride.engine ||
+          typeof record.draftOverride.model !== 'string' || !record.draftOverride.model) delete record.draftOverride;
       records.set(record.requestId, record as SubmissionRecord);
     }
   } catch { /* Storage unavailable. Live sends still use in-memory state. */ }
@@ -299,7 +285,7 @@ function needsConversation(cid: string | null): cid is null | `legacy:${string}`
 
 function chatOwnerKey(cid: string | null, agentId: string): string {
   // The reserved CEO profile ID owns the unsaved Loqman slot.
-  return cid ?? `new:${agentId}`;
+  return cid ?? DRAFT_OWNER_PREFIX + agentId;
 }
 
 /** An error shown in the chat, with what "Retry" does about it. */
@@ -377,8 +363,9 @@ interface AgentOpen {
 }
 
 export function useChat(
-  engine: EngineChoice | null,
-  agents: Agent[] = [],
+  agents: Agent[],
+  profiles: Profile[],
+  profilesKnown: boolean,
   onAgentsChanged?: () => void,
   onCeoActionsChanged?: () => void
 ): ChatState {
@@ -399,7 +386,7 @@ export function useChat(
     });
   }, []);
   const [legacy] = useState<LegacyThread[]>(() => readLegacyThreads());
-  const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
+  const [{ id: selectedId, draftAgentId }, setSelection] = useState(readChatSelection);
   // The messages and runs of ONE chat, tagged with it: after a switch the old chat's text is never shown in the new one.
   const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[]; recovered?: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
   const lastReconciledThread = useRef<{ cid: string; list: ConvMessage[] } | null>(null);
@@ -582,7 +569,6 @@ export function useChat(
     });
   }, []);
   const [loaded, setLoaded] = useState(false);
-  const [draftAgentId, setDraftAgentId] = useState<string | null>(null);
   const [agentMap, setAgentMap] = useState<Record<string, string>>(() => readJson(KEY_AGENTS, {}));
   const agentMapRef = useRef(agentMap);
   agentMapRef.current = agentMap;
@@ -605,6 +591,12 @@ export function useChat(
     return agents.find((a) => a.id === id) ?? null;
   }, [agents, recipientIdFor]);
   const selectedOwnerKey = chatOwnerKey(selectedId, newChatAgentId);
+  const recipient = recipientIdFor(selectedId);
+  const profile = recipient === null || recipient === CEO_PROFILE_ID
+    ? undefined
+    : profiles.find((entry) => entry.id === recipient) ?? null;
+  const draftRecipientUnverified = selectedId === null && profile === null;
+  const engines = useChatEngines(selectedOwnerKey, providers, profile);
   const streams = useRef(new Map<string, StreamHandle>());
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -1051,14 +1043,21 @@ export function useChat(
     selectionRevision.current++;
   }, []);
 
-  const select = useCallback((id: string | null) => {
-    invalidateNavigation();
+  const rememberSelection = useCallback((id: string | null, agentId: string | null = null) => {
     selectedRef.current = id;
-    setDraftAgentId(null);
-    setSelectedId(id);
-    writeJson(KEY_SELECTED, id);
+    const draftAgentId = id === null ? agentId : null;
+    setSelection({ id, draftAgentId });
+    // A single write replaces the prior selection. Keep saved IDs and the CEO draft in their legacy formats.
+    writeJson(KEY_SELECTED, id ?? (draftAgentId && draftAgentId !== CEO_PROFILE_ID
+      ? { draftOwner: chatOwnerKey(null, draftAgentId) }
+      : null));
+  }, []);
+
+  const select = useCallback((id: string | null, agentId: string | null = null) => {
+    invalidateNavigation();
+    rememberSelection(id, agentId);
     setPendingUser(null);
-  }, [invalidateNavigation]);
+  }, [invalidateNavigation, rememberSelection]);
 
   const setDraft = useCallback(
     (text: string) => {
@@ -1141,7 +1140,7 @@ export function useChat(
         deferredSource: recoverySource });
       const persist = (owned: boolean, recoveryFallback?: string) => {
         const record: SubmissionRecord = { cid, agentId, prompt, execution, wirePrompt, requestId, ownsDraft: owned,
-          createdCeoChat, deferredSource: recoverySource };
+          createdCeoChat, deferredSource: recoverySource, draftOverride: attempt.draftOverride };
         try {
           localStorage.setItem(submissionKey, JSON.stringify(record));
           submissions.set(requestId, record);
@@ -1189,6 +1188,9 @@ export function useChat(
           const sourceEdited = sourceRevision !== draftRevision;
           cid = created.id;
           boundProfile = created.profile_id;
+          const destinationEdited = draftRevisions.current.has(cid);
+          const moveDraft = !destinationEdited && (!sourceEdited || stillHere);
+          transferDraftChoice(sourceKey, cid, moveDraft && !sending.current.has(cid), attempt.draftOverride);
           rememberConversation(created);
           bindAgent(cid, agentId);
           if (sending.current.has(cid)) {
@@ -1206,7 +1208,6 @@ export function useChat(
           key = cid;
           publishLocks(nextLocks.set(key, lock));
           // Preserve edits if a concurrent list refresh exposed the new chat before creation returned.
-          const destinationEdited = draftRevisions.current.has(cid);
           if (!destinationEdited) {
             draftRevisions.current.set(cid, stillHere ? sourceRevision : draftRevision);
           } else {
@@ -1215,7 +1216,7 @@ export function useChat(
           // Record the actual destination before moving the draft or sending the prompt.
           if (!persist(ownsDraft(cid), sourceKey)) return;
           // Only remove the source here if its text actually moves to the destination.
-          if (!destinationEdited && (!sourceEdited || stillHere)) {
+          if (moveDraft) {
             setDraftMap((prev) => {
               if (!(sourceKey in prev)) return prev;
               const next = { ...prev };
@@ -1226,9 +1227,7 @@ export function useChat(
             });
           }
           if (stillHere) {
-            selectedRef.current = cid;
-            setSelectedId(cid);
-            writeJson(KEY_SELECTED, cid);
+            rememberSelection(cid);
           }
         }
         const chatId = cid;
@@ -1429,13 +1428,14 @@ ${prompt}`;
         releaseLock();
       }
     },
-    [follow, agents, bindAgent, onAgentsChanged, onCeoActionsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun, rememberConversation]
+    [follow, agents, bindAgent, onAgentsChanged, onCeoActionsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun, rememberConversation, rememberSelection]
   );
 
   const send = useCallback((text: string) => {
     const prompt = text.trim();
     if (!prompt) return Promise.resolve();
     const cid = selectedRef.current;
+    if (cid !== selectedId || draftRecipientUnverified) return Promise.resolve();
     const agentId = recipientIdFor(cid);
     if (agentId === null) return Promise.resolve();
     const revision = draftRevisions.current.get(chatOwnerKey(cid, agentId));
@@ -1444,13 +1444,14 @@ ${prompt}`;
       if (typeof action === 'object' && action?.requestId && action.cid === cid && action.agentId === agentId &&
           action.prompt === prompt && action.draftRevision === revision) return sendAttempt(action, errorKey);
     }
-    const execution = currentExecutionChoice();
-    if (!execution || execution.engine !== engine?.engine || execution.model !== engine.model) return Promise.resolve();
+    const execution = getChatExecution(selectedOwnerKey, profile);
+    if (!execution || execution.engine !== engines.choice?.engine || execution.model !== engines.choice.model) return Promise.resolve();
     return sendAttempt({
       cid, prompt, agentId, execution,
+      draftOverride: needsConversation(cid) ? getDraftOverride(selectedOwnerKey) : undefined,
       draftRevision: revision,
     });
-  }, [recipientIdFor, sendAttempt, errors, engine]);
+  }, [recipientIdFor, sendAttempt, errors, selectedId, selectedOwnerKey, profile, engines.choice, draftRecipientUnverified]);
 
   const openAgentChat = useCallback(
     async (agent: Agent, onOpen: () => void, onError: (message: string) => void) => {
@@ -1629,10 +1630,10 @@ ${prompt}`;
 
   const messages = thread.cid !== null && thread.cid === selectedId ? thread.list : NO_MESSAGES;
   const runsBySeq = runsThread.cid !== null && runsThread.cid === selectedId ? runsThread.map : NO_RUNS;
-  const selectedAgentId = recipientIdFor(selectedId);
+  const selectedAgentId = draftRecipientUnverified && profilesKnown ? null : recipient;
   const submissionKey = Object.keys(errors).reverse().find((key) => {
     const action = errors[key].retry;
-    return key.startsWith(SUBMISSION_PREFIX) && action !== null && typeof action === 'object' && action.agentId === selectedAgentId &&
+    return key.startsWith(SUBMISSION_PREFIX) && action !== null && typeof action === 'object' && action.agentId === recipient &&
       (action.cid === selectedId || action.deferredSource === selectedOwnerKey);
   });
   const errorKey = errors[selectedOwnerKey] ? selectedOwnerKey : submissionKey ?? '';
@@ -1648,7 +1649,7 @@ ${prompt}`;
   }, [retryReadiness, retryEngine]);
 
   const retry = useMemo(() => {
-    if (!shownError?.retry) return null;
+    if (!shownError?.retry || draftRecipientUnverified) return null;
     const action = shownError.retry;
     if (!action.execution) return null;
     return () => {
@@ -1665,7 +1666,7 @@ ${prompt}`;
       }
       void sendAttempt(action, errorKey);
     };
-  }, [shownError, conversations, sendAttempt, errorKey, raise, retryChoice]);
+  }, [shownError, conversations, sendAttempt, errorKey, raise, retryChoice, draftRecipientUnverified]);
 
   const retryThread = useCallback(() => {
     const cid = selectedRef.current;
@@ -1681,6 +1682,7 @@ ${prompt}`;
   }, [runs]);
 
   return {
+    engines,
     conversations,
     conversationListError,
     retryingConversationList,
@@ -1733,8 +1735,12 @@ ${prompt}`;
     stop,
     newChat: () => {
       const current = recipientIdFor(selectedRef.current);
-      select(null);
-      setDraftAgentId(current);
+      const owner = chatOwnerKey(null, current ?? CEO_PROFILE_ID);
+      if (!draftMap[owner] && !sending.current.has(owner) &&
+          ![...submissions.values()].some(record => record.cid === null && chatOwnerKey(null, record.agentId) === owner)) {
+        discardDraftChoice(owner);
+      }
+      select(null, current);
     },
     decide,
     draftSaves,
@@ -1744,6 +1750,7 @@ ${prompt}`;
     loaded,
     activeRunIds,
     selectedAgentId,
+    draftRecipientUnverified,
     agentFor,
     openAgentChat,
     invalidateNavigation,

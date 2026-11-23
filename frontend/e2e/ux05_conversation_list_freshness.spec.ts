@@ -8,7 +8,7 @@ type Rpc = { method: string; params: Record<string, unknown> };
 const row = (page: Page, id: string) => page.locator(`[data-sidebar-thread-row="${id}"]`);
 const composer = (page: Page) => page.locator('[data-tour="composer"]').getByRole('textbox');
 const sendButton = (page: Page) => page.getByRole('button', { name: 'Send', exact: true });
-const selected = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem('agentos.rusebot.selected.v1') ?? 'null') as string | null);
+const selected = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem('agentos.rusebot.selected.v1') ?? 'null') as string | { draftOwner: string } | null);
 
 function gate() {
   let release!: () => void;
@@ -201,7 +201,7 @@ for (const failOld of [false, true]) {
         // New Chat from B should still create a separate conversation for the same Agent.
         await page.locator('[data-sidebar-new]').click();
         await page.locator('[data-new-chat]').click();
-        await expect.poll(() => selected(page)).toBeNull();
+        await expect.poll(() => selected(page)).toEqual({ draftOwner: 'new:' + target.id });
         const sent = nextResponse(page, 'runs.start_turn');
         await send(page, 'Send in a separate chat for the same Agent.');
         const response = await sent;
