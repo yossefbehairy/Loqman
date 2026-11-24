@@ -1,7 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { SKINS } from '../src/rusebot/lib/skins';
 
-const output = 'D:/LOQMAN/ui-review/agent-panel-cohesive';
 const longModel = 'deepseek-v4.1-flash-free-' + 'extended-context-'.repeat(9);
 async function openPanel(page: Page, skin = 'midnight', width = 1440, height = 1000, long = false) {
   const name = long ? 'ليلى — تصميم تجربة المستخدم والبحث في المنتجات الطويلة' : 'ANYA';
@@ -36,7 +35,7 @@ async function openPanel(page: Page, skin = 'midnight', width = 1440, height = 1
 }
 
 for (const theme of SKINS) {
-  test(`cohesive panel presentation and theme tokens: ${theme.name}`, async ({ page }) => {
+  test(`cohesive panel presentation and theme tokens: ${theme.name}`, async ({ page }, testInfo) => {
     const { panel, calls } = await openPanel(page, theme.id);
     const header = panel.locator('.agent-details-header');
     const body = panel.locator('.agent-details-body');
@@ -72,7 +71,7 @@ for (const theme of SKINS) {
     expect(await remove.evaluate(el => el.parentElement === el.closest('.agent-details-body')!.lastElementChild)).toBe(true);
     expect(calls.filter(method => /conversations.create|profiles.update|profiles.delete|missions.delegate/.test(method))).toEqual([]);
     expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-    await page.screenshot({ path: `${output}/${theme.id}.png`, animations: 'disabled' });
+    await page.screenshot({ path: testInfo.outputPath(`${theme.id}.png`), animations: 'disabled' });
     await remove.scrollIntoViewIfNeeded();
     await expect(remove).toBeInViewport();
     const contrast = await remove.evaluate(el => {
@@ -86,7 +85,7 @@ for (const theme of SKINS) {
 }
 
 for (const width of [1440, 1280, 1024, 768, 390]) {
-  test(`sticky header, long bilingual content and full-width actions at ${width}px`, async ({ page }) => {
+  test(`sticky header, long bilingual content and full-width actions at ${width}px`, async ({ page }, testInfo) => {
     const { panel, trigger, calls } = await openPanel(page, 'midnight', width, 610, true);
     const header = panel.locator('.agent-details-header');
     const headerY = (await header.boundingBox())!.y;
@@ -95,7 +94,7 @@ for (const width of [1440, 1280, 1024, 768, 390]) {
     for (const selector of ['.agent-details-body', '.agent-details-fields', '.agent-details-identity']) {
       expect(await panel.locator(selector).evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
     }
-    await page.screenshot({ path: `${output}/long-${width}.png`, animations: 'disabled' });
+    await page.screenshot({ path: testInfo.outputPath(`long-${width}.png`), animations: 'disabled' });
     await panel.locator('#rb-contract').fill('Updated but unsaved.\nتغييرات غير محفوظة.');
     await expect(panel.getByRole('button', { name: 'Save contract' })).toBeEnabled();
     await panel.locator('#rb-delegate').fill('   ');
@@ -107,7 +106,7 @@ for (const width of [1440, 1280, 1024, 768, 390]) {
     await expect(remove).toBeInViewport();
     expect((await header.boundingBox())!.y).toBe(headerY);
     await expect(header.getByLabel('Close details')).toBeInViewport();
-    await page.screenshot({ path: `${output}/scrolled-${width}.png`, animations: 'disabled' });
+    await page.screenshot({ path: testInfo.outputPath(`scrolled-${width}.png`), animations: 'disabled' });
     await panel.getByLabel('Close details').press('Escape');
     await expect(trigger).toBeFocused();
     await trigger.click();

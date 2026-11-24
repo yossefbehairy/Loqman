@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type TestInfo } from '@playwright/test';
 import { SKINS } from '../src/rusebot/lib/skins';
 
 async function settings(page: Page, appearance = true) {
@@ -19,16 +19,16 @@ async function start(page: Page, skin = 'midnight', width = 1440) {
   await page.goto('/?ui=rusebot');
   await expect(page.locator('[data-rusebot-shell]')).toBeVisible();
 }
-const shot = async (page: Page, name: string) => page.screenshot({ path: `D:/LOQMAN/ui-review/appearance/${name}.png`, animations: 'disabled' });
+const shot = async (page: Page, testInfo: TestInfo, name: string) => page.screenshot({ path: testInfo.outputPath(`${name}.png`), animations: 'disabled' });
 
-test('registry gallery, scoped tokens, changes and preference persistence', async ({ page }) => {
+test('registry gallery, scoped tokens, changes and preference persistence', async ({ page }, testInfo) => {
   await start(page);
   let dialog = await settings(page);
   await expect(dialog.locator('[data-theme-card]')).toHaveCount(Math.min(3, SKINS.length));
-  await shot(page, 'midnight');
+  await shot(page, testInfo, 'midnight');
   await dialog.getByRole('button', { name: `View all ${SKINS.length} themes` }).click();
   await expect(dialog.locator('[data-theme-card]')).toHaveCount(SKINS.length);
-  await shot(page, 'all-themes');
+  await shot(page, testInfo, 'all-themes');
   for (const theme of SKINS) {
     const preview = dialog.locator(`[data-theme-card=${theme.id}] .theme-workspace`);
     const color = await preview.evaluate(el => getComputedStyle(el).backgroundColor);
@@ -42,7 +42,7 @@ test('registry gallery, scoped tokens, changes and preference persistence', asyn
   }
   await dialog.locator('[data-theme-card=atelier]').click();
   await dialog.getByRole('button', { name: 'Show fewer themes' }).click();
-  await shot(page, 'light');
+  await shot(page, testInfo, 'light');
   await dialog.getByRole('combobox', { name: 'Font' }).click();
   await page.getByRole('option', { name: 'Poppins', exact: true }).click();
   await dialog.getByRole('button', { name: 'Large', exact: true }).click();
@@ -56,7 +56,7 @@ test('registry gallery, scoped tokens, changes and preference persistence', asyn
   await expect(dialog.getByRole('button', { name: 'Full chat width' })).toHaveAttribute('aria-pressed', 'true');
 });
 
-test('font pointer and keyboard preview never commits until selection; dismissal restores', async ({ page }) => {
+test('font pointer and keyboard preview never commits until selection; dismissal restores', async ({ page }, testInfo) => {
   await start(page);
   const dialog = await settings(page);
   const trigger = dialog.getByRole('combobox', { name: 'Font', exact: true });
@@ -69,7 +69,7 @@ test('font pointer and keyboard preview never commits until selection; dismissal
   expect(await dialog.locator('[data-font-preview]').evaluate(el => getComputedStyle(el).fontFamily)).toContain('Poppins');
   expect(await applied()).toEqual(before);
   expect((await page.getByRole('listbox').boundingBox())!.width).toBeGreaterThanOrEqual(200);
-  await shot(page, 'font-hover');
+  await shot(page, testInfo, 'font-hover');
   await page.keyboard.press('Escape');
   await expect(dialog).toBeVisible();
   await expect(trigger).toBeFocused();
@@ -91,11 +91,11 @@ test('font pointer and keyboard preview never commits until selection; dismissal
   await dialog.locator('[data-theme-card=atelier]').click();
   expect(await page.evaluate(() => getComputedStyle(document.body).fontFamily)).not.toBe(midnightFont);
   await expect(page.locator('html')).not.toHaveAttribute('data-font');
-  await shot(page, 'bilingual-typography');
+  await shot(page, testInfo, 'bilingual-typography');
 });
 
 for (const width of [1440, 1280, 1024, 768, 390]) {
-  test(`sizes widths and responsive containment ${width}`, async ({ page }) => {
+  test(`sizes widths and responsive containment ${width}`, async ({ page }, testInfo) => {
     await start(page, 'midnight', width);
     const dialog = await settings(page);
     const heading = dialog.locator('#appearance-size');
@@ -104,14 +104,14 @@ for (const width of [1440, 1280, 1024, 768, 390]) {
       await dialog.getByRole('button', { name: size, exact: true }).click();
       expect(await heading.evaluate(el => parseFloat(getComputedStyle(el).fontSize))).toBeCloseTo(base * scale, 1);
       expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-      await shot(page, `text-${size.toLowerCase()}-${width}`);
+      await shot(page, testInfo, `text-${size.toLowerCase()}-${width}`);
     }
     for (const name of ['Standard', 'Wide', 'Full']) {
       await dialog.getByRole('button', { name: `${name} chat width` }).click();
       await expect(dialog.getByRole('button', { name: `${name} chat width` })).toHaveAttribute('aria-pressed', 'true');
       const max = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--chat-column-max').trim());
       expect(max).toBe(({ Standard: '60rem', Wide: '80rem', Full: '100%' })[name]);
-      await shot(page, `width-${name.toLowerCase()}-${width}`);
+      await shot(page, testInfo, `width-${name.toLowerCase()}-${width}`);
     }
     await dialog.getByRole('button', { name: 'Close settings' }).click();
     const composer = page.locator('.mention-editor textarea');
@@ -123,7 +123,7 @@ for (const width of [1440, 1280, 1024, 768, 390]) {
   });
 }
 
-test('profile photo text actions and removal persist across reloads in every theme', async ({ page }) => {
+test('profile photo text actions and removal persist across reloads in every theme', async ({ page }, testInfo) => {
   await start(page);
   let dialog = await settings(page, false);
   await expect(dialog.getByRole('button', { name: 'Remove photo', exact: true })).toHaveCount(0);
@@ -150,7 +150,7 @@ test('profile photo text actions and removal persist across reloads in every the
       return (Math.max(fg, bg) + .05) / (Math.min(fg, bg) + .05);
     });
     expect(contrast, theme.name + ' remove photo text contrast').toBeGreaterThanOrEqual(4.5);
-    await shot(page, `photo-${theme.id}`);
+    await shot(page, testInfo, `photo-${theme.id}`);
   }
   await page.reload();
   dialog = await settings(page, false);
@@ -164,7 +164,7 @@ test('profile photo text actions and removal persist across reloads in every the
 });
 
 
-test('invalid saved theme retains existing fallback and reduced-motion keyboard font menu fits mobile', async ({ page }) => {
+test('invalid saved theme retains existing fallback and reduced-motion keyboard font menu fits mobile', async ({ page }, testInfo) => {
   await page.emulateMedia({ reducedMotion: 'reduce' });
   await page.addInitScript(() => { localStorage.setItem('rusebot-skin', 'missing-theme'); localStorage.setItem('rusebot-text-size', 'missing-size'); });
   await start(page, 'midnight', 390);
@@ -181,13 +181,13 @@ test('invalid saved theme retains existing fallback and reduced-motion keyboard 
   expect(menu.x + menu.width).toBeLessThanOrEqual(bounds.x + bounds.width);
   expect(menu.y).toBeGreaterThanOrEqual(0);
   expect(menu.y + menu.height).toBeLessThanOrEqual(1000);
-  await shot(page, 'font-narrow');
+  await shot(page, testInfo, 'font-narrow');
   await page.keyboard.press('Escape');
   await expect(trigger).toBeFocused();
 });
 
 for (const width of [1440, 390]) {
-  test(`application text scale covers sidebar chat composer Team and AgentPanel ${width}`, async ({ page }) => {
+  test(`application text scale covers sidebar chat composer Team and AgentPanel ${width}`, async ({ page }, testInfo) => {
     await page.route('**/__agentos/call', route => {
       const { method } = route.request().postDataJSON();
       if (method === 'profiles.list') return route.fulfill({ json: { result: { profiles: [
@@ -213,7 +213,7 @@ for (const width of [1440, 390]) {
       expect(await sidebar.evaluate(el => parseFloat(getComputedStyle(el).fontSize))).toBeCloseTo(sidebarBase * scale, 1);
       await composer.fill('English and العربية\nMore room for ideas.');
       expect(await composer.evaluate(el => el.scrollHeight <= el.clientHeight + 1)).toBe(true);
-      await shot(page, `app-${name.toLowerCase()}-${width}`);
+      await shot(page, testInfo, `app-${name.toLowerCase()}-${width}`);
     }
     if (width < 768 && await page.getByRole('button', { name: 'Open chat list' }).getAttribute('aria-expanded') !== 'true') await page.getByRole('button', { name: 'Open chat list' }).click();
     await page.locator('[data-sidebar-nav=team]').click();
@@ -233,7 +233,7 @@ for (const width of [1440, 390]) {
       await remove.scrollIntoViewIfNeeded();
       await expect(remove).toBeInViewport();
       await expect(panel.locator('.agent-details-header')).toBeInViewport();
-      await shot(page, `team-panel-${name.toLowerCase()}-${width}`);
+      await shot(page, testInfo, `team-panel-${name.toLowerCase()}-${width}`);
     }
   });
 }
@@ -259,7 +259,7 @@ test('each text size and chat width restores the actual UI after refresh', async
   expect(columns[2]).toBeGreaterThanOrEqual(columns[1]);
 });
 
-test('125 and 150 percent simulated display density retain usable settings', async ({ page, context }) => {
+test('125 and 150 percent simulated display density retain usable settings', async ({ page, context }, testInfo) => {
   await start(page);
   const cdp = await context.newCDPSession(page);
   for (const density of [1.25, 1.5]) {
@@ -273,7 +273,7 @@ test('125 and 150 percent simulated display density retain usable settings', asy
     await page.getByRole('option', { name: 'Poppins', exact: true }).hover();
     const menu = (await page.getByRole('listbox').boundingBox())!;
     expect(menu.x + menu.width).toBeLessThanOrEqual(Math.floor(1440 / density));
-    await shot(page, `density-${density}`);
+    await shot(page, testInfo, `density-${density}`);
     await page.keyboard.press('Escape');
     await dialog.getByRole('button', { name: 'Close settings' }).click();
   }
