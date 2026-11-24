@@ -489,7 +489,7 @@ export function Sidebar(props: SidebarProps) {
                   rail ? 'mx-auto size-[46px] justify-center' : 'min-h-9 w-full gap-3 px-3 py-1.5 text-left'
                 )}
               >
-                <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-warning text-[12px] font-semibold text-ink">
+                <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-warning text-[12px] font-semibold text-warning-ink">
                   {props.needsYou}
                 </span>
                 {!rail && <span className="flex-1 truncate text-[14px] font-medium leading-5">Needs you</span>}

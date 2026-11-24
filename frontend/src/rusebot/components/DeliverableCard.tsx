@@ -91,7 +91,7 @@ export function DeliverableCard({
               'shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium',
               draft.status === 'approved' && 'bg-success/15 text-success',
               draft.status === 'rejected' && 'bg-danger/10 text-danger',
-              draft.status === 'pending_review' && 'bg-warning/15 text-warning'
+              draft.status === 'pending_review' && 'deliverable-pending bg-warning/15 text-warning'
             )}
           >
             {STATUS_LABEL[draft.status] ?? draft.status}
@@ -112,7 +112,7 @@ export function DeliverableCard({
               type="button"
               disabled={busy}
             onClick={() => void run('review', () => onReview(draft, 'approve'))}
-              className={cn(CONTROL, 'bg-accent text-accent-ink hover:brightness-110')}
+              className={cn(CONTROL, 'approval-confirm bg-accent text-accent-ink')}
             >
               <Check size={13} aria-hidden="true" /> Approve
             </button>

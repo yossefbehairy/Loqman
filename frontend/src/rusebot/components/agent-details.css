@@ -134,9 +134,9 @@
   width: 100%;
   min-height: 38px;
   padding: 8px 12px;
-  border-color: color-mix(in srgb, var(--color-danger) 20%, var(--color-hairline));
+  border-color: var(--destructive-outline);
   background: color-mix(in srgb, var(--color-danger) 8%, var(--color-panel));
-  color: color-mix(in srgb, var(--color-danger) 80%, var(--color-ink));
+  color: var(--color-danger);
 }
 .agent-details .agent-details-delete:enabled:hover {
   background: color-mix(in srgb, var(--color-danger) 14%, var(--color-panel));

@@ -76,7 +76,7 @@ export function ApprovalCard({
       data-approval-card={kind}
       className={cn(
         'w-full max-w-[840px] rounded-2xl border bg-card p-4',
-        settled ? 'border-hairline/30 opacity-70' : 'border-accent/40'
+        settled ? 'approval-settled border-hairline/20' : 'border-accent/40'
       )}
     >
       <div className="flex items-baseline justify-between gap-3">
@@ -146,7 +146,7 @@ export function ApprovalCard({
               type="button"
               disabled={busy !== null || decisionPending}
               onClick={() => void decide('approve')}
-              className={cn(APPROVAL_CONTROL, 'bg-accent text-accent-ink hover:brightness-110')}
+              className={cn(APPROVAL_CONTROL, 'approval-confirm bg-accent text-accent-ink')}
             >
               Approve
             </button>
