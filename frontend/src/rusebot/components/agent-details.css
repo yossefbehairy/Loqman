@@ -15,6 +15,9 @@
 @container (min-width: 840px) {
   [data-view="team"] .agent-details { position: relative; box-shadow: none; }
 }
+@media (min-width: 768px) {
+  [data-view="contracts"] .agent-details { position: relative; }
+}
 @media (min-width: 1536px) {
   .agent-details { position: relative; box-shadow: none; }
 }

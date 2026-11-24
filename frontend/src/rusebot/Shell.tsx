@@ -258,6 +258,7 @@ export function Shell() {
           <TeamView
             mode={view}
             loaded={company.loaded}
+            contractsStatus={company.profilesConfirmed ? 'ready' : company.error !== null ? 'error' : 'loading'}
             teams={company.teams}
             agents={company.agents}
             profiles={company.profiles}

@@ -14,21 +14,21 @@ import type { Agent, Team } from '../types';
 import { CEO_PROFILE_ID, cancelMission, isMissionTerminal, delegateToAgent, deleteProfile, updateProfileInstructions, type Mission, type Profile } from '../data/worker';
 import { messageOf } from '../state/useChat';
 import { useProviders } from '../state/useProviders';
-import { effectiveModel } from '../state/effectiveModel';
+import { contractModelLabel, effectiveModel } from '../state/effectiveModel';
 
 const DOTS = {
   backgroundImage: 'radial-gradient(circle, color-mix(in srgb, var(--color-ink) 14%, transparent) 1px, transparent 1px)',
   backgroundSize: '22px 22px',
 } as const;
 
-function PageHeader({ icon, title, count, subtitle, action }: { icon: React.ReactNode; title: string; count: string; subtitle: string; action?: React.ReactNode }) {
+function PageHeader({ icon, title, count, subtitle, action }: { icon: React.ReactNode; title: string; count?: string; subtitle: string; action?: React.ReactNode }) {
   return (
     <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-hairline/40 px-6 py-4 max-md:pl-12">
       <div>
         <div className="flex items-center gap-2.5">
           {icon}
           <h1 className="text-[17px] font-semibold">{title}</h1>
-          <span className="ml-1 text-[11px] text-ink-secondary">{count}</span>
+          {count && <span className="ml-1 text-[11px] text-ink-secondary">{count}</span>}
         </div>
         <p className="mt-1 text-[12px] text-ink-secondary">{subtitle}</p>
       </div>
@@ -201,12 +201,14 @@ function initials(name: string): string {
 export function AgentPanel({
   agent,
   profile,
+  modelLabel,
   onClose,
   onChat,
   onChanged,
 }: {
   agent: Agent;
   profile: Profile | null;
+  modelLabel?: string;
   onClose: () => void;
   onChat: () => void;
   onChanged: () => void;
@@ -301,7 +303,7 @@ export function AgentPanel({
             <dt>Status</dt>
             <dd>{agent.status}</dd>
             <dt>Model</dt>
-            <dd dir="auto">{drawerModel.label}</dd>
+            <dd dir="auto">{modelLabel ?? drawerModel.label}</dd>
             <dd data-model-note>Used for delegated tasks. Chats inherit available Agent settings unless changed in the + menu.</dd>
             <dt>Effort</dt>
             <dd>{agent.reason}</dd>
@@ -363,6 +365,7 @@ export function AgentPanel({
 export interface TeamViewProps {
   mode: 'team' | 'contracts';
   loaded: boolean;
+  contractsStatus: 'loading' | 'ready' | 'error';
   teams: Team[];
   agents: Agent[];
   profiles: Profile[];
@@ -377,14 +380,17 @@ export interface TeamViewProps {
 }
 
 export function TeamView(props: TeamViewProps) {
-  const { teams, agents, profiles, missions } = props;
+  const { teams, agents, profiles, missions, contractsStatus } = props;
+  const providers = useProviders();
+  const profilesById = useMemo(() => new Map(profiles.map(profile => [profile.id, profile])), [profiles]);
+  const modelOf = (member: Agent) => contractModelLabel(providers, profilesById.get(member.profileId ?? member.id)?.engine, member.model);
   const [selected, setSelectedState] = useState<string | null>(null);
   const setSelected = (id: string | null) => {
     setSelectedState(id);
     props.onPanelChange(id !== null);
   };
   const agent = agents.find((a) => a.id === selected) ?? null;
-  const profile = agent?.profileId ? (profiles.find((p) => p.id === agent.profileId) ?? null) : null;
+  const profile = agent?.profileId ? (profilesById.get(agent.profileId) ?? null) : null;
 
   const ceo = agents.find(a => a.id === CEO_PROFILE_ID);
   const nodes = useMemo(() => organizationNodes(agents, teams), [agents, teams]);
@@ -422,7 +428,7 @@ export function TeamView(props: TeamViewProps) {
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app" data-view={props.mode}>
       {contracts ? (
         <PageHeader icon={<FileText size={18} />} title="Contracts" action={newAgent}
-          count={`${agents.length} ${agents.length === 1 ? 'member' : 'members'}`}
+          count={contractsStatus === 'ready' ? `${agents.length} ${agents.length === 1 ? 'member' : 'members'}` : undefined}
           subtitle="What each employee is hired to do, with the model and limits they run under." />
       ) : (
         <header className="org-heading">
@@ -439,33 +445,42 @@ export function TeamView(props: TeamViewProps) {
         <div className="relative flex min-h-0 min-w-0 flex-1">
           <div className="relative min-h-0 min-w-0 flex-1 overflow-auto" style={DOTS} role="region" aria-label={contracts ? 'Contracts' : 'Team canvas'}>
             {contracts ? (
-              <ul className="mx-auto flex max-w-3xl flex-col gap-2 p-6">
-                {agents.map((a) => (
-                  <li key={a.id}>
-                    <button
-                      type="button"
-                      onClick={() => setSelected(a.id)}
-                      data-contract-row={a.id}
-                      className="flex w-full items-center gap-3 rounded-xl border border-hairline/50 bg-card px-4 py-3 text-left hover:border-ink-secondary/40"
-                    >
-                      <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-raised text-[14px] font-semibold text-ink-secondary">
-                        {initials(a.name)}
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span dir="auto" className="block truncate text-[14px] font-semibold">
-                          {a.name}
-                        </span>
-                        <span dir="auto" className="block truncate text-[12px] text-ink-secondary">
-                          {a.role}
-                        </span>
-                      </span>
-                      <span className="shrink-0 text-[11px] text-ink-secondary">
-                        {a.model} · {a.reason} · {a.timeout}s
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
+              <div className="mx-auto max-w-3xl p-6">
+                {contractsStatus === 'loading' && <p role="status" className="text-[13px] text-ink-secondary">Loading contracts…</p>}
+                {contractsStatus === 'ready' && (agents.length ? (
+                  <ul className="flex flex-col gap-2">
+                    {agents.map(a => {
+                      const model = modelOf(a);
+                      return (
+                        <li key={a.id}>
+                          <button
+                            type="button"
+                            onClick={() => setSelected(a.id)}
+                            data-contract-row={a.id}
+                            className="flex w-full items-center gap-3 rounded-xl border border-hairline/50 bg-card px-4 py-3 text-left hover:border-ink-secondary/40"
+                          >
+                            <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-raised text-[14px] font-semibold text-ink-secondary">
+                              {initials(a.name)}
+                            </span>
+                            <span className="min-w-0 flex-1">
+                              <span dir="auto" title={a.name} className="block truncate text-[14px] font-semibold">
+                                {a.name}
+                              </span>
+                              <span dir="auto" title={a.role} className="block truncate text-[12px] text-ink-secondary">
+                                {a.role}
+                              </span>
+                            </span>
+                            <span className="flex min-w-0 max-w-[45%] items-center gap-1 text-[11px] text-ink-secondary">
+                              <bdi title={model} className="truncate">{model}</bdi>
+                              <span className="shrink-0 whitespace-nowrap">· {a.reason} · {a.timeout}s</span>
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                ) : <p className="text-[13px] text-ink-secondary">No contracts yet.</p>)}
+              </div>
             ) : (
               <OrganizationChart ceo={ceo} nodes={nodes} profiles={profiles} loaded={props.loaded} detailsOpen={Boolean(agent)} onChat={props.onOpenChat}
                 onDepartmentOpen={() => setSelected(null)}
@@ -503,6 +518,7 @@ export function TeamView(props: TeamViewProps) {
             key={agent.id}
             agent={agent}
             profile={profile}
+            modelLabel={contracts ? modelOf(agent) : undefined}
             onClose={() => {
               setSelected(null);
               if (!contracts && chartTrigger.current?.isConnected) chartTrigger.current.focus({ preventScroll: true });

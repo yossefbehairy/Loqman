@@ -89,9 +89,9 @@ export function NewAgentDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-agent-title"
-        className="glass-surface glass-popup animate-pop-in relative flex !h-auto w-[min(520px,calc(100vw-32px))] flex-col overflow-hidden rounded-[24px]"
+        className="glass-surface glass-popup animate-pop-in relative flex !h-auto max-h-full w-[min(520px,calc(100vw-32px))] flex-col overflow-hidden rounded-[24px]"
       >
-        <div className="flex items-center justify-between gap-3 border-b border-hairline/30 px-5 py-3.5">
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-hairline/30 px-5 py-3.5">
           <div className="flex items-center gap-2 text-[15px] font-semibold text-ink" id="new-agent-title">
             <UserPlus size={16} aria-hidden="true" /> New agent
           </div>
@@ -100,7 +100,7 @@ export function NewAgentDialog({
           </button>
         </div>
         <form
-          className="flex flex-col gap-3 px-5 py-4"
+          className="flex min-h-0 flex-col gap-3 overflow-y-auto px-5 py-4 [&>*]:shrink-0"
           onSubmit={(e) => {
             e.preventDefault();
             void submit();
