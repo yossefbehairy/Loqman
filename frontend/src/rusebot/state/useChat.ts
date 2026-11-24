@@ -228,6 +228,7 @@ export interface ChatState {
   activeRunIds: Record<string, string>;
   selectedAgentId: string | null;
   draftRecipientUnverified: boolean;
+  profileIdForConversation: (conversation: Conversation) => string;
   agentFor: (conversationId: string | null) => Agent | null;
   openAgentChat: (agent: Agent, onOpen: () => void, onError: (message: string) => void) => Promise<void>;
   invalidateNavigation: () => void;
@@ -632,13 +633,17 @@ export function useChat(
     writeJson(KEY_AGENTS, next);
   }, []);
   const newChatAgentId = draftAgentId ?? CEO_PROFILE_ID;
+  // Only a known, unbound conversation can use the browser's legacy recipient hint.
+  const profileIdForConversation = useCallback(
+    (conversation: Conversation) => conversation.profile_id ?? agentMap[conversation.id] ?? CEO_PROFILE_ID,
+    [agentMap]
+  );
   const recipientIdFor = useCallback((cid: string | null) => {
     if (cid === null) return newChatAgentId;
     if (cid.startsWith('legacy:')) return legacy.some((t) => `legacy:${t.id}` === cid) ? CEO_PROFILE_ID : null;
     const row = conversations.find((c) => c.id === cid);
-    // Only a known, unbound row can use the browser's legacy recipient hint.
-    return row ? (row.profile_id ?? agentMap[cid] ?? CEO_PROFILE_ID) : null;
-  }, [newChatAgentId, legacy, conversations, agentMap]);
+    return row ? profileIdForConversation(row) : null;
+  }, [newChatAgentId, legacy, conversations, profileIdForConversation]);
   const agentFor = useCallback((cid: string | null) => {
     const id = recipientIdFor(cid);
     return agents.find((a) => a.id === id) ?? null;
@@ -1855,6 +1860,7 @@ ${prompt}`;
     activeRunIds,
     selectedAgentId,
     draftRecipientUnverified,
+    profileIdForConversation,
     agentFor,
     openAgentChat,
     invalidateNavigation,

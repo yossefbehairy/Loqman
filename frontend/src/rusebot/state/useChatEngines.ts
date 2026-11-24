@@ -6,7 +6,10 @@ import {
   hasCatalogChoice,
   isExecutableChoice,
   loadProviderModels,
+  refreshProviders,
   type EngineChoice,
+  type ModelsEntry,
+  type ProviderEntry,
   type ProvidersSnapshot,
 } from './useProviders';
 
@@ -174,13 +177,30 @@ export function getChatExecution(owner: string, profile: Profile | null | undefi
   return choice && isExecutableChoice(choice, providers) ? { engine: choice.engine, model: choice.model } : null;
 }
 
+function providerAvailable(provider: ProviderEntry): boolean {
+  return provider.id === 'mock' || selectable(provider.state);
+}
+
+/** Workspace discovery can finish without yielding a provider/model choice. */
+function workspaceCatalogStatus(providers: ProvidersSnapshot): ModelsEntry['status'] | undefined {
+  const catalogs = providers.selectable.filter(providerAvailable).map(provider => providers.models[provider.id]);
+  if (providers.loading || providers.refreshing || catalogs.some(catalog => catalog?.status === 'loading')) return 'loading';
+  if (providers.error || catalogs.some(catalog => catalog?.status === 'error')) return 'error';
+  if (catalogs.length && catalogs.every(catalog => catalog?.status === 'ready' && !catalog.list.some(model => model.id))) return 'ready';
+  return undefined;
+}
+
 export function useChatEngines(owner: string, providers: ProvidersSnapshot, profile: Profile | null | undefined) {
   const selection = useSyncExternalStore(subscribe, getSnapshot).get(owner);
   const choice = ownedChoice(selection, providers, profile);
   const engine = choice?.engine;
   const catalog = engine ? providers.models[engine] : undefined;
+  const models = catalog?.list.filter(model => model.id) ?? noModels;
   const provider = providers.selectable.find(entry => entry.id === engine);
-  const available = provider && (provider.id === 'mock' || selectable(provider.state));
+  const available = provider && providerAvailable(provider);
+  const catalogStatus = engine
+    ? catalog?.status ?? (available || providers.loading ? 'loading' : undefined)
+    : profile === null ? undefined : workspaceCatalogStatus(providers);
   const intent = selection?.intent;
   useEffect(() => {
     if (engine && available && !catalog) void loadProviderModels(engine);
@@ -188,13 +208,22 @@ export function useChatEngines(owner: string, providers: ProvidersSnapshot, prof
   }, [engine, available, catalog, intent]);
   return {
     engines: providers.selectable,
-    models: catalog?.list ?? noModels,
+    models,
     choice,
     explicit: Boolean(selection?.saved || intent),
     needsAgentDefaults: profile === null && !choice,
     storageFailed: selection?.storageFailed ?? false,
     providerUnavailable: Boolean(engine && !available && !providers.loading),
-    catalogStatus: catalog?.status,
+    catalogStatus,
+    canSelectModel: Boolean(choice && available && catalog?.status === 'ready' && models.length),
+    retryModelDiscovery() {
+      if (catalogStatus !== 'error') return;
+      if (engine && available) {
+        if (getProviderSnapshot().models[engine]?.status === 'error') void loadProviderModels(engine, true);
+      } else {
+        void refreshProviders(true);
+      }
+    },
     executionReady: isExecutableChoice(choice, providers),
     loading: providers.loading,
     setChoice(next: EngineChoice) {

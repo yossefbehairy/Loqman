@@ -75,10 +75,23 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
 
   // No usable provider with a model: sending would go nowhere, so say so and point to Settings > AI.
   const noProvider = !disabled && !engines.executionReady;
+  const selectedModel = engines.models.find(model => model.id === choice?.model);
+  const selectedName = selectedModel?.name || choice?.model;
+  const modelMissing = Boolean(choice?.model && engines.catalogStatus === 'ready' && !selectedModel);
+  const modelStatus = engines.catalogStatus === 'loading' ? 'Loading models…'
+    : engines.catalogStatus === 'error' ? 'Could not load models'
+    : modelMissing || (engines.providerUnavailable && selectedName) ? 'Unavailable'
+    : engines.providerUnavailable ? 'Provider unavailable'
+    : engines.needsAgentDefaults ? 'Agent defaults unavailable'
+    : engines.catalogStatus === 'ready' && !engines.models.length ? 'No models available'
+    : undefined;
+  const modelLabel = modelStatus
+    ? [modelStatus, selectedName].filter(Boolean).join(' · ')
+    : selectedName || (choice ? 'Choose a model' : 'Choose a provider');
   const providerNotice = engines.catalogStatus === 'loading' ? 'Loading models for the selected provider.'
-    : engines.catalogStatus === 'error' ? 'Could not load models for the selected provider.'
+    : engines.catalogStatus === 'error' ? (choice ? 'Could not load models for the selected provider.' : 'Could not load models.')
     : engines.providerUnavailable ? 'The selected provider is unavailable.'
-    : choice?.model && engines.catalogStatus === 'ready' && !engines.models.some(model => model.id === choice.model)
+    : modelMissing
       ? 'The selected model is unavailable. Choose another model or refresh providers.'
     : choice ? 'Choose an available model for the selected provider.' : 'No AI provider is ready to answer.';
   const canSend = value.trim().length > 0 && !running && !sending && !disabled && !noProvider;
@@ -187,10 +200,16 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
                   id="rb-model"
                   size="compact"
                   value={choice?.model ?? ''}
-                  selectedLabel={choice?.model || (engines.catalogStatus === 'loading' ? 'Loading models…' : undefined)}
+                  disabled={!engines.canSelectModel}
+                  selectedLabel={modelLabel}
                   onValueChange={(model) => choice && engines.setChoice({ engine: choice.engine, model })}
-                  options={engines.models.map(m => ({ value: m.id, label: m.name }))}
+                  options={engines.canSelectModel ? engines.models.map(m => ({ value: m.id, label: m.name || m.id })) : []}
                 />
+                {engines.catalogStatus === 'error' && (
+                  <button type="button" onClick={engines.retryModelDiscovery} className="mt-1 px-2 py-1 text-[12px] font-medium text-accent-text hover:underline">
+                    Retry model discovery
+                  </button>
+                )}
                 {onManageProviders && (
                   <button
                     type="button"

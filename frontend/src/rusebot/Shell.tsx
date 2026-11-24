@@ -218,6 +218,7 @@ export function Shell() {
           view={view}
           onView={goView}
           conversations={chat.conversations}
+          profileIdForConversation={chat.profileIdForConversation}
           legacy={chat.legacy}
           selectedId={chat.selectedId}
           onSelect={(id) => {

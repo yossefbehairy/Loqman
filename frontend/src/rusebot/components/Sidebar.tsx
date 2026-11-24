@@ -77,6 +77,7 @@ export interface SidebarProps {
   view: View;
   onView: (view: View) => void;
   conversations: Conversation[];
+  profileIdForConversation: (conversation: Conversation) => string;
   legacy: LegacyThread[];
   /** Every agent of the company; the ones without a chat yet are listed so they can be opened from here. */
   agents: Agent[];
@@ -177,12 +178,17 @@ export function Sidebar(props: SidebarProps) {
   const agentsById = useMemo(() => new Map(props.agents.map((a) => [a.id, a])), [props.agents]);
   const agentIndex = useMemo(() => new Map(props.agents.map((a, i) => [a.id, i])), [props.agents]);
 
-  const row = (id: string, title: string, when: string, preview: string, working: boolean, profileId?: string | null) => {
+  const row = (id: string, title: string, when: string, preview: string, working: boolean, profileId: string) => {
     const current = view === 'chat' && props.selectedId === id;
-    // The badge shows who the chat is with: the agent's colour and initial, so chats with
-    // different agents read apart at a glance. Unknown agent (or an older chat): the title's initial, neutral.
-    const agent = profileId ? agentsById.get(profileId) : undefined;
-    const avatarLabel = agent?.name || title;
+    const agent = agentsById.get(profileId);
+    const isCeo = profileId === CEO_PROFILE_ID;
+    const avatar = (
+      <AgentAvatar
+        identity={isCeo || agent ? profileId : null}
+        index={agentIndex.get(profileId)}
+        label={isCeo ? 'Loqman' : agent?.name ?? ''}
+      />
+    );
     if (rail && !railSearch) {
       return (
         <button
@@ -198,7 +204,7 @@ export function Sidebar(props: SidebarProps) {
             current ? 'bg-raised text-ink' : 'text-ink-secondary hover:bg-raised/50 hover:text-ink'
           )}
         >
-          <AgentAvatar identity={profileId} index={profileId ? agentIndex.get(profileId) : undefined} label={avatarLabel} />
+          {avatar}
         </button>
       );
     }
@@ -219,7 +225,7 @@ export function Sidebar(props: SidebarProps) {
           onClick={() => selectThread(id)}
           className="flex min-h-[46px] min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
-          <AgentAvatar identity={profileId} index={profileId ? agentIndex.get(profileId) : undefined} label={avatarLabel} />
+          {avatar}
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="flex items-baseline gap-2">
               <span dir="auto" className={cn('min-w-0 flex-1 truncate text-[14px] font-medium leading-5', current ? 'text-ink' : 'text-ink')}>
@@ -248,7 +254,7 @@ export function Sidebar(props: SidebarProps) {
           stamp(c.updated_at),
           props.previews[c.id] ?? '',
           Boolean(props.activeRunIds[c.id]),
-          c.profile_id
+          props.profileIdForConversation(c)
         )
       )}
       {idleAgents.length > 0 && (!rail || railSearch) && (
@@ -300,7 +306,8 @@ export function Sidebar(props: SidebarProps) {
           t.title,
           t.ts ? stamp(new Date(t.ts).toISOString()) : '',
           t.turns[t.turns.length - 1]?.reply.slice(0, 80) ?? '',
-          false
+          false,
+          CEO_PROFILE_ID
         )
       )}
       {rows.length === 0 && legacyRows.length === 0 && idleAgents.length === 0 && q && (
