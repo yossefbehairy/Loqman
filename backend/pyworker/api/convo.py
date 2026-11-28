@@ -45,13 +45,13 @@ def _fs_error(exc: WorkspaceFsError):
 def _conv_out(r: Dict[str, Any]) -> Dict[str, Any]:
     return {"id": r["id"], "title": r["title"], "workspace_id": r["workspace_id"],
             "profile_id": r.get("profile_id"),
-            "created_at": iso(r["created_at"]), "updated_at": iso(r["updated_at"])}
+            "created_at": iso_utc(r["created_at"]), "updated_at": iso_utc(r["updated_at"])}
 
 
 def _msg_out(r: Dict[str, Any]) -> Dict[str, Any]:
     return {"seq": r["seq"], "conversation_id": r["conversation_id"], "role": r["role"],
             "content": r["content"], "client_message_id": r["client_message_id"],
-            "created_at": iso(r["created_at"])}
+            "created_at": iso_utc(r["created_at"])}
 
 
 def _conversation(ctx, conversation_id: str) -> Dict[str, Any]:
@@ -82,6 +82,25 @@ async def conversations_create(ctx, params):
     return _conv_out(_conversation(ctx, cid))
 
 
+@method("conversations.bind_profile")
+async def conversations_bind_profile(ctx, params):
+    """Bind a conversation that has no agent yet (made before chats were profile-bound) to a profile.
+
+    Idempotent for the same profile; a conversation already bound to a different one is refused (409).
+    """
+    check_keys(params, {"conversation_id", "profile_id"})
+    conv = _conversation(ctx, req_str(params, "conversation_id", 1, 64))
+    from backend.pyworker.core.profiles import get_by_id
+    profile = get_by_id(ctx.db, req_str(params, "profile_id", 1, 64))
+    if profile is None:
+        raise api_error(404, "Profile not found")
+    if conv.get("profile_id") and conv["profile_id"] != profile["id"]:
+        raise api_error(409, "Conversation is already bound to another profile")
+    if not conv.get("profile_id"):
+        ctx.db.update("conversations", {"profile_id": profile["id"]}, "id=? AND profile_id IS NULL", (conv["id"],))
+    return _conv_out(_conversation(ctx, conv["id"]))
+
+
 @method("conversations.list")
 async def conversations_list(ctx, params):
     check_keys(params)
@@ -91,17 +110,28 @@ async def conversations_list(ctx, params):
 
 @method("conversations.import_ceo")
 async def conversations_import_ceo(ctx, params):
-    """Copy legacy CEO messages once while retaining the original history."""
+    """Copy the company-wide CEO log into the history conversation, each row exactly once.
+
+    ``ceo.ask`` with a ``conversation_id`` stores its exchange in that conversation only. Unscoped exchanges
+    are the ones that live in ``ceo_messages`` and get ids starting with "g" (never a UUID), so they are always
+    imported. Older rows have no such marker: they were also written for scoped asks, so only those created
+    before the history conversation are copied. Re-importing is a no-op (``ceo:<id>`` is the dedupe key).
+    """
     check_keys(params)
     db, cid = ctx.db, "legacy-ceo-history"
     with db.tx():
-        if not db.one("SELECT id FROM conversations WHERE id=?", (cid,)):
+        history = db.one("SELECT id, created_at FROM conversations WHERE id=?", (cid,))
+        if not history:
             now = ts()
             db.insert("conversations", {"id": cid, "title": "CEO history", "created_at": now, "updated_at": now})
+            cutoff = now
+        else:
+            cutoff = history["created_at"]
         existing = {r["client_message_id"] for r in db.all(
             "SELECT client_message_id FROM conversation_messages WHERE conversation_id=?", (cid,))}
         imported = 0
-        for old in db.all("SELECT * FROM ceo_messages ORDER BY seq, id"):
+        for old in db.all("SELECT * FROM ceo_messages WHERE created_at<=? OR id LIKE 'g%' ORDER BY seq, id",
+                           (cutoff,)):
             key = f"ceo:{old['id']}"
             if key in existing or old["role"] not in ("user", "assistant"):
                 continue
@@ -203,6 +233,19 @@ async def runs_start_turn(ctx, params):
         raise api_error(422, "Unsupported engine")
 
 
+@method("runs.list")
+async def runs_list(ctx, params):
+    """The newest runs of one conversation (oldest first), so a client needs no private index of run ids."""
+    check_keys(params, {"conversation_id"}, ("limit",))
+    cid = req_str(params, "conversation_id", 1, 64)
+    limit = opt_int(params, "limit", 50, 1, 200)
+    if ctx.db.one("SELECT id FROM conversations WHERE id=?", (cid,)) is None:
+        raise api_error(404, "Conversation not found")
+    rows = ctx.db.all("SELECT * FROM conversation_runs WHERE conversation_id=? "
+                      "ORDER BY created_at DESC, id DESC LIMIT ?", (cid, limit))
+    return {"runs": [ctx.runs.snapshot(r) for r in reversed(rows)]}
+
+
 @method("runs.get")
 async def runs_get(ctx, params):
     check_keys(params, {"run_id"})
@@ -292,9 +335,10 @@ async def runs_steer(ctx, params):
 @method("runs.events")
 async def runs_events(ctx, params):
     """Persisted lifecycle events after ``after_id`` (the pull form of the SSE stream)."""
-    check_keys(params, {"run_id"}, ("after_id",))
+    check_keys(params, {"run_id"}, ("after_id", "event_format"))
+    event_format = req_enum(params, "event_format", ("legacy", "normalised-v1")) if "event_format" in params else "legacy"
     try:
-        events = ctx.runs.list_events(req_str(params, "run_id", 1, 64), opt_int(params, "after_id", 0, 0, 2**62))
+        events = ctx.runs.list_events(req_str(params, "run_id", 1, 64), opt_int(params, "after_id", 0, 0, 2**62), event_format)
     except RunNotFound:
         raise api_error(404, "Run not found")
     return {"events": events}
@@ -303,13 +347,13 @@ async def runs_events(ctx, params):
 # -- workspaces & artifacts -------------------------------------------------------
 
 def _ws_out(r: Dict[str, Any]) -> Dict[str, Any]:
-    return {"id": r["id"], "name": r["name"], "path": r["path"], "created_at": iso(r["created_at"])}
+    return {"id": r["id"], "name": r["name"], "path": r["path"], "created_at": iso_utc(r["created_at"])}
 
 
 def _art_out(r: Dict[str, Any]) -> Dict[str, Any]:
     return {"id": r["id"], "workspace_id": r["workspace_id"], "run_id": r["run_id"],
             "relative_path": r["relative_path"], "mime": r["mime"], "size": r["size"],
-            "created_at": iso(r["created_at"])}
+            "created_at": iso_utc(r["created_at"])}
 
 
 def _workspace(ctx, workspace_id: str) -> Dict[str, Any]:
@@ -422,7 +466,7 @@ async def artifacts_content(ctx, params):
 # -- skill sources ------------------------------------------------------------------
 
 def _src_out(r: Dict[str, Any]) -> Dict[str, Any]:
-    return {"id": r["id"], "name": r["name"], "path": r["path"], "created_at": iso(r["created_at"])}
+    return {"id": r["id"], "name": r["name"], "path": r["path"], "created_at": iso_utc(r["created_at"])}
 
 
 def _source(ctx, source_id: str) -> Dict[str, Any]:
@@ -558,6 +602,15 @@ async def deliverables_list(ctx, params):
         return {"drafts": ctx.deliverables.list(req_str(params, "run_id", 1, 64))}
     except RunNotEligible as exc:
         raise _eligible(exc)
+
+
+@method("deliverables.list_all")
+async def deliverables_list_all(ctx, params):
+    check_keys(params, optional=("limit", "cursor"))
+    try:
+        return ctx.deliverables.list_all(opt_int(params, "limit", 200, 1, 500), opt_str(params, "cursor", 1, 200))
+    except ValueError:
+        raise bad("'cursor' is not a cursor returned by this method.")
 
 
 @method("deliverables.get")

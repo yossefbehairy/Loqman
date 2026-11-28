@@ -54,12 +54,14 @@ class RuntimeHealth:
 class ExecuteAgentTask:
     prompt: str
     model_id: str
-    provider_id: str = "opencode"
+    # Ledger provider id of the engine running the task (see providers.ENGINE_LEDGER_PROVIDERS). Always explicit:
+    # a forgotten value must not label another engine's work.
+    provider_id: str
     variant: Optional[str] = None
     task_depth: str = "Standard"
     session_title: str = "agentos-task"
     timeout: int = 90
-    # Locked OpenCode agent to run this task. None -> the work agent.
+    # OpenCode only: the locked agent to run this task (None -> its work agent). Other engines ignore it.
     agent_id: Optional[str] = None
     mcp_servers: Dict[str, Any] = field(default_factory=dict)
 
@@ -81,7 +83,7 @@ class AgentRuntime(Protocol):
 
     async def check_health(self) -> RuntimeHealth: ...
 
-    async def list_available_models(self, free_only: bool = True) -> List[ModelCatalogEntry]: ...
+    async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]: ...
 
     async def execute_task(self, task: ExecuteAgentTask) -> AgentResult: ...
 

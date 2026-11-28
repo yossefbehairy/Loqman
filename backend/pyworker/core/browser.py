@@ -4,13 +4,17 @@ import asyncio
 import base64
 import hashlib
 import json
+import ipaddress
 import os
+import socket
 import secrets
+import signal
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -18,6 +22,18 @@ from urllib.request import urlopen
 
 class BrowserError(Exception):
     pass
+
+
+def _check_public_url(url):
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError()
+        addresses = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        if not addresses or any(not ipaddress.ip_address(item[4][0].split("%")[0]).is_global for item in addresses):
+            raise ValueError()
+    except (ValueError, OSError):
+        raise BrowserError("Browser URL must resolve only to public addresses.") from None
 
 
 class Cdp:
@@ -82,6 +98,19 @@ class Cdp:
         async with asyncio.timeout(20):
             while True:
                 message = await self.receive()
+                if message.get("method") == "Fetch.requestPaused":
+                    paused = message["params"]
+                    try:
+                        await asyncio.to_thread(_check_public_url, paused["request"]["url"])
+                        method = "Fetch.continueRequest"
+                    except BrowserError:
+                        method = "Fetch.failRequest"
+                    self.next_id += 1
+                    params = {"requestId": paused["requestId"]}
+                    if method == "Fetch.failRequest":
+                        params["errorReason"] = "BlockedByClient"
+                    await self.send(json.dumps({"id": self.next_id, "method": method, "params": params}).encode())
+                    continue
                 if message.get("id") != request_id:
                     continue
                 if "error" in message:
@@ -97,6 +126,7 @@ class BrowserSession:
     def __init__(self):
         self.process = None
         self.profile = None
+        self._log = None
         self.cdp = None
         self.human_control = False
 
@@ -110,21 +140,26 @@ class BrowserSession:
         if not executable:
             raise BrowserError("Install Chromium, Chrome or Edge to enable browser tools.")
         self.profile = tempfile.TemporaryDirectory(prefix="agentos-browser-")
-        kwargs = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
-        self.process = await asyncio.create_subprocess_exec(
-            executable, "--headless=new", "--no-first-run", "--no-default-browser-check",
-            "--remote-debugging-port=0", f"--user-data-dir={self.profile.name}", "about:blank",
-            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL, **kwargs)
+        self._log = Path(self.profile.name + ".log")
+        # POSIX: own process group, so close() can stop Chromium's renderer/zygote children too.
+        kwargs = ({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32"
+                  else {"start_new_session": True})
+        with self._log.open("wb") as log:
+            self.process = await asyncio.create_subprocess_exec(
+                executable, "--headless=new", "--no-first-run", "--no-default-browser-check",
+                # CDP currently uses WebSockets, so local processes can still connect.
+                "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0", f"--user-data-dir={self.profile.name}", "about:blank",
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+                stderr=log, **kwargs)
         active_port = Path(self.profile.name) / "DevToolsActivePort"
-        for _ in range(100):
+        for _ in range(300):  # cold starts on shared CI runners can take well over 10s
             if active_port.exists():
                 break
             if self.process.returncode is not None:
-                raise BrowserError("Chromium failed to start.")
+                raise BrowserError("Chromium failed to start. " + self._log_tail())
             await asyncio.sleep(.1)
         if not active_port.exists():
-            raise BrowserError("Chromium debugging endpoint did not become ready.")
+            raise BrowserError("Chromium debugging endpoint did not become ready. " + self._log_tail())
         port = int(active_port.read_text().splitlines()[0])
 
         def targets():
@@ -137,6 +172,28 @@ class BrowserSession:
             raise BrowserError("Browser page unavailable.")
         self.cdp = Cdp()
         await self.cdp.connect(page["webSocketDebuggerUrl"])
+        await self.cdp.call("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
+
+    def _remove_profile(self):
+        # Chromium children may still be flushing files for a moment after the main process dies.
+        for attempt in range(20):
+            try:
+                shutil.rmtree(self.profile.name)
+                break
+            except FileNotFoundError:
+                break
+            except OSError:
+                if attempt == 19:
+                    shutil.rmtree(self.profile.name, ignore_errors=True)
+                else:
+                    time.sleep(.1)
+        self.profile.cleanup()
+
+    def _log_tail(self):
+        try:
+            return self._log.read_text("utf-8", "replace")[-1500:]
+        except OSError:
+            return ""
 
     async def evaluate(self, expression):
         result = await self.cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
@@ -174,6 +231,7 @@ class BrowserSession:
             url = args.get("url")
             if not isinstance(url, str) or len(url) > 4096 or urlsplit(url).scheme not in ("http", "https"):
                 raise BrowserError("Browser URL must use http or https.")
+            await asyncio.to_thread(_check_public_url, url)
             navigation = await self.cdp.call("Page.navigate", {"url": url})
             if navigation.get("errorText"):
                 raise BrowserError("Browser navigation failed.")
@@ -233,7 +291,12 @@ class BrowserSession:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             else:
-                self.process.kill()
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    self.process.kill()
             await self.process.wait()
         if self.profile is not None:
-            self.profile.cleanup()
+            await asyncio.to_thread(self._remove_profile)
+        if self._log is not None:
+            self._log.unlink(missing_ok=True)

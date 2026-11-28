@@ -5,9 +5,9 @@
  * Left out: mentions, thread references, GitHub references, attachments and
  * Mermaid, which depend on the RuseBot store.
  */
-import { memo, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createContext, memo, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import type { HighlighterCore } from 'shiki/core';
-import Markdown, { type Components } from 'react-markdown';
+import Markdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -21,13 +21,7 @@ import {
   parseFenceInfo,
 } from '../lib/code-block';
 import 'katex/dist/katex.min.css';
-
-const RTL_LETTER = /[֐-ࣿיִ-﷿ﹰ-﻿\u{10800}-\u{10FFF}\u{1E800}-\u{1EFFF}]/u;
-
-export function textDirection(value: string): 'rtl' | 'ltr' {
-  const strong = /\p{Letter}/u.exec(value);
-  return strong && RTL_LETTER.test(strong[0]) ? 'rtl' : 'ltr';
-}
+import { textDirection } from '../lib/textDirection';
 
 interface HastNode {
   type?: string;
@@ -141,20 +135,21 @@ async function highlightFence(code: string, lang: string): Promise<string> {
   });
 }
 
+/** True while the text is still streaming in: code is shown plain until the turn completes (highlighting every delta is costly). */
+const LiveText = createContext(false);
+
 export function CodeBlock({ code, lang, initialWrap = false }: { code: string; lang: string; initialWrap?: boolean }) {
-  const highlightable = code.length <= HIGHLIGHT_MAX_CHARS;
+  const streaming = useContext(LiveText);
+  const highlightable = !streaming && code.length <= HIGHLIGHT_MAX_CHARS;
   const key = `${lang}:${code}`;
-  const [html, setHtml] = useState<string | null>(() => (highlightable ? (highlightCache.get(key) ?? null) : null));
+  const [highlighted, setHtml] = useState<string | null>(() => (highlightable ? (highlightCache.get(key) ?? null) : null));
+  const html = highlightable ? (highlightCache.get(key) ?? highlighted) : highlighted;
   const [wrapLines, setWrapLines] = useState(initialWrap);
   const [copied, setCopied] = useState<'idle' | 'copied' | 'failed'>('idle');
 
   useEffect(() => {
     if (!highlightable) return;
-    const cached = highlightCache.get(key);
-    if (cached) {
-      setHtml(cached);
-      return;
-    }
+    if (highlightCache.get(key)) return;
     let alive = true;
     highlightFence(code, lang || 'text')
       .then((out) => {
@@ -282,6 +277,12 @@ function blockText2(children: HastNode[] | undefined): string {
 }
 
 const MARKDOWN_COMPONENTS: Components = {
+  img({ src, alt }) {
+    if (typeof src === 'string' && /^(?:data:image\/|blob:)/i.test(src)) {
+      return <img src={src} alt={alt ?? ''} />;
+    }
+    return <a href={src} target="_blank" rel="noreferrer" className="text-accent underline">{alt || src || 'Image'}</a>;
+  },
   pre: MarkdownCode,
   code({ children }: { children?: ReactNode }) {
     return (
@@ -305,7 +306,7 @@ const MARKDOWN_COMPONENTS: Components = {
     );
   },
   th({ children }: { children?: ReactNode }) {
-    return <th className="border-b border-hairline/40 px-2 py-1.5 text-start font-semibold">{children}</th>;
+    return <th className="border-b border-hairline/40 bg-ink/[0.04] px-2 py-1.5 text-start font-semibold">{children}</th>;
   },
   td({ children }: { children?: ReactNode }) {
     return <td className="border-b border-hairline/20 px-2 py-1.5 align-top">{children}</td>;
@@ -329,21 +330,21 @@ const MARKDOWN_COMPONENTS: Components = {
   },
   h1({ node, children }: BlockProps) {
     return (
-      <div dir={blockDirection(node)} className="mt-2 text-[16px] font-semibold">
+      <div dir={blockDirection(node)} role="heading" aria-level={1} className="md-heading mt-3 text-[17px] font-bold">
         {children}
       </div>
     );
   },
   h2({ node, children }: BlockProps) {
     return (
-      <div dir={blockDirection(node)} className="mt-2 text-[15.5px] font-semibold">
+      <div dir={blockDirection(node)} role="heading" aria-level={2} className="md-heading mt-3 text-[16px] font-bold">
         {children}
       </div>
     );
   },
   h3({ node, children }: BlockProps) {
     return (
-      <div dir={blockDirection(node)} className="mt-1.5 font-semibold">
+      <div dir={blockDirection(node)} role="heading" aria-level={3} className="md-heading mt-2 font-semibold">
         {children}
       </div>
     );
@@ -362,15 +363,18 @@ const MARKDOWN_COMPONENTS: Components = {
 
 const MATH = /\$\$[\s\S]+?\$\$|\$[^$\n]+\$|\\\(|\\\[/;
 
-function ChatMarkdownComponent({ text }: { text: string }) {
+function ChatMarkdownComponent({ text, live = false }: { text: string; live?: boolean }) {
   const rehype = useMemo(() => (MATH.test(text) ? [rehypeKatex] : []), [text]);
   return (
+    <LiveText.Provider value={live}>
     <div className="chat-md min-w-0 [&>*+*]:mt-2">
-      <Markdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={rehype} components={MARKDOWN_COMPONENTS}>
+      <Markdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={rehype} components={MARKDOWN_COMPONENTS}
+        urlTransform={(url, key, node) => node.tagName === 'img' && key === 'src' && /^(?:data:image\/|blob:)/i.test(url) ? url : defaultUrlTransform(url)}>
         {text}
       </Markdown>
     </div>
+    </LiveText.Provider>
   );
 }
 
-export const ChatMarkdown = memo(ChatMarkdownComponent, (a, b) => a.text === b.text);
+export const ChatMarkdown = memo(ChatMarkdownComponent, (a, b) => a.text === b.text && a.live === b.live);

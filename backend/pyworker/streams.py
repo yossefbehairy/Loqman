@@ -4,7 +4,7 @@
 ``{"type":"stream","stream_id":..,"event":<name>,"id":<int|null>,"data":{..}}``
 lines, ending with ``{"type":"stream_end","stream_id":..,"reason":..}``.
 Run streams replay from SQLite after ``last_event_id`` (gap-free resume);
-mission/execution streams replay their persisted state first, then tail live.
+mission streams replay their persisted state first, then tail live.
 Delivery applies back-pressure to the stream task only, never to the worker.
 """
 
@@ -22,7 +22,6 @@ from .engine.events import event_hub
 logger = logging.getLogger("agentos.streams")
 
 MAX_STREAMS = 64
-EXECUTION_TERMINAL = ("execution.finished", "execution.failed", "execution.cancelled")
 MISSION_TERMINAL = ("succeeded", "failed", "partially_succeeded", "cancelled")
 Emit = Callable[[Dict[str, Any]], Awaitable[None]]
 
@@ -38,13 +37,14 @@ class StreamRegistry:
     def count(self) -> int:
         return len(self._streams)
 
-    def open(self, topic: str, key: str, last_event_id: int = 0) -> str:
+    def open(self, topic: str, key: str, last_event_id: int = 0, event_format: str = "legacy") -> str:
+        if event_format not in {"legacy", "normalised-v1"}:
+            raise ValueError("Unknown event format")
         if len(self._streams) >= self._max:
             raise TooManyRuns("Too many event streams")
         sid = uuid.uuid4().hex
-        pump = {"run": self._pump_run, "mission": self._pump_mission,
-                "execution": self._pump_execution}[topic]
-        task = asyncio.get_running_loop().create_task(self._guard(sid, pump, key, last_event_id),
+        pump = {"run": self._pump_run, "mission": self._pump_mission}[topic]
+        task = asyncio.get_running_loop().create_task(self._guard(sid, pump, key, last_event_id, event_format),
                                                       name=f"stream-{topic}-{sid[:8]}")
         self._streams[sid] = task
         task.add_done_callback(lambda _t, s=sid: self._streams.pop(s, None))
@@ -65,10 +65,13 @@ class StreamRegistry:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _guard(self, sid: str, pump, key: str, last: int) -> None:
+    async def _guard(self, sid: str, pump, key: str, last: int, event_format: str) -> None:
         reason = "complete"
         try:
-            await pump(sid, key, last)
+            if pump == self._pump_run:
+                await pump(sid, key, last, event_format)
+            else:
+                await pump(sid, key, last)
         except asyncio.CancelledError:
             reason = "closed"
             raise
@@ -84,9 +87,9 @@ class StreamRegistry:
     def _msg(self, sid: str, event: str, data: Any, id_: Optional[int] = None) -> Dict[str, Any]:
         return {"type": "stream", "stream_id": sid, "event": event, "id": id_, "data": data}
 
-    async def _pump_run(self, sid: str, run_id: str, last: int) -> None:
+    async def _pump_run(self, sid: str, run_id: str, last: int, event_format: str = "legacy") -> None:
         try:
-            async for ev in self._ctx.runs.iter_events(run_id, last):
+            async for ev in self._ctx.runs.iter_events(run_id, last, event_format):
                 if ev is None:
                     continue  # heartbeat: not needed on a pipe
                 await self._emit(self._msg(sid, ev["type"], ev["data"], ev["id"]))
@@ -119,33 +122,3 @@ class StreamRegistry:
                     return
         finally:
             event_hub.unsubscribe(mission_id, q)
-
-    async def _pump_execution(self, sid: str, execution_id: str, last: int) -> None:
-        from .core import executions as ex
-
-        db = self._ctx.db
-        q = event_hub.subscribe(execution_id)  # subscribe BEFORE the DB read: no lost gap
-        try:
-            for e in ex.execution_events(db, execution_id):
-                try:
-                    data = json.loads(e["event_json"])
-                except Exception:
-                    data = {"raw": e["event_json"]}
-                await self._emit(self._msg(sid, e["event_type"], data))
-            current = ex.execution_get(db, execution_id)
-            if not current or current["status"] in ("succeeded", "failed", "cancelled"):
-                if current:
-                    event = {"succeeded": "execution.finished", "failed": "execution.failed",
-                             "cancelled": "execution.cancelled"}[current["status"]]
-                    await self._emit(self._msg(sid, event, {
-                        "executionId": execution_id, "status": current["status"]}))
-                return
-            while True:
-                ev = await q.get()
-                if ev["event"] == "stream.overflow":
-                    return
-                await self._emit(self._msg(sid, ev["event"], ev["data"]))
-                if ev["event"] in EXECUTION_TERMINAL:
-                    return
-        finally:
-            event_hub.unsubscribe(execution_id, q)

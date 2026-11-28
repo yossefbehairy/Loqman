@@ -1,0 +1,20 @@
+/*
+ * Self-hosted fonts (SIL Open Font License 1.1, via @fontsource). The app makes
+ * no network request for fonts: the packaged CSP allows font-src 'self' only.
+ * Families match the names used in styles.css: Inter (default), Poppins (font
+ * option), Plus Jakarta Sans (one theme). Latin and Latin-ext subsets only; Arabic
+ * text falls back to the system UI font as before.
+ */
+@import "@fontsource/inter/latin-400.css";
+@import "@fontsource/inter/latin-500.css";
+@import "@fontsource/inter/latin-600.css";
+@import "@fontsource/inter/latin-700.css";
+@import "@fontsource/inter/latin-ext-400.css";
+@import "@fontsource/inter/latin-ext-600.css";
+@import "@fontsource/poppins/latin-400.css";
+@import "@fontsource/poppins/latin-500.css";
+@import "@fontsource/poppins/latin-600.css";
+@import "@fontsource/plus-jakarta-sans/latin-400.css";
+@import "@fontsource/plus-jakarta-sans/latin-500.css";
+@import "@fontsource/plus-jakarta-sans/latin-600.css";
+@import "@fontsource/plus-jakarta-sans/latin-700.css";

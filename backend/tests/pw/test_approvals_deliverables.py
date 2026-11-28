@@ -28,7 +28,7 @@ async def active_run(api, rt):
 @pytest.mark.asyncio
 async def test_capabilities_match_enforced_workspace_approvals(api):
     caps = await api("approvals.capabilities")
-    assert set(caps) == {"opencode", "claude-code", "codex", "agy"}
+    assert set(caps) == {"opencode", "claude-code", "codex", "antigravity"}
     assert caps["claude-code"]["tool_approvals"] is True
     assert caps["claude-code"]["scope"] == "workspace_write"
     assert all(not c["tool_approvals"] for name, c in caps.items() if name != "claude-code")
@@ -197,3 +197,54 @@ async def test_empty_oversized_and_too_many(rig):
     for i in range(10):
         await api("deliverables.create", run_id=many, filename=f"f{i}.txt")
     assert (await api.fail("deliverables.create", run_id=many, filename="one-too-many.txt")).status == 429
+
+
+@pytest.mark.asyncio
+async def test_runs_and_drafts_are_listable_without_a_client_side_index(rig):
+    api, rt = rig
+    rt.gated, rt.text = False, "reply one"
+    cid = await new_conv(api)
+    first = await api("runs.start_turn", conversation_id=cid, engine="codex", model_id="m", prompt="one")
+    await wait_status(api, first["id"], "succeeded")
+    rt.text = "reply two"
+    second = await api("runs.start_turn", conversation_id=cid, engine="codex", model_id="m", prompt="two")
+    await wait_status(api, second["id"], "succeeded")
+    other = await new_conv(api)
+    elsewhere = await api("runs.start_turn", conversation_id=other, engine="codex", model_id="m", prompt="x")
+    await wait_status(api, elsewhere["id"], "succeeded")
+
+    runs = (await api("runs.list", conversation_id=cid))["runs"]
+    assert [r["id"] for r in runs] == [first["id"], second["id"]]  # oldest first, this conversation only
+    assert runs[1]["assistant_content"] == "reply two" and runs[0]["assistant_message_seq"] is not None
+    assert [r["id"] for r in (await api("runs.list", conversation_id=cid, limit=1))["runs"]] == [second["id"]]
+    assert (await api.fail("runs.list", conversation_id="missing")).status == 404
+
+    d1 = await api("deliverables.create", run_id=first["id"])
+    d2 = await api("deliverables.create", run_id=elsewhere["id"])
+    listed = (await api("deliverables.list_all"))["drafts"]
+    assert {d["id"] for d in listed} == {d1["id"], d2["id"]}
+    by_id = {d["id"]: d for d in listed}
+    assert by_id[d1["id"]]["conversation_id"] == cid and by_id[d1["id"]]["run_id"] == first["id"]
+    assert by_id[d2["id"]]["conversation_id"] == other and by_id[d1["id"]]["content"] is None
+    assert len((await api("deliverables.list_all", limit=1))["drafts"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_list_all_drafts_pages_with_an_exclusive_cursor(rig):
+    api, rt = rig
+    run = await succeeded_run(api, rt, text="ok")
+    made = [(await api("deliverables.create", run_id=run, filename=f"f{i}.txt"))["id"] for i in range(5)]
+    # identical timestamps: the id tie-break must keep the order stable and the cursor exclusive
+    api.db.execute("UPDATE deliverable_drafts SET created_at='2030-01-01 00:00:00.000000'")
+    seen, cursor, pages = [], None, 0
+    while True:
+        out = await api("deliverables.list_all", limit=2, **({"cursor": cursor} if cursor else {}))
+        pages += 1
+        seen += [d["id"] for d in out["drafts"]]
+        cursor = out["next_cursor"]
+        if cursor is None:
+            break
+    assert pages == 3 and sorted(seen) == sorted(made) and len(set(seen)) == 5
+    assert seen == sorted(made, reverse=True)
+    assert (await api.fail("deliverables.list_all", cursor="garbage")).status == 422
+    assert (await api("deliverables.list_all", limit=500))["next_cursor"] is None

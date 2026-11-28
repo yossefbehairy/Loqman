@@ -47,8 +47,8 @@ jobs:
       - name: Typecheck
         working-directory: frontend
         run: npx tsc -b
-      - name: Stream lifecycle regressions
-        run: node --test frontend/electron/transport.test.cjs
+      - name: Electron layer tests (main, worker client, transport, bridge, security, backup)
+        run: node --test "frontend/electron/*.test.cjs"
       - name: Lint
         working-directory: frontend
         run: npm run lint
@@ -92,3 +92,28 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  frozen-worker:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install backend and build dependencies
+        shell: pwsh
+        run: |
+          python -m venv backend/.venv
+          backend/.venv/Scripts/python.exe -m pip install -r backend/requirements.txt pyinstaller
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build frozen worker
+        shell: pwsh
+        run: ./pyinstaller/build-backend.ps1
+      - name: Smoke-test frozen worker
+        shell: pwsh
+        run: ./pyinstaller/smoke-test.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentos-backend-windows-x64
+          path: backend/dist/agentos-backend.exe
+          if-no-files-found: error

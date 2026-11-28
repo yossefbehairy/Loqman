@@ -4,13 +4,36 @@
 // every file under electron/ must use the .cjs extension.
 'use strict';
 
-const { app, BrowserWindow, Menu, dialog, shell, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, ipcMain, session } = require('electron');
 const path = require('node:path');
 const { WorkerClient, workerCommand, METHOD_RE } = require('./worker-client.cjs');
+const { guardNavigation } = require('./navigation.cjs');
+const { saveBackup } = require('./backup.cjs');
+const { configureSession } = require('./security.cjs');
+const fs = require('node:fs/promises');
 
 const isDev = !app.isPackaged;
 
-app.setAppUserModelId('app.loqman.desktop');
+// Explicit renderer capabilities. Source-call coverage lives in main.test.cjs.
+const RENDERER_METHODS = new Set([
+  'approvals.decide', 'approvals.list',
+  'ceo.actions', 'ceo.approve', 'ceo.ask', 'ceo.ask_progress', 'ceo.deny',
+  'conversations.add_message', 'conversations.bind_profile', 'conversations.create',
+  'conversations.import_ceo', 'conversations.list', 'conversations.messages',
+  'deliverables.content', 'deliverables.create', 'deliverables.decide',
+  'deliverables.get', 'deliverables.list', 'deliverables.list_all',
+  'engines.capabilities', 'engines.check', 'engines.models', 'engines.open_setup',
+  'engines.setup', 'engines.status', 'engines.test',
+  'missions.cancel', 'missions.create', 'missions.delegate', 'missions.list',
+  'models.free', 'preferences.get', 'preferences.set_default',
+  'profiles.create', 'profiles.delete', 'profiles.list', 'profiles.update',
+  'runs.cancel', 'runs.events', 'runs.get', 'runs.list', 'runs.start_turn',
+  'usage.summary',
+]);
+
+// Must equal build.appId in package.json: the NSIS installer stamps its shortcuts with that id, and Windows
+// groups the running window (taskbar pin, notifications) only when the app reports the same one.
+app.setAppUserModelId('com.agentos.desktop');
 // Keep userData deterministic across dev and packaged builds: %APPDATA%\Loqman
 // (must run before the first getPath('userData') call).
 app.setName('Loqman');
@@ -33,6 +56,7 @@ let splashWindow = null;
 let worker = null;
 /** stream_id -> webContents that opened it. @type {Map<string, Electron.WebContents>} */
 const streamOwners = new Map();
+const streamGenerations = new WeakMap();
 let backendRestartCount = 0;
 let restartingBackend = false;
 let quitting = false;
@@ -80,10 +104,12 @@ function spawnBackend() {
   worker = child;
   child.on('log', logBackend);
   child.on('stream', (msg) => {
+    if (child !== worker) return;
     const owner = streamOwners.get(msg.stream_id);
     if (owner && !owner.isDestroyed()) owner.send('agentos:stream', msg);
   });
   child.on('stream_end', (msg) => {
+    if (child !== worker) return;
     const owner = streamOwners.get(msg.stream_id);
     streamOwners.delete(msg.stream_id);
     if (owner && !owner.isDestroyed()) owner.send('agentos:stream', msg);
@@ -135,8 +161,9 @@ function registerIpc() {
 
   ipcMain.handle('agentos:call', async (event, method, params) => {
     if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
-    if (typeof method !== 'string' || !METHOD_RE.test(method) || method === 'shutdown') {
-      throw new Error('Invalid method');
+    if (typeof method !== 'string' || !METHOD_RE.test(method) ||
+        !RENDERER_METHODS.has(method)) {
+      throw new Error('Invalid method: renderer method is not allowed');
     }
     if (!worker) throw new Error('Backend is not running');
     try {
@@ -149,14 +176,40 @@ function registerIpc() {
     }
   });
 
-  ipcMain.handle('agentos:stream-open', async (event, topic, id, lastEventId) => {
+  ipcMain.handle('agentos:backup-save', async (event) => {
+    if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
+    if (!worker) throw new Error('Backend is not running');
+    const owner = worker; // Cleanup must use the worker that created the backup.
+    try {
+      return await saveBackup({
+        call: (method, params) => owner.request(method, params),
+        dialog: { showSaveDialog: (options) => dialog.showSaveDialog(mainWindow, options) },
+        fs, documentsPath: app.getPath('documents'),
+      });
+    } catch (error) {
+      throw new Error(JSON.stringify({ status: error.status || null, detail: error.detail ?? error.message }));
+    }
+  });
+
+  ipcMain.handle('agentos:stream-open', async (event, topic, id, lastEventId, eventFormat) => {
     if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
     if (!worker) throw new Error('Backend is not running');
     const params = { topic, id };
     if (Number.isInteger(lastEventId) && lastEventId > 0) params.last_event_id = lastEventId;
+    // Only the one known format is forwarded; anything else keeps the legacy stream.
+    if (eventFormat === 'normalised-v1') params.event_format = 'normalised-v1';
+    const owner = worker;
+    const generation = streamGenerations.get(event.sender);
     try {
-      const { stream_id: streamId } = await worker.request('stream.open', params, 15000,
-        ({ stream_id }) => streamOwners.set(stream_id, event.sender));
+      const { stream_id: streamId } = await owner.request('stream.open', params, 15000,
+        ({ stream_id }) => {
+          if (event.sender.isDestroyed() || owner !== worker || quitting ||
+              streamGenerations.get(event.sender) !== generation) {
+            void owner.request('stream.close', { stream_id }, 5000).catch(() => {});
+            return;
+          }
+          streamOwners.set(stream_id, event.sender);
+        });
       return streamId;
     } catch (error) {
       throw new Error(JSON.stringify({ status: (error && error.status) || null, detail: (error && error.detail) || (error && error.message) || 'Stream failed' }));
@@ -165,7 +218,7 @@ function registerIpc() {
 
   ipcMain.handle('agentos:stream-close', async (event, streamId) => {
     if (!fromMainWindow(event)) throw new Error('Unauthorized caller');
-    if (typeof streamId !== 'string' || !worker) return false;
+    if (typeof streamId !== 'string' || !worker || streamOwners.get(streamId) !== event.sender) return false;
     streamOwners.delete(streamId);
     try {
       return (await worker.request('stream.close', { stream_id: streamId }, 5000)).closed;
@@ -256,6 +309,20 @@ function createMainWindow() {
   });
 
   mainWindow = win;
+  guardNavigation(win.webContents, (url) => shell.openExternal(url));
+  const releaseStreams = () => {
+    streamGenerations.set(win.webContents, (streamGenerations.get(win.webContents) || 0) + 1);
+    for (const [id, owner] of streamOwners) {
+      if (owner !== win.webContents) continue;
+      streamOwners.delete(id);
+      if (worker) void worker.request('stream.close', { stream_id: id }, 5000).catch(() => {});
+    }
+  };
+  win.webContents.on('destroyed', releaseStreams);
+  win.webContents.on('render-process-gone', releaseStreams);
+  win.webContents.on('did-start-navigation', (_event, _url, inPlace, isMainFrame) => {
+    if (isMainFrame && !inPlace) releaseStreams();
+  });
 
   win.once('ready-to-show', () => {
     if (win.isDestroyed()) return;
@@ -318,10 +385,10 @@ function buildMenu() {
         { role: 'quit' },
       ],
     },
-    {
+    ...(isDev ? [{
       label: 'View',
       submenu: [{ role: 'toggleDevTools' }],
-    },
+    }] : []),
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -401,6 +468,7 @@ async function promptBackendCrash(code, signal) {
     ? await dialog.showMessageBox(parent, options)
     : await dialog.showMessageBox(options);
 
+  if (quitting) return;
   if (result.response === 0) {
     await restartBackend();
   } else {
@@ -480,6 +548,7 @@ if (!hasSingleInstanceLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
+    if (quitting) return;
     const target = mainWindow && !mainWindow.isDestroyed() ? mainWindow : splashWindow;
     if (target && !target.isDestroyed()) {
       if (target.isMinimized()) target.restore();
@@ -494,7 +563,14 @@ if (!hasSingleInstanceLock) {
   });
 
   registerIpc();
-  app.whenReady().then(boot);
+  app.whenReady().then(() => {
+    configureSession(session.defaultSession, {
+      isPackaged: app.isPackaged,
+      rendererFile: path.join(__dirname, '..', 'dist', 'index.html'),
+      getMainContents: () => mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    });
+    return boot();
+  });
 
   app.on('window-all-closed', () => {
     console.error('[exit-trace] window-all-closed firing (all windows are gone)');
@@ -508,6 +584,10 @@ if (!hasSingleInstanceLock) {
   let stoppingWorker = false;
   app.on('before-quit', (event) => {
     quitting = true;
+    if (stoppingWorker) {
+      event.preventDefault();
+      return;
+    }
     // Graceful: the worker persists in-flight runs as interrupted before exiting.
     if (worker && !stoppingWorker) {
       stoppingWorker = true;
@@ -517,6 +597,7 @@ if (!hasSingleInstanceLock) {
       streamOwners.clear();
       closing.stop(5000).catch(() => {}).finally(() => {
         closing.kill();
+        stoppingWorker = false;
         app.quit();
       });
     }

@@ -65,19 +65,19 @@ def fake(tmp_path, monkeypatch):
     script = tmp_path / "fake_claude.py"
     script.write_text(FAKE, encoding="utf-8")
     log = tmp_path / "log.json"
-    monkeypatch.setenv("FAKE_LOG", str(log))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-stripped")
 
     def make(mode="ok", **kw):
-        monkeypatch.setenv("FAKE_MODE", mode)
-        return ClaudeCodeRuntime(cli_cmd=[sys.executable, str(script)], **kw)
+        # S5: the child environment is an allowlist, so the fake's control variables are passed explicitly.
+        return ClaudeCodeRuntime(cli_cmd=[sys.executable, str(script)],
+                                 extra_env={"FAKE_MODE": mode, "FAKE_LOG": str(log)}, **kw)
 
     make.log = lambda: json.loads(log.read_text(encoding="utf-8"))
     return make
 
 
 def task(**kw):
-    base = dict(prompt="ping", model_id="sonnet", session_title="t1", timeout=30)
+    base = dict(prompt="ping", model_id="sonnet", provider_id="anthropic", session_title="t1", timeout=30)
     base.update(kw)
     return ExecuteAgentTask(**base)
 
@@ -203,7 +203,7 @@ def test_models_never_free_or_verified():
     rt = ClaudeCodeRuntime(cli_cmd=["nonexistent"])
     assert run(rt.list_available_models(free_only=True)) == []
     ms = run(rt.list_available_models(free_only=False))
-    assert {m.id for m in ms} == {"sonnet", "opus", "haiku"}
+    assert {"sonnet", "opus", "haiku"} <= {m.id for m in ms}
     assert all(not m.is_free and m.status == "unverified" for m in ms)
 
 
@@ -213,7 +213,14 @@ def test_factory_selection_and_default(monkeypatch):
     monkeypatch.setattr(rtpkg, "_runtime_instance", None)
     monkeypatch.setattr(rtpkg.settings, "RUNTIME_MODE", "real")
     assert isinstance(rtpkg.get_runtime(), RealOpenCodeRuntime)   # default untouched
+    monkeypatch.setattr(rtpkg, "_engine_instances", {})
+    assert isinstance(rtpkg.get_runtime("claude-code"), ClaudeCodeRuntime)   # chosen by engine id, not by RUNTIME_MODE
     monkeypatch.setattr(rtpkg, "_runtime_instance", None)
-    monkeypatch.setattr(rtpkg.settings, "RUNTIME_MODE", "claude")
-    assert isinstance(rtpkg.get_runtime(), ClaudeCodeRuntime)
-    monkeypatch.setattr(rtpkg, "_runtime_instance", None)
+
+
+def test_catalog_lists_aliases_full_ids_and_long_context_variants():
+    rt = ClaudeCodeRuntime(cli_cmd=["nonexistent"])
+    ids = [m.id for m in run(rt.list_available_models(free_only=False))]
+    assert ids[:3] == ["sonnet", "opus", "haiku"]  # the default stays the first alias
+    for expected in ("claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "sonnet[1m]", "opus[1m]"):
+        assert expected in ids

@@ -7,10 +7,10 @@ Desktop packaging for AgentOS uses **Electron** (shell + UI) and **PyInstaller**
 ## 1. Architecture
 
 ```
-AgentOS-Setup-x.x.x.exe (electron-builder · NSIS)
-└── AgentOS.exe  (Electron)
+Loqman-Setup-x.x.x.exe (electron-builder · NSIS)
+└── Loqman.exe  (Electron)
     ├── app.asar
-    │   ├── electron/         ← main.cjs · preload.cjs · splash.html
+    │   ├── electron/         ← main.cjs · preload.cjs · worker-client.cjs · splash.html
     │   └── dist/             ← built React frontend (vite, base "./")
     └── resources/
         └── agentos-backend.exe   ← frozen Python worker (PyInstaller onefile)
@@ -19,7 +19,7 @@ Runtime:
   Electron main ──spawns──▶ agentos-backend.exe --data-dir <userData>   (Python worker, stdlib only)
   Electron main ◀──ready──  first stdout line; JSON Lines over stdin/stdout (docs/PYWORKER.md)
   Renderer (file://) ─────▶ window.agentos.call(method, params) / openStream(...)  (preload → IPC → main → worker)
-  SQLite data ────────────▶ %APPDATA%\AgentOS\agentos.db
+  SQLite data ────────────▶ %APPDATA%\Loqman\agentos.db
 ```
 
 Key properties:
@@ -29,7 +29,7 @@ Key properties:
 | Renderer load path | `file://…/app.asar/dist/index.html` (packaged) or `http://127.0.0.1:5173` (dev) |
 | API in renderer | `window.agentos.call(method, params)` / `openStream(...)` (exposed by `electron/preload.cjs`); a plain browser uses the dev-only Vite bridge |
 | Backend transport | stdin/stdout pipes to the worker — no HTTP server, no ports, no token, no CORS |
-| Database location | `app.getPath('userData')` → `%APPDATA%\AgentOS\agentos.db` (WAL mode) |
+| Database location | `app.getPath('userData')` → `%APPDATA%\Loqman\agentos.db` (WAL mode). `main.cjs` calls `app.setName('Loqman')` so dev and packaged builds share the folder |
 | Backend lifecycle | Stopped gracefully on quit (`shutdown`, in-flight runs saved as interrupted); killed with its process tree if it lingers |
 | Single instance | Enforced via `app.requestSingleInstanceLock()` |
 
@@ -56,6 +56,10 @@ npm run desktop
 
 With `AGENTOS_DEV_SERVER_URL` set, Electron loads the Vite server. Otherwise `npm run desktop` builds and loads the local `dist` files. Electron spawns the worker with the venv Python (`python -m backend.pyworker --data-dir <userData>`) and talks to it over stdin/stdout.
 
+`npm run desktop` uses `electron/launch.cjs`, which removes inherited `ELECTRON_RUN_AS_NODE` before spawning Electron (including VS Code terminals). `Start-Loqman.bat` also clears it for packaged and installed copies. `desktop:dist` only packages the app; it does not launch Electron.
+
+External HTTP/HTTPS links open in the default browser. Popup windows and renderer navigation away from the app are blocked; other URL schemes are not opened.
+
 For plain-browser development just run `npm run dev`: a serve-only Vite plugin (`frontend/vite-agentos-bridge.mjs`) spawns the same worker (`RUNTIME_MODE` from the environment, default mock; data in `.agentos-dev-data`).
 
 ---
@@ -80,7 +84,7 @@ Verify the frozen backend standalone:
 powershell -ExecutionPolicy Bypass -File pyinstaller\smoke-test.ps1
 ```
 
-The smoke test spawns the exe with a temp data dir and the mock engine, waits for the `ready` line, sends `health`, asserts `agentos.db` was created, then sends `shutdown` and checks a clean exit. Expected cold start: ~1 s.
+The smoke test spawns the exe with a temp data dir and the mock engine, waits for the `ready` line, sends `health`, asserts `agentos.db` was created, then sends `shutdown` and checks a clean exit. It fails if the `ready` line does not arrive within its timeout.
 
 ### Step 2 — Build the frontend
 
@@ -98,7 +102,7 @@ cd d:\AgentOS\frontend
 npm run desktop:dist          # npm run build && electron-builder --win --x64
 ```
 
-Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` → the user picks the install directory; per-user by default).
+Output: `frontend\release\Loqman-Setup-<version>.exe` (NSIS, `oneClick: false` → the user picks the install directory; per-user by default).
 
 > `electron-builder` **requires** `frontend\build-resources\agentos-backend.exe` to exist (Step 1). Packaging fails without it.
 
@@ -110,18 +114,35 @@ Output: `frontend\release\AgentOS-Setup-<version>.exe` (NSIS, `oneClick: false` 
 
 | Flag | Description |
 |---|---|
-| `--data-dir <path>` | SQLite lives at `<path>gentos.db` |
+| `--data-dir <path>` | SQLite lives at `<path>\agentos.db` |
 | `--db <file>` | Explicit database file (alternative to `--data-dir`) |
-| `--runtime-mode real\|mock\|claude\|codex\|agy` | Overrides `RUNTIME_MODE` |
+| `--runtime-mode real\|mock` | Overrides `RUNTIME_MODE` |
 
 **Protocol:** JSON Lines on stdin/stdout (`agentos-worker/1`, see `docs/PYWORKER.md`). The first stdout line is `ready`; startup failures send a `fatal` line and exit with code 2. Logs go to stderr only.
 
 **Preload bridge:** `electron/preload.cjs` exposes exactly two globals via `contextBridge` (context isolation ON, node integration OFF):
 
-- `window.agentos` — `call(method, params)` and `openStream(topic, id, lastEventId, onMessage)`
+- `window.agentos` — `call(method, params)`, `openStream(topic, id, lastEventId, onMessage)`, and `saveBackup()`
 - `window.__AGENTOS_DESKTOP__` — `true`
 
-Any new frontend backend call must go through `frontend/src/api/client.ts` (`call` from `transport.ts`); event streams use `openStream`.
+Any new frontend backend call must go through `call` from `frontend/src/api/transport.ts` (typed wrappers live in `frontend/src/rusebot/data/worker.ts`); event streams use `openStream`.
+
+**Desktop backup:** call `window.agentos.saveBackup()` with no arguments. It returns
+`Promise<{ saved: boolean, path?: string, size?: number, cancelled?: boolean }>`:
+success is `{ saved: true, path, size }`; cancel is `{ saved: false, cancelled: true }`.
+Errors reject using the existing bridge JSON error-message format (`status`, `detail`).
+The native Save dialog defaults to the worker's backup filename in Documents. Only the
+worker-created source is copied, then `backup.cleanup` is attempted even on cancellation
+or a copy/dialog error. A failed create has no returned path to clean; worker death can
+prevent cleanup. Cleanup failures reject (an earlier copy/dialog error takes precedence).
+Generic `call()` rejects `backup.*`, `stream.*`, and `shutdown`; use the dedicated bridge APIs.
+Renderer TypeScript declarations/UI wiring are maintained separately from the desktop shell.
+
+Worker startup errors and crashes reject pending requests; shutdown is bounded and repeat
+quit requests wait for it. Stream ownership is checked on close and released on renderer
+reload, crash, or destruction. A second launch focuses the active window and cannot reboot
+the app during shutdown. The existing three-second window fallback closes the splash if
+`ready-to-show` never arrives.
 
 ---
 
@@ -129,7 +150,7 @@ Any new frontend backend call must go through `frontend/src/api/client.ts` (`cal
 
 | Symptom | Cause / Fix |
 |---|---|
-| Splash shows "backend failed to start" | Read the last `[backend]` log lines shown on the splash. Typical: antivirus quarantined `agentos-backend.exe`, or a database newer than this version |
+| Splash shows "Startup failed", then a dialog titled "Loqman failed to start" | The dialog shows the last backend log lines and offers Retry or Quit. Typical: antivirus quarantined `agentos-backend.exe`, or a database newer than this version |
 | Packaging fails: `file not found: build-resources\agentos-backend.exe` | Run Step 1 (PyInstaller build) first |
 | Blank window in packaged app | `base: './'` missing from `vite.config.ts`, or `dist/` not rebuilt before packaging |
 | Missions never progress | The AI runtime (`OPENCODE_BASE_URL`, default `http://127.0.0.1:49100`) is external to the desktop package and must be running |

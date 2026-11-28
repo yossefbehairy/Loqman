@@ -25,11 +25,10 @@ async def test_drains_both_pipes_while_writing_stdin():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("channel", ["stdout", "stderr"])
-@pytest.mark.parametrize("engine", ["claude", "codex", "agy", "opencode"])
+@pytest.mark.parametrize("engine", ["claude", "codex", "opencode"])
 async def test_adapter_kills_on_output_limit(tmp_path, monkeypatch, channel, engine):
     from backend.pyworker.runtime.claude_runtime import ClaudeCodeRuntime
     from backend.pyworker.runtime.codex_runtime import CodexCliRuntime
-    from backend.pyworker.runtime.agy_runtime import AgyCliRuntime
     from backend.pyworker.runtime.opencode_runtime import RealOpenCodeRuntime
 
     script = tmp_path / "flood.py"
@@ -40,7 +39,7 @@ async def test_adapter_kills_on_output_limit(tmp_path, monkeypatch, channel, eng
         "while True:\n"
         " stream.write(b'x'*65536); stream.flush()\n", encoding="utf-8")
     classes = {"claude": ClaudeCodeRuntime, "codex": CodexCliRuntime,
-               "agy": AgyCliRuntime, "opencode": RealOpenCodeRuntime}
+               "opencode": RealOpenCodeRuntime}
     runtime = classes[engine]()
     if engine != "opencode":
         runtime._cmd = [sys.executable, str(script)]
@@ -64,7 +63,7 @@ async def test_adapter_kills_on_output_limit(tmp_path, monkeypatch, channel, eng
         operation = runtime._run_cli_api("GET", "/api/model", timeout=15)
     else:
         operation = runtime.execute_task(
-            ExecuteAgentTask(prompt="hello", model_id="model", session_title="flood", timeout=15))
+            ExecuteAgentTask(prompt="hello", model_id="model", provider_id="x", session_title="flood", timeout=15))
     with pytest.raises(RuntimeOutputLimit):
         await asyncio.wait_for(operation, 20)
     assert len(spawned) == 1 and spawned[0].returncode is not None

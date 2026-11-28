@@ -14,7 +14,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 
 from .core import Database
-from .schema import INDEXES, SCHEMA_VERSION, TABLES
+from .schema import DRIVER_COLUMNS, INDEXES, SCHEMA_VERSION, TABLES
 
 
 class SchemaTooNew(RuntimeError):
@@ -114,6 +114,8 @@ def init_db(db: Database) -> None:
                 "started_at", "finished_at", "tool_config_json", "profile_snapshot_json",
             },
         }
+        for table, columns in DRIVER_COLUMNS.items():
+            added.setdefault(table, set()).update(columns)
         recognized = own & set(TABLES)
         if not recognized:
             raise ForeignDatabase("The file is not an AgentOS database; refusing to modify it.")
@@ -158,11 +160,17 @@ def init_db(db: Database) -> None:
         _add_column(db, "conversations", "workspace_id",
                     "VARCHAR(36) REFERENCES workspaces(id) ON DELETE SET NULL")
         _add_column(db, "conversations", "profile_id", "VARCHAR(64)")
+    for table, columns in DRIVER_COLUMNS.items():
+        for column, declaration in columns.items():
+            _add_column(db, table, column, declaration)
     # Indexes the legacy upgrade path added explicitly to pre-existing tables.
     explicit = {"conversations": ("ix_conversations_workspace_id",),
                 "missions": ("ix_missions_source_conversation_id",),
                 "usage_events": ("ix_usage_events_run_id",),
-                "conversation_runs": ("uq_runs_request_key", "uq_conversation_runs_one_active")}
+                "conversation_runs": ("uq_runs_request_key", "uq_conversation_runs_one_active"),
+                "conversation_run_events": ("uq_run_driver_event",),
+                "runtime_sessions": ("uq_runtime_sessions_native",),
+                "approvals": ("uq_approval_runtime_request",)}
     for table, names in explicit.items():
         if table in existing and table not in created:
             for ddl in INDEXES.get(table, []):

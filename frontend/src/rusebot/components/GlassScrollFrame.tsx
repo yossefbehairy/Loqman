@@ -5,27 +5,9 @@
 import { useLayoutEffect, useRef, type HTMLAttributes, type ReactNode } from "react";
 
 import { cn } from "../lib/cn";
+import { frameBars, publishGlassInsets, type GlassEdge as GlassEdgeName } from "../lib/glassInsets";
 
-type GlassEdge = "top" | "bottom";
-
-const EDGES: readonly GlassEdge[] = ["top", "bottom"];
-
-function frameBars(frame: HTMLElement): Partial<Record<GlassEdge, HTMLElement>> {
-  const bars: Partial<Record<GlassEdge, HTMLElement>> = {};
-  for (const child of Array.from(frame.children)) {
-    const edge = (child as HTMLElement).dataset?.glassBar;
-    if (edge === "top" || edge === "bottom") bars[edge] = child as HTMLElement;
-  }
-  return bars;
-}
-
-export function publishGlassInsets(frame: HTMLElement): void {
-  const bars = frameBars(frame);
-  for (const edge of EDGES) {
-    const bar = bars[edge];
-    frame.style.setProperty(`--glass-${edge}`, `${bar ? Math.ceil(bar.getBoundingClientRect().height) : 0}px`);
-  }
-}
+type GlassEdge = GlassEdgeName;
 
 export function GlassScrollFrame({ className, children, ...rest }: HTMLAttributes<HTMLDivElement> & { children: ReactNode }) {
   const ref = useRef<HTMLDivElement>(null);

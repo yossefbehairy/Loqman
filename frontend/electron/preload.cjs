@@ -47,6 +47,13 @@ function unwrap(error) {
 }
 
 contextBridge.exposeInMainWorld('agentos', {
+  saveBackup: async () => {
+    try {
+      return await ipcRenderer.invoke('agentos:backup-save');
+    } catch (error) {
+      throw unwrap(error);
+    }
+  },
   call: async (method, params) => {
     try {
       return await ipcRenderer.invoke('agentos:call', method, params || {});
@@ -54,10 +61,10 @@ contextBridge.exposeInMainWorld('agentos', {
       throw unwrap(error);
     }
   },
-  openStream: async (topic, id, lastEventId, onMessage) => {
+  openStream: async (topic, id, lastEventId, onMessage, eventFormat) => {
     let streamId;
     try {
-      streamId = await ipcRenderer.invoke('agentos:stream-open', topic, id, lastEventId || 0);
+      streamId = await ipcRenderer.invoke('agentos:stream-open', topic, id, lastEventId || 0, eventFormat);
     } catch (error) {
       throw unwrap(error);
     }

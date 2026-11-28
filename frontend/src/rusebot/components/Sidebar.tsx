@@ -4,12 +4,16 @@
  * Copyright 2026 Milind Soni and OpenMausBot contributors). Data comes from
  * props; the RuseBot store is not used.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, FileText, Loader2, MessageSquarePlus, PackageCheck, Plus, Search, Settings, UserPlus, UsersRound, X } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { GlassBar, GlassScrollFrame, GlassScroller } from './GlassScrollFrame';
-import type { Conversation } from '../data/worker';
+import { AgentAvatar } from './AgentAvatar';
+import { UserAvatar } from './UserAvatar';
+import { CEO_PROFILE_ID, type Conversation } from '../data/worker';
+import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
+import type { Agent } from '../types';
 
 export type View = 'chat' | 'team' | 'contracts' | 'results';
 
@@ -17,7 +21,7 @@ const SIMPLE_TOP_BUTTON =
   'flex size-[30px] shrink-0 items-center justify-center rounded-full bg-raised/50 text-ink hover:bg-raised focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus';
 
 function stamp(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   if (Number.isNaN(d.getTime())) return '';
   const today = new Date();
   return d.toDateString() === today.toDateString()
@@ -65,32 +69,43 @@ function NavRow({
 
 export interface SidebarProps {
   open: boolean;
+  inert: boolean;
   onClose: () => void;
   rail: boolean;
+  canExpandRail: boolean;
   onToggleRail: () => void;
   view: View;
   onView: (view: View) => void;
   conversations: Conversation[];
+  profileIdForConversation: (conversation: Conversation) => string;
   legacy: LegacyThread[];
+  /** Every agent of the company; the ones without a chat yet are listed so they can be opened from here. */
+  agents: Agent[];
+  onOpenAgent: (agent: Agent) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
-  onNewChat: () => void;
+  specialist: Agent | null;
+  onNewChat: (recipientId: string) => void;
   onNewAgent: () => void;
   onSettings: () => void;
   activeRunIds: Record<string, string>;
   needsYou: number;
   onNeedsYou: () => void;
   userName: string;
+  userPhoto: string | null;
   previews: Record<string, string>;
 }
 
 export function Sidebar(props: SidebarProps) {
-  const { rail, view } = props;
+  const { rail, specialist, view } = props;
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState('');
   const asideRef = useRef<HTMLElement>(null);
+  const searchButtonRef = useRef<HTMLButtonElement>(null);
+  const searchSurfaceRef = useRef<HTMLDivElement>(null);
   const [plusOpen, setPlusOpen] = useState(false);
   const plusRef = useRef<HTMLDivElement>(null);
+  const plusButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!plusOpen) return;
@@ -105,24 +120,76 @@ export function Sidebar(props: SidebarProps) {
       document.removeEventListener('keydown', esc);
     };
   }, [plusOpen]);
-  const q = query.trim().toLowerCase();
+  const closeSearch = useCallback(() => {
+    setQuery('');
+    setSearchOpen(false);
+  }, []);
+  const dismissSearch = () => {
+    closeSearch();
+    searchButtonRef.current?.focus();
+  };
+  if (props.inert && searchOpen) {
+    setQuery('');
+    setSearchOpen(false);
+  }
 
+  const railSearch = rail && searchOpen;
   useEffect(() => {
-    if (!searchOpen) setQuery('');
-  }, [searchOpen]);
+    if (!railSearch) return;
+    const close = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (!searchSurfaceRef.current?.contains(target) && !searchButtonRef.current?.contains(target)) {
+        closeSearch();
+      }
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [railSearch, closeSearch]);
+
+  const toggleSearch = () => {
+    if (searchOpen) {
+      closeSearch();
+      return;
+    }
+    if (rail && props.canExpandRail) props.onToggleRail();
+    setSearchOpen(true);
+  };
+  const selectThread = (id: string) => {
+    if (railSearch) closeSearch();
+    props.onSelect(id);
+  };
+  const q = query.trim().toLowerCase();
 
   const rows = useMemo(
     () => props.conversations.filter((c) => !q || c.title.toLowerCase().includes(q)),
     [props.conversations, q]
   );
+  const idleAgents = useMemo(() => {
+    const withChat = new Set(props.conversations.map((c) => c.profile_id).filter(Boolean));
+    return props.agents.filter(
+      (a) => a.id !== CEO_PROFILE_ID && !withChat.has(a.id) && (!q || a.name.toLowerCase().includes(q))
+    );
+  }, [props.agents, props.conversations, q]);
   const legacyRows = useMemo(
     () => props.legacy.filter((t) => !q || t.title.toLowerCase().includes(q)),
     [props.legacy, q]
   );
 
-  const row = (id: string, title: string, when: string, preview: string, working: boolean) => {
+  const agentsById = useMemo(() => new Map(props.agents.map((a) => [a.id, a])), [props.agents]);
+  const agentIndex = useMemo(() => new Map(props.agents.map((a, i) => [a.id, i])), [props.agents]);
+
+  const row = (id: string, title: string, when: string, preview: string, working: boolean, profileId: string) => {
     const current = view === 'chat' && props.selectedId === id;
-    if (rail) {
+    const agent = agentsById.get(profileId);
+    const isCeo = profileId === CEO_PROFILE_ID;
+    const avatar = (
+      <AgentAvatar
+        identity={isCeo || agent ? profileId : null}
+        index={agentIndex.get(profileId)}
+        label={isCeo ? 'Loqman' : agent?.name ?? ''}
+      />
+    );
+    if (rail && !railSearch) {
       return (
         <button
           key={id}
@@ -131,13 +198,13 @@ export function Sidebar(props: SidebarProps) {
           title={title}
           aria-label={title}
           aria-current={current ? 'page' : undefined}
-          onClick={() => props.onSelect(id)}
+          onClick={() => selectThread(id)}
           className={cn(
-            'mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium',
+            'mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium outline-none focus-visible:ring-2 focus-visible:ring-focus',
             current ? 'bg-raised text-ink' : 'text-ink-secondary hover:bg-raised/50 hover:text-ink'
           )}
         >
-          {title.trim().charAt(0).toUpperCase() || '?'}
+          {avatar}
         </button>
       );
     }
@@ -145,27 +212,26 @@ export function Sidebar(props: SidebarProps) {
       <div
         key={id}
         className={cn(
-          'group/thread relative flex min-w-0 items-center rounded-xl',
+          'sidebar-row group/thread relative flex min-w-0 items-center rounded-xl',
           current ? 'bg-raised' : 'hover:bg-raised/50'
         )}
+        data-current={current ? 'true' : undefined}
       >
         <button
           type="button"
           data-sidebar-thread-row={id}
           aria-current={current ? 'page' : undefined}
           title={title}
-          onClick={() => props.onSelect(id)}
-          className="flex min-h-[46px] min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-accent/60"
+          onClick={() => selectThread(id)}
+          className="flex min-h-[46px] min-w-0 flex-1 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-raised text-[13px] font-medium text-ink-secondary">
-            {title.trim().charAt(0).toUpperCase() || '?'}
-          </span>
+          {avatar}
           <span className="flex min-w-0 flex-1 flex-col">
             <span className="flex items-baseline gap-2">
               <span dir="auto" className={cn('min-w-0 flex-1 truncate text-[14px] font-medium leading-5', current ? 'text-ink' : 'text-ink')}>
                 {title}
               </span>
-              {when && <time className="shrink-0 tabular-nums text-[10px] text-ink-secondary">{when}</time>}
+              {when && <time className="shrink-0 tabular-nums text-[11px] text-ink-tertiary">{when}</time>}
             </span>
             <span className="flex items-center gap-1">
               <span dir="auto" className="min-w-0 flex-1 truncate text-[12.5px] leading-4 text-ink-secondary">
@@ -179,9 +245,81 @@ export function Sidebar(props: SidebarProps) {
     );
   };
 
+  const threadRows = (
+    <>
+      {rows.map((c) =>
+        row(
+          c.id,
+          c.title,
+          stamp(c.updated_at),
+          props.previews[c.id] ?? '',
+          Boolean(props.activeRunIds[c.id]),
+          props.profileIdForConversation(c)
+        )
+      )}
+      {idleAgents.length > 0 && (!rail || railSearch) && (
+        <div role="heading" aria-level={2} className="mx-1 mt-2 border-t border-hairline/50 px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">
+          Agents
+        </div>
+      )}
+      {idleAgents.map((a) =>
+        rail && !railSearch ? (
+          <button
+            key={`agent:${a.id}`}
+            type="button"
+            data-sidebar-agent-row={a.id}
+            title={a.name}
+            aria-label={a.name}
+            onClick={() => props.onOpenAgent(a)}
+            className="mx-auto flex size-[46px] shrink-0 items-center justify-center rounded-xl text-[15px] font-medium text-ink-secondary outline-none hover:bg-raised/50 hover:text-ink focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            <AgentAvatar identity={a.id} index={agentIndex.get(a.id)} label={a.name} />
+          </button>
+        ) : (
+          <button
+            key={`agent:${a.id}`}
+            type="button"
+            data-sidebar-agent-row={a.id}
+            title={a.name}
+            onClick={() => {
+              if (railSearch) closeSearch();
+              props.onOpenAgent(a);
+            }}
+            className="flex min-h-[46px] min-w-0 items-center gap-3 rounded-xl px-3 py-2 text-left outline-none hover:bg-raised/50 focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            <AgentAvatar identity={a.id} index={agentIndex.get(a.id)} label={a.name} />
+            <span className="flex min-w-0 flex-1 flex-col">
+              <span dir="auto" className="truncate text-[14px] font-medium leading-5 text-ink">{a.name}</span>
+              <span dir="auto" className="truncate text-[12.5px] leading-4 text-ink-secondary">{a.role}</span>
+            </span>
+          </button>
+        )
+      )}
+      {legacyRows.length > 0 && (!rail || railSearch) && (
+        <div role="heading" aria-level={2} className="mx-1 mt-2 border-t border-hairline/50 px-2 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-ink-tertiary">
+          Earlier chats
+        </div>
+      )}
+      {legacyRows.map((t) =>
+        row(
+          `legacy:${t.id}`,
+          t.title,
+          t.ts ? stamp(new Date(t.ts).toISOString()) : '',
+          t.turns[t.turns.length - 1]?.reply.slice(0, 80) ?? '',
+          false,
+          CEO_PROFILE_ID
+        )
+      )}
+      {rows.length === 0 && legacyRows.length === 0 && idleAgents.length === 0 && q && (
+        <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">No chats match “{query}”.</div>
+      )}
+    </>
+  );
+
   return (
     <aside
       ref={asideRef}
+      inert={props.inert}
       tabIndex={-1}
       aria-label="Chats and navigation"
       data-sidebar
@@ -196,7 +334,7 @@ export function Sidebar(props: SidebarProps) {
       )}
     >
       <GlassScrollFrame className="flex-1">
-        <GlassBar edge="top">
+        <GlassBar edge="top" className={rail && (plusOpen || railSearch) ? 'z-[35]' : undefined}>
           <div
             data-sidebar-top-row
             className={cn('flex items-center', rail ? 'flex-col gap-1 px-2 pt-3.5 pb-1' : 'relative h-12 pl-4 pr-2')}
@@ -205,8 +343,9 @@ export function Sidebar(props: SidebarProps) {
             <div data-sidebar-top-buttons className={cn('relative flex shrink-0 items-center', rail ? 'flex-col gap-1' : 'gap-1 pl-0.5')}>
               <button
                 type="button"
+                ref={searchButtonRef}
                 data-sidebar-search-toggle
-                onClick={() => setSearchOpen((o) => !o)}
+                onClick={toggleSearch}
                 aria-label="Search chats"
                 aria-expanded={searchOpen}
                 title="Search chats"
@@ -217,6 +356,7 @@ export function Sidebar(props: SidebarProps) {
               <div className="relative" ref={plusRef}>
                 <button
                   type="button"
+                  ref={plusButtonRef}
                   data-sidebar-new
                   onClick={() => setPlusOpen((o) => !o)}
                   aria-haspopup="menu"
@@ -231,25 +371,44 @@ export function Sidebar(props: SidebarProps) {
                   <div
                     role="menu"
                     aria-label="Create"
-                    className="absolute right-0 top-full z-50 mt-1.5 w-[200px] rounded-xl border border-hairline/50 bg-menu p-1.5 shadow-2xl shadow-black/30"
+                    className={cn(
+                      'absolute top-full z-50 mt-1.5 w-[min(200px,calc(100vw-64px))] rounded-xl border border-hairline/50 bg-menu p-1.5 shadow-2xl shadow-black/30',
+                      rail ? 'left-0' : 'right-0'
+                    )}
                   >
                     <button
                       type="button"
                       role="menuitem"
-                      data-new-chat
+                      data-new-chat={specialist ? undefined : true}
                       onClick={() => {
                         setPlusOpen(false);
-                        props.onNewChat();
+                        props.onNewChat(CEO_PROFILE_ID);
                       }}
                       className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13.5px] text-ink hover:bg-raised/70"
                     >
-                      <MessageSquarePlus size={15} aria-hidden="true" /> New chat
+                      <MessageSquarePlus size={15} aria-hidden="true" className="shrink-0" /> New chat with Loqman
                     </button>
+                    {specialist && (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        data-new-chat
+                        onClick={() => {
+                          setPlusOpen(false);
+                          props.onNewChat(specialist.id);
+                        }}
+                        className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[13.5px] text-ink hover:bg-raised/70"
+                      >
+                        <MessageSquarePlus size={15} aria-hidden="true" className="shrink-0" />
+                        <span className="min-w-0 [overflow-wrap:anywhere]">New chat with <bdi>{specialist.name}</bdi></span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       role="menuitem"
                       data-new-agent
                       onClick={() => {
+                        plusButtonRef.current?.focus();
                         setPlusOpen(false);
                         props.onNewAgent();
                       }}
@@ -262,27 +421,33 @@ export function Sidebar(props: SidebarProps) {
               </div>
             </div>
           </div>
-          {searchOpen && !rail && (
-            <div data-sidebar-search-pill className="px-3 pb-2 pt-0.5">
+          {searchOpen && (
+            <div
+              ref={searchSurfaceRef}
+              data-sidebar-search-pill
+              className={railSearch
+                ? 'absolute left-full top-3 ml-4 w-[min(260px,calc(100vw-120px))] rounded-xl border border-hairline/50 bg-menu p-2 shadow-2xl shadow-black/30'
+                : 'px-3 pb-2 pt-0.5'}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape' && !event.nativeEvent.isComposing) {
+                  event.preventDefault();
+                  dismissSearch();
+                }
+              }}
+            >
               <div className="flex h-[34px] items-center gap-2 rounded-full bg-raised/60 pl-3 pr-1.5 text-ink-secondary focus-within:ring-1 focus-within:ring-focus">
                 <Search size={15} aria-hidden="true" className="shrink-0" />
                 <input
                   autoFocus
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') {
-                      e.preventDefault();
-                      setSearchOpen(false);
-                    }
-                  }}
                   placeholder="Search chats"
                   aria-label="Search chats"
                   className="min-w-0 flex-1 bg-transparent text-[13px] text-ink placeholder:text-ink-tertiary focus:outline-none"
                 />
                 <button
                   type="button"
-                  onClick={() => setSearchOpen(false)}
+                  onClick={dismissSearch}
                   aria-label="Close search"
                   title="Close search"
                   className="flex size-6 shrink-0 items-center justify-center rounded-full text-ink-tertiary hover:bg-raised hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-focus"
@@ -290,6 +455,7 @@ export function Sidebar(props: SidebarProps) {
                   <X size={14} aria-hidden="true" />
                 </button>
               </div>
+              {railSearch && <div className="mt-1 max-h-[min(50vh,320px)] overflow-y-auto">{threadRows}</div>}
             </div>
           )}
         </GlassBar>
@@ -297,7 +463,10 @@ export function Sidebar(props: SidebarProps) {
         <button
           type="button"
           data-sidebar-edge-toggle
-          onClick={props.onToggleRail}
+          onClick={() => {
+            if (!rail) closeSearch();
+            props.onToggleRail();
+          }}
           aria-label={rail ? 'Expand sidebar' : 'Collapse sidebar'}
           aria-expanded={!rail}
           title={rail ? 'Expand sidebar' : 'Collapse sidebar'}
@@ -320,38 +489,13 @@ export function Sidebar(props: SidebarProps) {
                   rail ? 'mx-auto size-[46px] justify-center' : 'min-h-9 w-full gap-3 px-3 py-1.5 text-left'
                 )}
               >
-                <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-warning text-[12px] font-semibold text-ink">
+                <span className="flex size-6 shrink-0 items-center justify-center rounded-full bg-warning text-[12px] font-semibold text-warning-ink">
                   {props.needsYou}
                 </span>
                 {!rail && <span className="flex-1 truncate text-[14px] font-medium leading-5">Needs you</span>}
               </button>
             )}
-            {rows.map((c) =>
-              row(
-                c.id,
-                c.title,
-                stamp(c.updated_at),
-                props.previews[c.id] ?? '',
-                Boolean(props.activeRunIds[c.id])
-              )
-            )}
-            {legacyRows.length > 0 && !rail && (
-              <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-[0.08em] text-ink-secondary">
-                Earlier chats
-              </div>
-            )}
-            {legacyRows.map((t) =>
-              row(
-                `legacy:${t.id}`,
-                t.title,
-                t.ts ? stamp(new Date(t.ts).toISOString()) : '',
-                t.turns[t.turns.length - 1]?.reply.slice(0, 80) ?? '',
-                false
-              )
-            )}
-            {rows.length === 0 && legacyRows.length === 0 && q && (
-              <div className="px-3 py-6 text-center text-[13px] text-ink-secondary">No chats match “{query}”.</div>
-            )}
+            {!railSearch && threadRows}
           </div>
         </GlassScroller>
 
@@ -370,9 +514,7 @@ export function Sidebar(props: SidebarProps) {
                     <Settings size={18} className="text-ink-secondary" />
                   ) : (
                     <span className="flex min-h-[46px] w-full items-center gap-3 rounded-xl px-3 py-2 text-left transition-colors hover:bg-raised/50">
-                      <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-raised text-[13px] font-medium text-ink-secondary">
-                        {props.userName.trim().charAt(0).toUpperCase() || '?'}
-                      </span>
+                      <UserAvatar name={props.userName} photo={props.userPhoto} />
                       <span className="min-w-0 flex-1 truncate text-[14px] font-medium leading-5 text-ink">{props.userName}</span>
                     </span>
                   )}

@@ -11,23 +11,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Optional, Tuple
 
 from backend.pyworker.appsettings import settings
 from backend.pyworker.db.core import Database, new_id, ts
 from backend.pyworker.runtime.base import AgentResult, AgentRuntime, ExecuteAgentTask
+from backend.pyworker.runtime.collector import collect_turn
+from backend.pyworker.runtime.driver import StartTurn, ToolPolicy
+from backend.pyworker.runtime.execute_driver import ExecuteTaskDriver
+from backend.pyworker.runtime.providers import ENGINE_LEDGER_PROVIDERS
 
 logger = logging.getLogger("agentos.usage")
 
 # Stable, queryable kind labels.
-KIND_CHAT_CONSULT = "chat_consult"
 KIND_CEO_ASK = "ceo_ask"
 KIND_CEO_ASK_FAST = "ceo_ask_fast"
 KIND_MISSION_PLANNER = "mission_planner"
 KIND_MISSION_DELEGATE = "mission_delegate"
 KIND_MISSION_SYNTHESIS = "mission_synthesis"
-KIND_WORKFLOW_NODE = "workflow_node"
 KIND_GREETING = "greeting_reply"
 
 _db: Optional[Database] = None
@@ -80,7 +83,7 @@ def _record_event(
             "kind": kind,
             "agent_id": task.agent_id or (settings.WORK_AGENT_ID if task.provider_id == "opencode" else "unassigned"),
             "model_id": getattr(result, "model_id", None) or task.model_id,
-            "provider_id": task.provider_id or "opencode",
+            "provider_id": task.provider_id or "unknown",
             "variant_id": getattr(result, "variant_id", None),
             "session_id": getattr(result, "session_id", None),
             "duration_ms": duration_ms,
@@ -101,13 +104,30 @@ async def run_agent_task(
     task: ExecuteAgentTask,
     kind: str,
     run_id: Optional[str] = None,
+    *, driver=None, emit=None, engine=None, scope_kind=None, scope_id=None,
+    max_output_chars=8 * 1024 * 1024,
+    usage_recorder=None, is_cancelled=None,
 ) -> AgentResult:
-    """Execute one model task and record its usage."""
+    """Execute once; a durable owner may defer the sole usage write to settlement."""
     t0 = time.monotonic()
+    record = usage_recorder or _record_event
+    logical_id = run_id or new_id()
+    engine = engine or next((e for e, p in ENGINE_LEDGER_PROVIDERS.items() if p == task.provider_id), "legacy")
+    driver = driver or ExecuteTaskDriver(runtime, engine, legacy_task=task)
+    turn = StartTurn(
+        logical_id, logical_id, scope_kind or ("ceo" if kind.startswith("ceo_") else "mission_attempt"),
+        scope_id or logical_id, task.prompt, task.model_id, os.getcwd(),
+        ToolPolicy("scoped" if task.mcp_servers else "none", "deny", mcp_servers=task.mcp_servers),
+        conversation_id=scope_id if scope_kind == "conversation" else None,
+        provider_id=task.provider_id, agent_id=task.agent_id, variant=task.variant,
+        timeout_s=task.timeout, max_output_chars=max_output_chars,
+    )
     try:
-        result = await runtime.execute_task(task)
+        result = await collect_turn(driver, turn, emit, is_cancelled=is_cancelled)
     except (asyncio.CancelledError, Exception) as exc:  # noqa: B014
-        _record_event(task, kind, None, int((time.monotonic() - t0) * 1000), False, exc, run_id)
+        state = driver._turns.get(logical_id) if isinstance(driver, ExecuteTaskDriver) else None
+        recorded_error = state.error if state is not None and state.error is not None else exc
+        record(task, kind, None, int((time.monotonic() - t0) * 1000), False, recorded_error, run_id)
         raise
-    _record_event(task, kind, result, int((time.monotonic() - t0) * 1000), True, None, run_id)
+    record(task, kind, result, int((time.monotonic() - t0) * 1000), True, None, run_id)
     return result

@@ -5,23 +5,23 @@
  * centred transcript column, message bubbles, copy action, working dots and
  * the floating composer dock. Messages, runs and approvals arrive as props.
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { Check, Copy, Cpu, X } from 'lucide-react';
+import { CEO_PROFILE_ID } from '../data/worker';
 import { cn } from '../lib/cn';
-import { useComposerDockPad } from '../lib/composer-dock';
 import { userBubbleStyle } from '../lib/user-bubble-tone';
 import { GlassBar, GlassScrollFrame } from './GlassScrollFrame';
 import { ChatMarkdown } from './ChatMarkdown';
 import { Composer } from './Composer';
 import { ApprovalCard } from './ApprovalCard';
 import { DeliverableCard } from './DeliverableCard';
-import { stripContract, type ChatState, type EngineState } from '../state/useChat';
-import type { Agent } from '../../types/agentos';
-import { useKeepDecided } from '../state/useKeepDecided';
-import type { Conversation } from '../data/worker';
+import { stripContract, type ChatState } from '../state/useChat';
+import type { EngineState } from '../state/useChatEngines';
+import { hasLiveContent, type LiveTurn } from '../state/liveTurn';
+import type { Agent } from '../types';
+import type { Conversation, RunSnapshot } from '../data/worker';
+import { parseWorkerTime } from '../data/time';
 import type { LegacyThread } from '../data/legacy';
-
-const FALLBACK_NAME = 'Loqman';
 
 function WorkingDots({ size = 4, className }: { size?: number; className?: string }) {
   return (
@@ -64,12 +64,12 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
 }
 
 function clock(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
 function dayLabel(iso: string): string {
-  const d = new Date(iso);
+  const d = parseWorkerTime(iso);
   if (Number.isNaN(d.getTime())) return '';
   const when = clock(iso);
   return d.toDateString() === new Date().toDateString()
@@ -79,8 +79,43 @@ function dayLabel(iso: string): string {
 
 const USER_BUBBLE_STYLE = userBubbleStyle('chrome');
 
-function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string; iso: string }) {
+// Render only known worker summaries. Older or unexpected diagnostics may contain sensitive detail.
+const PUBLIC_RUN_ERRORS = new Set([
+  'Internal error.',
+  'Output did not match the profile schema.',
+  'Run interrupted by server restart or shutdown; it was not re-executed.',
+  'Task ended without a verified tool result.',
+  'Report was not published. Approval was denied or publication is incomplete.',
+  'Task ended with unread file pages.',
+  'A source file changed before completion.',
+  ...[
+    'auth', 'busy', 'cancelled', 'cli_missing', 'model_unavailable', 'offline', 'output_limit',
+    'protocol_error', 'quota', 'rate_limited', 'request_refused', 'runtime_error', 'timeout',
+    'unsupported_capability', 'upstream_unavailable',
+  ].map((code) => `Engine request failed (${code}).`),
+]);
+
+function SavedRunOutcome({ run }: { run: RunSnapshot }) {
+  if (run.status !== 'failed' && run.status !== 'interrupted') return null;
+  const failed = run.status === 'failed';
+  const detail = run.error && PUBLIC_RUN_ERRORS.has(run.error) ? run.error : null;
+  return (
+    <p
+      data-saved-run-outcome={run.status}
+      role="note"
+      dir="auto"
+      className={cn('mt-1 max-w-[min(var(--chat-bubble-max),var(--chat-bubble-pct))] px-4 text-[12.5px]', failed ? 'text-danger' : 'text-ink-secondary')}
+    >
+      <span className="font-medium">{failed ? 'Run failed' : 'Run interrupted'}</span>
+      {detail && ` · ${detail}`}
+    </p>
+  );
+}
+
+function Bubble({ role, text, iso, savedRun }: { role: 'user' | 'assistant'; text: string; iso: string; savedRun?: RunSnapshot }) {
   const mine = role === 'user';
+  const time = parseWorkerTime(iso).toLocaleString();
+  const executedWith = !mine && savedRun?.engine && savedRun.model_id ? `${savedRun.engine} · ${savedRun.model_id}` : null;
   return (
     <div data-message-row="" data-role={role} className={cn('group flex w-full flex-col', mine ? 'animate-msg-in items-end' : 'items-start')}>
       <div className={cn('flex w-full items-center gap-1.5', mine ? 'justify-end' : 'justify-start')}>
@@ -96,7 +131,7 @@ function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string;
             mine ? 'bg-bubble-user whitespace-pre-wrap text-ink user-bubble-colored antialiased' : 'bg-card text-ink'
           )}
           style={mine ? USER_BUBBLE_STYLE : undefined}
-          title={new Date(iso).toLocaleString()}
+          title={executedWith ? `${time} · ${executedWith}` : time}
         >
           {mine ? <div className="chat-text">{text}</div> : <ChatMarkdown text={text} />}
         </div>
@@ -113,6 +148,42 @@ function Bubble({ role, text, iso }: { role: 'user' | 'assistant'; text: string;
         >
           {clock(iso)}
         </span>
+      </div>
+      {mine && savedRun && <SavedRunOutcome run={savedRun} />}
+    </div>
+  );
+}
+
+/** The reply while it streams in: live text per item, tool steps as compact chips. The stored message replaces it when the turn ends. */
+function LiveReply({ turn }: { turn: LiveTurn }) {
+  const last = turn.items.length - 1;
+  return (
+    <div data-live-bubble="" data-stopped={turn.stopped ? 'true' : 'false'} className="flex w-full flex-col items-start">
+      <div className="w-fit max-w-[min(var(--chat-bubble-max),var(--chat-bubble-pct))] rounded-[23px] bg-card px-4 py-2.5 text-[15px] leading-relaxed text-ink">
+        {turn.items.map((item, i) => {
+          if (item.kind === 'tool') {
+            const state = item.status === 'running' ? 'running' : item.status === 'failed' ? 'failed' : 'done';
+            return (
+              <div key={item.id} data-live-tool="" data-status={state} className="my-1 flex items-center gap-1.5 text-[12.5px] text-ink-secondary">
+                <Cpu size={12} aria-hidden="true" />
+                <span className="font-medium">{item.title}</span>
+                <span>{state === 'running' ? 'running' : state === 'failed' ? 'failed' : 'done'}</span>
+              </div>
+            );
+          }
+          if (!item.streamed || !item.text) return null;
+          const commentary = item.done && item.phase === 'commentary';
+          return (
+            <div key={item.id} data-live-item="" data-phase={item.phase ?? 'streaming'} className={cn(commentary && 'text-ink-secondary opacity-70')}>
+              <ChatMarkdown text={item.text} live={!item.done && !turn.stopped && i <= last} />
+            </div>
+          );
+        })}
+        {turn.stopped && (
+          <div data-live-stopped="" className="mt-1 text-[12.5px] text-ink-tertiary">
+            Stopped
+          </div>
+        )}
       </div>
     </div>
   );
@@ -131,14 +202,27 @@ function EmptyChat({ name, role, description }: { name: string; role?: string; d
   );
 }
 
-export function ChatErrorBanner({ message, onDismiss }: { message: string | null; onDismiss: () => void }) {
+export function ChatErrorBanner({ message, onDismiss, onRetry, providerCheck }: {
+  message: string | null;
+  onDismiss: () => void;
+  onRetry?: (() => void) | null;
+  providerCheck: ChatState['retryProviderCheck'];
+}) {
   if (!message) return null;
   return (
     <div className="w-full px-5">
       <div role="alert" className="mb-2 flex items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-2 text-[13px] text-danger">
         <div className="min-w-0 flex-1 break-words">
           <p dir="auto">{message}</p>
+          {providerCheck === 'checking' && <p role="status">Checking the original engine and model…</p>}
+          {providerCheck === 'unavailable' && <p>The original engine and model are currently unavailable. Restore them in Settings → AI before retrying.</p>}
+          {providerCheck === 'failed' && <p>Could not check the original engine and model. Retry to check again, or refresh providers in Settings → AI.</p>}
         </div>
+        {onRetry && (
+          <button type="button" data-chat-retry onClick={onRetry} disabled={providerCheck === 'checking'} className="shrink-0 rounded px-1.5 font-medium underline hover:bg-danger/10 disabled:opacity-60">
+            Retry
+          </button>
+        )}
         <button type="button" onClick={onDismiss} aria-label="Dismiss" title="Dismiss" className="shrink-0 rounded p-0.5 hover:bg-danger/10">
           <X size={13} />
         </button>
@@ -155,6 +239,9 @@ export function ChatView({
   agent,
   onOpenProfile,
   onNewAgent,
+  onManageProviders,
+  agentDefaultsNotice,
+  ready = true,
 }: {
   chat: ChatState;
   engines: EngineState;
@@ -163,49 +250,76 @@ export function ChatView({
   agent: Agent | null;
   onOpenProfile: () => void;
   onNewAgent: () => void;
+  onManageProviders?: () => void;
+  agentDefaultsNotice?: string;
+  /** False until the conversation list and the agents are loaded, so the remembered chat is not shown as Loqman first. */
+  ready?: boolean;
 }) {
-  const dockRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const dock = useComposerDockPad(dockRef);
-  const ASSISTANT_NAME = agent?.name ?? FALLBACK_NAME;
+  const transcriptRef = useRef<HTMLDivElement>(null);
+  const scrollState = useRef({ followTail: true, top: 0, maxScroll: 0 });
+  const unknownRecipient = chat.selectedAgentId === null;
+  const fallbackName = unknownRecipient ? 'Recipient unavailable' : chat.selectedAgentId === CEO_PROFILE_ID ? 'Loqman' : 'Specialist';
+  const ASSISTANT_NAME = ready ? (agent?.name ?? fallbackName) : '';
   const running = Boolean(chat.run && (chat.run.status === 'queued' || chat.run.status === 'running'));
-  const title = conversation?.title ?? legacyThread?.title ?? 'New chat';
+  const title = !ready ? '' : (conversation?.title ?? legacyThread?.title ?? (unknownRecipient && chat.selectedId ? 'Saved conversation' : 'New chat'));
 
-  const lastKey = `${chat.messages.length}:${chat.pendingUser ?? ''}:${running}:${legacyThread?.turns.length ?? 0}`;
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [lastKey, chat.selectedId]);
+  useLayoutEffect(() => {
+    const viewport = scrollRef.current!;
+    const transcript = transcriptRef.current!;
+    // Each conversation opens at its latest message, including after its history loads.
+    scrollState.current.followTail = true;
+    const keepLatestInView = () => {
+      if (!scrollState.current.followTail) return;
+      const maxScroll = viewport.scrollHeight - viewport.clientHeight;
+      viewport.scrollTop = maxScroll;
+      scrollState.current = { followTail: true, top: viewport.scrollTop, maxScroll };
+    };
+    keepLatestInView();
+    // Observe both the content (including streaming Markdown) and the space
+    // available for it (including composer growth and window resizing).
+    const observer = new ResizeObserver(keepLatestInView);
+    observer.observe(viewport);
+    observer.observe(transcript);
+    return () => observer.disconnect();
+  }, [chat.selectedId]);
 
-  const runApprovals = useMemo(
-    () => chat.approvals.filter((a) => chat.run && a.run_id === chat.run.runId),
-    [chat.approvals, chat.run]
-  );
-  const { shown: approvals, decide: decideApproval } = useKeepDecided(runApprovals);
+  const choice = engines.choice;
+  const chatModel = choice ? (engines.models.find((m) => m.id === choice.model)?.name ?? choice.model) : '';
+  const savedModel = agent && agent.id !== CEO_PROFILE_ID ? agent.model : '';
+  const overridden = engines.explicit;
+
+  const live = hasLiveContent(chat.live) ? chat.live : null;
+
+  const approvals = chat.toolApprovalCards.filter(({ approval }) => approval.run_id === chat.run?.runId);
 
   const rows = chat.messages.map((m, i) => {
     const prev = chat.messages[i - 1];
-    const showDay = !prev || new Date(prev.created_at).toDateString() !== new Date(m.created_at).toDateString();
-    const run = m.role === 'assistant' ? chat.runsBySeq[m.seq] : undefined;
-    const drafts = run ? (chat.drafts[run.id] ?? []) : [];
+    const showDay = !prev || parseWorkerTime(prev.created_at).toDateString() !== parseWorkerTime(m.created_at).toDateString();
+    const run = chat.runsBySeq[m.seq];
+    const replyRun = m.role === 'assistant' ? run : undefined;
+    const drafts = replyRun ? (chat.drafts[replyRun.id] ?? []) : [];
+    const save = replyRun ? chat.draftSaves[replyRun.id] : undefined;
     return (
       <div className="contents" key={m.seq} data-mid={m.seq}>
         {(i === 0 || showDay) && <div className="py-3 text-center text-[13px] text-ink-secondary">{dayLabel(m.created_at)}</div>}
-        <Bubble role={m.role} text={stripContract(m.content)} iso={m.created_at} />
-        {run && (
-          <div className="flex w-full flex-col items-start gap-2" data-run-id={run.id}>
+        <Bubble role={m.role} text={stripContract(m.content)} iso={m.created_at} savedRun={run} />
+        {replyRun && (
+          <div className="flex w-full flex-col items-start gap-2" data-run-id={replyRun.id}>
             {drafts.map((d) => (
               <DeliverableCard key={d.id} draft={d} onReview={chat.reviewDraft} onDownload={chat.downloadDraft} />
             ))}
-            {run.status === 'succeeded' && drafts.length === 0 && (
+            {replyRun.status === 'succeeded' && drafts.length === 0 && (
               <button
                 type="button"
-                onClick={() => void chat.makeDeliverable(run.id)}
+                disabled={save?.pending}
+                onClick={() => void chat.makeDeliverable(replyRun)}
                 className="ui-chip text-[12.5px] text-ink-secondary hover:text-ink"
               >
-                Save reply as deliverable for review
+                {save?.pending ? 'Saving deliverable…' : 'Save reply as deliverable for review'}
               </button>
             )}
+            {save?.error && <p role="alert" className="text-[13px] text-danger">Could not save deliverable. {save.error}</p>}
           </div>
         )}
       </div>
@@ -214,7 +328,7 @@ export function ChatView({
 
   return (
     <main className="relative flex h-full min-w-0 flex-1 flex-col bg-app">
-      <GlassScrollFrame className="flex-1 [--glass-tint:var(--color-app)]">
+      <GlassScrollFrame className="flex flex-1 flex-col [--glass-tint:var(--color-app)]">
         <GlassBar edge="top" className="z-[25]">
           <div className="@container/chathead px-5 py-3 pl-11 md:pl-5">
             <div
@@ -229,8 +343,8 @@ export function ChatView({
                   type="button"
                   data-chathead-pill="true"
                   data-tour="bot-pill"
-                  title={`${ASSISTANT_NAME} in the team`}
-                  aria-label={`Open ${ASSISTANT_NAME}'s team`}
+                  title={agent ? `${ASSISTANT_NAME} in the team` : 'Open team'}
+                  aria-label={agent ? `Open ${ASSISTANT_NAME}'s team` : 'Open team'}
                   onClick={onOpenProfile}
                   className="group flex h-9 min-w-0 items-center gap-2.5 rounded-full border border-hairline/40 bg-control/60 py-0.5 pl-2 pr-3.5 text-ink hover:bg-raised-hover"
                 >
@@ -244,7 +358,24 @@ export function ChatView({
                       className="flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent @max-4xl/chathead:px-1.5"
                     >
                       <Cpu size={11} aria-hidden="true" />
-                      <span className="@max-4xl/chathead:sr-only">{engines.choice.engine}</span>
+                      <span className="@max-4xl/chathead:sr-only">
+                        {engines.engines.find((e) => e.id === engines.choice?.engine)?.title ?? engines.choice.engine}
+                      </span>
+                    </span>
+                  )}
+                  {choice && (
+                    <span
+                      data-chathead-model
+                      data-model-override={overridden ? 'true' : 'false'}
+                      title={
+                        overridden
+                          ? `Next message model: ${choice.model || 'waiting for catalog'}. Chat override.${savedModel ? ` ${ASSISTANT_NAME} is saved with ${savedModel}.` : ''}`
+                          : `Next message model: ${choice.model || 'waiting for catalog'}. Inherited default.`
+                      }
+                      className="hidden min-w-0 max-w-[180px] items-center gap-1 truncate whitespace-nowrap text-[11px] text-ink-secondary @4xl/chathead:flex"
+                    >
+                      <span className="truncate">{chatModel}</span>
+                      {overridden && <span className="shrink-0 rounded-full bg-warning/15 px-1.5 text-[10px] font-medium text-warning">override</span>}
                     </span>
                   )}
                 </button>
@@ -260,10 +391,23 @@ export function ChatView({
           </div>
         </GlassBar>
 
-        <div ref={scrollRef} className="glass-scroller h-full overflow-x-hidden overflow-y-auto overscroll-y-contain px-5 [overflow-anchor:none]">
+        <div
+          key={chat.selectedId ?? 'new-chat'}
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            const { scrollTop: top, scrollHeight, clientHeight } = el;
+            const maxScroll = scrollHeight - clientHeight;
+            const previous = scrollState.current;
+            // A resize or content update can move the browser's scroll anchor
+            // before ResizeObserver runs. Keep following through that reflow.
+            if (top === previous.top || (previous.followTail && maxScroll !== previous.maxScroll)) return;
+            scrollState.current = { top, maxScroll, followTail: maxScroll - top <= 2 };
+          }}
+          className="glass-scroller min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain px-5">
           <div
-            className="glass-scroller-content chat-column relative flex w-full flex-col gap-3"
-            style={{ paddingBottom: dock.pad }}
+            ref={transcriptRef}
+            className="chat-column relative flex w-full flex-col gap-3 pt-[var(--glass-top,0px)] pb-3"
             role="log"
             aria-live="off"
             aria-label={`Conversation with ${ASSISTANT_NAME}`}
@@ -282,27 +426,48 @@ export function ChatView({
               ))
             ) : (
               <>
-                {chat.messages.length === 0 && !chat.pendingUser && !running && (
-                  <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description="Send a message to start the conversation." />
+                {chat.threadError && (
+                  <div role="alert" data-thread-error className="flex flex-col items-start gap-2 rounded-lg border border-danger/30 bg-danger/10 px-3 py-3 text-[13px] text-danger">
+                    <p dir="auto" className="break-words">
+                      This chat could not be loaded completely. {chat.threadError}
+                    </p>
+                    <button type="button" data-thread-retry onClick={chat.retryThread} className="ui-button ui-button-sm">
+                      Retry
+                    </button>
+                  </div>
+                )}
+                {chat.threadLoading && (
+                  <p role="status" className="py-3 text-center text-[13px] text-ink-secondary">Loading conversation…</p>
+                )}
+                {ready && !chat.threadLoading && !chat.threadError && chat.messages.length === 0 && !chat.pendingUser && !running && !live && (
+                  <EmptyChat name={ASSISTANT_NAME} role={agent?.role} description={unknownRecipient
+                    ? (chat.draftRecipientUnverified ? 'This Agent is missing from the Agent list.' : 'Sending is paused until the chat list includes this conversation.')
+                    : 'Send a message to start the conversation.'} />
                 )}
                 {rows}
                 {chat.pendingUser && !chat.messages.some((m) => m.role === 'user' && m.content === chat.pendingUser) && (
                   <Bubble role="user" text={chat.pendingUser} iso={new Date().toISOString()} />
                 )}
-                {approvals.map((a) => (
+                {approvals.map(({ key, approval, outcome, locked, error, canRefresh }) => (
                   <ApprovalCard
-                    key={a.id}
+                    key={key}
                     kind="tool"
                     title={`${ASSISTANT_NAME} wants permission`}
-                    detail={a.action_summary}
-                    scope={a.scope}
-                    onDecide={(decision) => decideApproval(a, () => chat.decide(a, decision))}
+                    detail={approval.action_summary}
+                    scope={approval.scope}
+                    confirmedDecision={outcome}
+                    decisionPending={locked}
+                    decisionError={error}
+                    onRetryStatus={canRefresh ? chat.refreshApprovals : undefined}
+                    refreshingStatus={chat.approvalRead.loading}
+                    onDecide={(decision) => chat.decide(approval, decision, { conversationId: chat.selectedId })}
                   />
                 ))}
-                {running && (
+                {live && <LiveReply turn={live} />}
+                {running && !live && (
                   <div data-working className="flex items-center gap-2 px-1 text-[13px] text-ink-secondary" role="status">
                     <WorkingDots size={5} className="text-ink-tertiary" />
-                    <span>{chat.run?.status === 'queued' ? 'Queued' : 'Working'}</span>
+                    <span>{chat.run?.status === 'queued' ? 'Queued' : (chat.progress ?? 'Working')}</span>
                   </div>
                 )}
               </>
@@ -313,23 +478,28 @@ export function ChatView({
           {running ? 'Working' : ''}
         </p>
 
-        <div ref={dockRef} className="pointer-events-none absolute inset-x-0 bottom-0 z-[2] chat-column-dock">
+        <div className="chat-column-dock relative z-[2] w-full shrink-0">
           <div className="pointer-events-none relative px-5 pb-3">
             <div className="pointer-events-auto">
-              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} />
+              <ChatErrorBanner message={chat.error} onDismiss={chat.dismissError} onRetry={chat.retry} providerCheck={chat.retryProviderCheck} />
             </div>
             <div className="pointer-events-auto relative w-full">
               <div className="relative">
                 <Composer
-                  placeholder={`Message ${ASSISTANT_NAME}`}
+                  placeholder={!ready ? 'Loading…' : unknownRecipient ? 'Recipient unavailable' : `Message ${ASSISTANT_NAME}`}
                   value={chat.draft}
                   onChange={chat.setDraft}
                   onSend={chat.send}
                   onStop={chat.stop}
+                  canStop={chat.canStop}
+                  stopping={chat.stopping}
                   running={running}
-                  disabled={engines.loading}
+                  sending={chat.sending}
+                  disabled={engines.loading || !ready || unknownRecipient || chat.draftRecipientUnverified}
                   engines={engines}
                   onNewAgent={onNewAgent}
+                  onManageProviders={onManageProviders}
+                  agentDefaultsNotice={agentDefaultsNotice}
                 />
               </div>
             </div>

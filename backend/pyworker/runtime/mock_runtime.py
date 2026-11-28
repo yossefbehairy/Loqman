@@ -120,7 +120,7 @@ class MockRuntime:
             free_models_count=len(self._models)
         )
 
-    async def list_available_models(self, free_only: bool = True) -> List[ModelCatalogEntry]:
+    async def list_available_models(self, free_only: bool) -> List[ModelCatalogEntry]:
         if free_only:
             return [m for m in self._models if m.is_free]
         return self._models
