@@ -18,7 +18,6 @@ for features this port does not use (T3 Code, Cache Tax, hpke-js, WebRTC) are no
 | `lib/fonts.ts` | `lib/fonts.ts` |
 | `lib/chat-width.ts` | `lib/chat-width.ts` |
 | `lib/code-block.ts` | `lib/code-block.ts` |
-| `lib/composer-dock.ts` | `lib/composer-dock.ts` |
 | `lib/color-contrast.ts` | `lib/color-contrast.ts` |
 | `lib/use-media-query.ts` | `lib/use-media-query.ts` |
 | `components/GlassScrollFrame.tsx` | `components/GlassScrollFrame.tsx` (import path only) |

@@ -1,6 +1,6 @@
 /*
- * "AI" settings page (Providers v2). Header with Refresh, the default provider and model
- * for new chats, then one row per provider ordered ready -> unverified -> needs sign-in ->
+ * "AI" settings page (Providers v2). Header with Refresh,
+ * then one row per provider ordered ready -> unverified -> needs sign-in ->
  * problem -> not installed. State comes from the shared store (state/useProviders.ts), so a
  * Refresh here updates the Composer and the New agent dialog too.
  * Card and header styling follows the RuseBot 0.1.127 EngineLibrary / EnginesSettings
@@ -11,9 +11,8 @@ import { RefreshCw } from 'lucide-react';
 import { cn } from '../lib/cn';
 import { usageSummary, type UsageByEngine } from '../data/worker';
 import { parseWorkerTime } from '../data/time';
-import { refreshProviders, saveDefaultProvider, useProviders } from '../state/useProviders';
+import { refreshProviders, useProviders } from '../state/useProviders';
 import { STATE_ORDER } from '../state/providerText';
-import { ProviderPicker } from './ai/ProviderPicker';
 import { ProviderRow } from './ai/ProviderRow';
 
 function formatChecked(iso: string | null): string | null {
@@ -69,19 +68,6 @@ export function AiProviders() {
             {s.refreshing ? '' : checked ? `Checked at ${checked}` : ''}
           </p>
         </div>
-      </div>
-
-      <div className="rounded-xl bg-card p-4" data-providers-default>
-        <div className="text-[14px] font-medium text-ink">Default for new chats</div>
-        <p className="mb-3 mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
-          Used by the chat box, by Loqman, for missions and as the starting point for new agents. You can still change it per chat.
-        </p>
-        <ProviderPicker idPrefix="ai-default" value={s.choice} onChange={(next) => void saveDefaultProvider(next)} />
-        {s.defaultError && (
-          <p role="alert" className="mt-2 text-[12px] text-danger">
-            Could not save the default. {s.defaultError}
-          </p>
-        )}
       </div>
 
       <div className="flex min-w-0 flex-col gap-3">

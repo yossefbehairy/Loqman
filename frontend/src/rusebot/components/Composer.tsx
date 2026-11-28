@@ -9,7 +9,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ArrowUp, Plus, Server, Square, UserPlus } from 'lucide-react';
 import { cn } from '../lib/cn';
-import type { EngineState } from '../state/useChat';
+import { SettingsSelect } from './ai/SettingsSelect';
+import type { EngineState } from '../state/useChatEngines';
 import { STATE_SHORT, selectable } from '../state/providerText';
 
 export interface ComposerProps {
@@ -23,54 +24,85 @@ export interface ComposerProps {
   /** Stop was pressed and the worker has not confirmed yet. */
   stopping?: boolean;
   running: boolean;
+  sending: boolean;
   disabled?: boolean;
   engines: EngineState;
+  agentDefaultsNotice?: string;
   onNewAgent?: () => void;
   /** Opens Settings on the AI page. */
   onManageProviders?: () => void;
 }
 
-export function Composer({ placeholder, value, onChange, onSend, onStop, canStop = true, stopping = false, running, disabled, engines, onNewAgent, onManageProviders }: ComposerProps) {
+export function Composer({ placeholder, value, onChange, onSend, onStop, canStop = true, stopping = false, running, sending, disabled, engines, agentDefaultsNotice, onNewAgent, onManageProviders }: ComposerProps) {
   const choice = engines.choice;
   const ref = useRef<HTMLTextAreaElement>(null);
   const [menu, setMenu] = useState(false);
-  const [sending, setSending] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useLayoutEffect(() => {
     const el = ref.current;
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 144)}px`;
+    if (!el || CSS.supports('field-sizing', 'content')) return;
+    const resize = () => {
+      el.style.height = 'auto';
+      el.style.height = `${el.scrollHeight}px`;
+    };
+    resize();
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (width === el.clientWidth) return;
+      resize();
+      width = el.clientWidth;
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
   }, [value]);
 
   useEffect(() => {
     if (!menu) return;
-    const close = (e: MouseEvent) => {
+    const close = (e: PointerEvent) => {
+      // Radix portals disable outside pointer targets; dismiss the select before its parent menu.
+      if (menuRef.current?.querySelector('[role="combobox"][data-state="open"]')) return;
       if (!menuRef.current?.contains(e.target as Node)) setMenu(false);
     };
     const esc = (e: KeyboardEvent) => e.key === 'Escape' && setMenu(false);
-    document.addEventListener('mousedown', close);
+    document.addEventListener('pointerdown', close);
     document.addEventListener('keydown', esc);
     return () => {
-      document.removeEventListener('mousedown', close);
+      document.removeEventListener('pointerdown', close);
       document.removeEventListener('keydown', esc);
     };
   }, [menu]);
 
   // No usable provider with a model: sending would go nowhere, so say so and point to Settings > AI.
-  const noProvider = !disabled && !(choice?.model);
+  const noProvider = !disabled && !engines.executionReady;
+  const selectedModel = engines.models.find(model => model.id === choice?.model);
+  const selectedName = selectedModel?.name || choice?.model;
+  const modelMissing = Boolean(choice?.model && engines.catalogStatus === 'ready' && !selectedModel);
+  const modelStatus = engines.catalogStatus === 'loading' ? 'Loading models…'
+    : engines.catalogStatus === 'error' ? 'Could not load models'
+    : modelMissing || (engines.providerUnavailable && selectedName) ? 'Unavailable'
+    : engines.providerUnavailable ? 'Provider unavailable'
+    : engines.needsAgentDefaults ? 'Agent defaults unavailable'
+    : engines.catalogStatus === 'ready' && !engines.models.length ? 'No models available'
+    : undefined;
+  const modelLabel = modelStatus
+    ? [modelStatus, selectedName].filter(Boolean).join(' · ')
+    : selectedName || (choice ? 'Choose a model' : 'Choose a provider');
+  const providerNotice = engines.catalogStatus === 'loading' ? 'Loading models for the selected provider.'
+    : engines.catalogStatus === 'error' ? (choice ? 'Could not load models for the selected provider.' : 'Could not load models.')
+    : engines.providerUnavailable ? 'The selected provider is unavailable.'
+    : modelMissing
+      ? 'The selected model is unavailable. Choose another model or refresh providers.'
+    : choice ? 'Choose an available model for the selected provider.' : 'No AI provider is ready to answer.';
   const canSend = value.trim().length > 0 && !running && !sending && !disabled && !noProvider;
   const submit = async () => {
     if (!canSend) return;
     const text = value;
-    setSending(true);
     try {
       await onSend(text);
     } catch {
       onChange(text);
     } finally {
-      setSending(false);
       ref.current?.focus();
     }
   };
@@ -82,15 +114,24 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
     >
       {noProvider && (
         <p role="status" data-composer-no-provider className="px-3 pb-1 pt-1.5 text-[12.5px] leading-relaxed text-ink-secondary">
-          No AI provider is ready to answer.{' '}
-          {onManageProviders ? (
-            <button type="button" onClick={onManageProviders} className="font-medium text-accent-text hover:underline">
-              Open Settings &gt; AI
-            </button>
-          ) : (
-            'Open Settings > AI'
-          )}{' '}
-          to sign in or pick a model.
+          {agentDefaultsNotice ?? (
+            <>
+              {providerNotice}{' '}
+              {onManageProviders ? (
+                <button type="button" onClick={onManageProviders} className="font-medium text-accent-text hover:underline">
+                  Open Settings &gt; AI
+                </button>
+              ) : (
+                'Open Settings > AI'
+              )}{' '}
+              to manage providers.
+            </>
+          )}
+        </p>
+      )}
+      {engines.storageFailed && (
+        <p role="status" className="px-3 pb-1 pt-1.5 text-[12.5px] leading-relaxed text-ink-secondary">
+          Could not save the provider selection on this device. It may change after a restart.
         </p>
       )}
       <div data-composer-row="true" className="flex items-end gap-1 @max-[30rem]/composer:flex-wrap">
@@ -135,39 +176,40 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
                 <label className="block px-2 pb-1 pt-1 text-[12px] font-medium text-ink-secondary" htmlFor="rb-engine">
                   Provider
                 </label>
-                <select
+                <SettingsSelect
                   id="rb-engine"
+                  size="compact"
+                  className="mb-2"
                   value={choice?.engine ?? ''}
-                  onChange={(e) => void engines.selectEngine(e.target.value)}
-                  className="mb-2 w-full rounded-lg border border-hairline/40 bg-control px-2 py-1.5 text-[13px] text-ink focus:outline-none focus:ring-1 focus:ring-focus"
-                >
-                  {!choice && (
-                    <option value="" disabled>
-                      Choose a provider
-                    </option>
-                  )}
-                  {engines.engines.map((e) => (
-                    <option key={e.id} value={e.id} disabled={e.id !== 'mock' && !selectable(e.state)}>
-                      {e.title}
-                      {e.id !== 'mock' && e.state !== 'ready' ? ` (${STATE_SHORT[e.state]})` : ''}
-                    </option>
-                  ))}
-                </select>
+                  disabled={engines.engines.length === 0}
+                  selectedLabel={choice?.engine}
+                  onValueChange={(id) => void engines.selectEngine(id)}
+                  options={[
+                    ...(!choice ? [{ value: '', label: 'Choose a provider', disabled: true }] : []),
+                    ...engines.engines.map(e => ({
+                      value: e.id,
+                      label: e.title + (e.id !== 'mock' && e.state !== 'ready' ? ` (${STATE_SHORT[e.state]})` : ''),
+                      disabled: e.id !== 'mock' && !selectable(e.state),
+                    })),
+                  ]}
+                />
                 <label className="block px-2 pb-1 text-[12px] font-medium text-ink-secondary" htmlFor="rb-model">
                   Model
                 </label>
-                <select
+                <SettingsSelect
                   id="rb-model"
+                  size="compact"
                   value={choice?.model ?? ''}
-                  onChange={(e) => choice && engines.setChoice({ engine: choice.engine, model: e.target.value })}
-                  className="w-full rounded-lg border border-hairline/40 bg-control px-2 py-1.5 text-[13px] text-ink focus:outline-none focus:ring-1 focus:ring-focus"
-                >
-                  {engines.models.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name}
-                    </option>
-                  ))}
-                </select>
+                  disabled={!engines.canSelectModel}
+                  selectedLabel={modelLabel}
+                  onValueChange={(model) => choice && engines.setChoice({ engine: choice.engine, model })}
+                  options={engines.canSelectModel ? engines.models.map(m => ({ value: m.id, label: m.name || m.id })) : []}
+                />
+                {engines.catalogStatus === 'error' && (
+                  <button type="button" onClick={engines.retryModelDiscovery} className="mt-1 px-2 py-1 text-[12px] font-medium text-accent-text hover:underline">
+                    Retry model discovery
+                  </button>
+                )}
                 {onManageProviders && (
                   <button
                     type="button"
@@ -201,7 +243,7 @@ export function Composer({ placeholder, value, onChange, onSend, onStop, canStop
                 void submit();
               }
             }}
-            className="block max-h-[9rem] min-h-6 w-full resize-none overflow-y-auto bg-transparent px-1 py-1 text-[15px] leading-6 placeholder:text-ink-secondary focus:outline-none"
+            className="block max-h-[min(9rem,max(2rem,40dvh))] min-h-6 w-full resize-none overflow-y-auto bg-transparent px-1 py-1 text-[15px] leading-6 [field-sizing:content] placeholder:text-ink-secondary focus:outline-none"
           />
         </div>
         <div data-composer-actions="true" className="flex items-center gap-1 @max-[30rem]/composer:ml-auto">

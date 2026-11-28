@@ -24,16 +24,29 @@ export interface ApprovalCardProps {
   detail: string;
   scope?: string;
   kind: 'tool' | 'manager';
+  confirmedDecision?: 'approve' | 'deny';
+  decisionPending?: boolean;
+  decisionError?: string;
+  onRetryStatus?: () => void;
+  refreshingStatus?: boolean;
   onDecide: (decision: 'approve' | 'deny') => Promise<DecideResult>;
 }
 
-export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalCardProps) {
+export function ApprovalCard({
+  title, detail, scope, kind, confirmedDecision, decisionPending, decisionError, onRetryStatus, refreshingStatus, onDecide,
+}: ApprovalCardProps) {
   const [busy, setBusy] = useState<null | 'approve' | 'deny'>(null);
-  const [outcome, setOutcome] = useState<null | 'approve' | 'deny'>(null);
+  const [localOutcome, setOutcome] = useState<null | 'approve' | 'deny'>(null);
+  const outcome = confirmedDecision ?? localOutcome;
   const [failure, setFailure] = useState<string | null>(null);
   const [applyError, setApplyError] = useState<string | null>(null);
   const [byLoqman, setByLoqman] = useState(false);
   const decide = async (decision: 'approve' | 'deny') => {
+    if (outcome || busy || decisionPending) return;
+    if (kind === 'tool') {
+      await onDecide(decision);
+      return;
+    }
     setBusy(decision);
     setFailure(null);
     setApplyError(null);
@@ -53,12 +66,17 @@ export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalC
     }
   };
   const settled = outcome !== null;
+  let waitingLabel = 'Waiting for your answer';
+  if (kind === 'tool' && decisionPending) {
+    waitingLabel = 'Submitting decision…';
+    if (decisionError) waitingLabel = onRetryStatus ? 'Decision unconfirmed' : 'Approval unavailable';
+  }
   return (
     <div
       data-approval-card={kind}
       className={cn(
         'w-full max-w-[840px] rounded-2xl border bg-card p-4',
-        settled ? 'border-hairline/30 opacity-70' : 'border-accent/40'
+        settled ? 'approval-settled border-hairline/20' : 'border-accent/40'
       )}
     >
       <div className="flex items-baseline justify-between gap-3">
@@ -79,10 +97,20 @@ export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalC
           {applyError}
         </p>
       )}
-      {failure && (
+      {(decisionError || failure) && (
         <p role="alert" className="mt-2 text-[12.5px] text-danger">
-          {failure}
+          {decisionError ?? failure}
         </p>
+      )}
+      {onRetryStatus && (
+        <button
+          type="button"
+          disabled={refreshingStatus}
+          onClick={onRetryStatus}
+          className="mt-1 text-[12.5px] font-medium underline disabled:opacity-60"
+        >
+          Retry status
+        </button>
       )}
       <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-[13px] text-ink-secondary">
         <span className="flex items-center gap-1.5">
@@ -100,7 +128,7 @@ export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalC
           ) : (
             <>
               <ShieldCheck size={14} className="text-accent" />
-              Waiting for your answer
+              {waitingLabel}
             </>
           )}
         </span>
@@ -108,7 +136,7 @@ export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalC
           <span className="flex items-center gap-2">
             <button
               type="button"
-              disabled={busy !== null}
+              disabled={busy !== null || decisionPending}
               onClick={() => void decide('deny')}
               className={cn(APPROVAL_CONTROL, 'bg-control text-ink hover:bg-raised-hover')}
             >
@@ -116,9 +144,9 @@ export function ApprovalCard({ title, detail, scope, kind, onDecide }: ApprovalC
             </button>
             <button
               type="button"
-              disabled={busy !== null}
+              disabled={busy !== null || decisionPending}
               onClick={() => void decide('approve')}
-              className={cn(APPROVAL_CONTROL, 'bg-accent text-accent-ink hover:brightness-110')}
+              className={cn(APPROVAL_CONTROL, 'approval-confirm bg-accent text-accent-ink')}
             >
               Approve
             </button>

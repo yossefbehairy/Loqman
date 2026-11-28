@@ -13,23 +13,23 @@ import { TeamView } from './components/TeamView';
 import { ResultsView } from './components/ResultsView';
 import { SettingsModal, type PageId } from './components/SettingsModal';
 import { NewAgentDialog } from './components/NewAgentDialog';
-import { useChat, useEngines, messageOf } from './state/useChat';
-import { agentOf, useCompany } from './state/useCompany';
+import { useChat, messageOf } from './state/useChat';
+import { useCompany } from './state/useCompany';
 import {
   approveCeoAction,
+  CEO_PROFILE_ID,
   ceoActionOutcome,
   denyCeoAction,
   listCeoActions,
   listMissions,
-  listProfiles,
   type CeoAction,
   type Mission,
-  type Profile,
 } from './data/worker';
-import { useMediaQuery, SIDEBAR_AND_PANEL_FIT } from './lib/use-media-query';
+import { useMediaQuery, SIDEBAR_AND_PANEL_FIT, SIDEBAR_INLINE } from './lib/use-media-query';
 import type { Agent } from './types';
 import type { ApiError } from '../api/transport';
 import type { DecideResult } from './components/ApprovalCard';
+import { useProfilePhoto } from './state/useProfilePhoto';
 
 const KEY_NAME = 'agentos.rusebot.userName.v1';
 const KEY_RAIL = 'agentos.rusebot.rail.v1';
@@ -43,20 +43,21 @@ function readText(key: string, fallback: string): string {
 }
 
 export function Shell() {
-  const engines = useEngines();
+  const profilePhoto = useProfilePhoto();
   const company = useCompany();
   const reloadAgents = company.reload;
-  const chat = useChat(engines.choice, company.agents, company.reload);
   const [view, setView] = useState<View>('chat');
   const [drawer, setDrawer] = useState(false);
+  const drawerToggle = useRef<HTMLButtonElement>(null);
+  const sidebarInline = useMediaQuery(SIDEBAR_INLINE, true);
   const [rail, setRail] = useState(() => readText(KEY_RAIL, '0') === '1');
   const [panelOpen, setPanelOpen] = useState(false);
   const [settings, setSettings] = useState<PageId | null>(null);
   const [newAgent, setNewAgent] = useState(false);
   const [userName, setUserName] = useState(() => readText(KEY_NAME, 'You'));
-  const [profiles, setProfiles] = useState<Profile[]>([]);
   const [missions, setMissions] = useState<Mission[]>([]);
   const [ceoActions, setCeoActions] = useState<CeoAction[]>([]);
+  const [ceoActionsConfirmed, setCeoActionsConfirmed] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   // What failed to load (key -> message). The last data that did load stays on screen; Retry reads it all again.
   const [failures, setFailures] = useState<Record<string, string>>({});
@@ -73,26 +74,39 @@ export function Shell() {
   }, []);
   const fits = useMediaQuery(SIDEBAR_AND_PANEL_FIT, true);
 
+  const ceoActionsRequest = useRef(0);
+  const refreshCeoActions = useCallback(async () => {
+    const ticket = ++ceoActionsRequest.current;
+    setCeoActionsConfirmed(false);
+    try {
+      const actions = await listCeoActions();
+      if (ticket !== ceoActionsRequest.current) return;
+      setCeoActions(actions);
+      setCeoActionsConfirmed(true);
+      note('proposals', null);
+    } catch (error) {
+      if (ticket === ceoActionsRequest.current) note('proposals', messageOf(error));
+    }
+  }, [note]);
+  const chat = useChat(company.agents, company.profiles, company.loaded && company.error === null, reloadAgents, refreshCeoActions);
+  const agentDefaultsNotice = chat.engines.needsAgentDefaults && company.loaded
+    ? company.error
+      ? 'Could not load this Agent’s Engine and Model. Retry Agent discovery above to send.'
+      : 'This Agent is missing from the Agent list. Open another chat or refresh the Agent list.'
+    : undefined;
+
   // Every missions request takes a number; only the newest one may update the list, so a slow older answer
   // (for example a late "running" snapshot) never overwrites a newer one.
   const missionsRequest = useRef(0);
 
   const refreshCompany = useCallback(async () => {
     const ticket = ++missionsRequest.current;
-    const [p, m, c] = await Promise.allSettled([listProfiles(), listMissions(), listCeoActions()]);
-    if (p.status === 'fulfilled') {
-      setProfiles(p.value);
-      note('team', null);
-    } else note('team', messageOf(p.reason));
+    const [, m] = await Promise.allSettled([reloadAgents(), listMissions(), refreshCeoActions()]);
     if (m.status === 'fulfilled') {
       if (ticket === missionsRequest.current) setMissions(m.value);
       note('missions', null);
     } else note('missions', messageOf(m.reason));
-    if (c.status === 'fulfilled') {
-      setCeoActions(c.value);
-      note('proposals', null);
-    } else note('proposals', messageOf(c.reason));
-  }, [note]);
+  }, [note, reloadAgents, refreshCeoActions]);
 
   /** Resolves when the request settles, so the caller can schedule the next poll after it. */
   const refreshMissions = useCallback(async () => {
@@ -109,12 +123,13 @@ export function Shell() {
 
   useEffect(() => {
     void refreshCompany();
-    void reloadAgents();
-  }, [refreshCompany, reloadAgents, view]);
+  }, [refreshCompany, view]);
 
   const failedParts = [...(company.error ? ['agents'] : []), ...Object.keys(failures)];
   const failureDetail = company.error ?? Object.values(failures)[0] ?? '';
-  const collapsed = rail || (panelOpen && !fits);
+  const forcedRail = panelOpen && !fits;
+  const collapsed = rail || forcedRail;
+  const selectedAgent = chat.agentFor(chat.selectedId);
 
   const conversation = chat.conversations.find((c) => c.id === chat.selectedId) ?? null;
   const legacyThread = chat.selectedId?.startsWith('legacy:')
@@ -128,19 +143,23 @@ export function Shell() {
     return out;
   }, [chat.messages, chat.selectedId]);
 
-  const goView = (next: View) => {
-    setView(next);
+  const closeDrawer = () => {
+    if (drawer && !sidebarInline && document.activeElement?.closest('[data-sidebar]')) {
+      drawerToggle.current?.focus();
+    }
     setDrawer(false);
+  };
+
+  const goView = (next: View) => {
+    chat.invalidateNavigation();
+    setView(next);
+    closeDrawer();
     if (next !== 'team' && next !== 'contracts') setPanelOpen(false);
   };
 
-  const openChatWith = async (agent: Agent) => {
-    try {
-      await chat.openAgentChat(agent);
-      goView('chat');
-    } catch (e) {
-      setNotice(messageOf(e));
-    }
+  const openChatWith = (agent: Agent) => {
+    setNotice(null);
+    void chat.openAgentChat(agent, () => goView('chat'), setNotice);
   };
 
   const decideCeo = async (action: CeoAction, decision: 'approve' | 'deny'): Promise<DecideResult> => {
@@ -171,19 +190,22 @@ export function Shell() {
     <div className="flex h-full flex-col" data-rusebot-shell>
       <div className="relative flex min-h-0 flex-1">
         <button
+          ref={drawerToggle}
           type="button"
           aria-label="Open chat list"
           aria-expanded={drawer}
-          onClick={() => setDrawer((o) => !o)}
+          onClick={() => drawer ? closeDrawer() : setDrawer(true)}
           className="absolute left-3 top-3 z-30 rounded-md p-1.5 text-ink-secondary hover:bg-raised hover:text-ink md:hidden"
         >
           <Menu size={18} />
         </button>
-        {drawer && <div aria-hidden="true" className="absolute inset-0 z-30 bg-black/30 md:hidden" onClick={() => setDrawer(false)} />}
+        {drawer && <div aria-hidden="true" className="absolute inset-0 z-30 bg-black/30 md:hidden" onMouseDown={(event) => event.preventDefault()} onClick={closeDrawer} />}
         <Sidebar
           open={drawer}
-          onClose={() => setDrawer(false)}
+          inert={!sidebarInline && !drawer}
+          onClose={closeDrawer}
           rail={collapsed}
+          canExpandRail={sidebarInline && !forcedRail}
           onToggleRail={() => {
             const next = !rail;
             setRail(next);
@@ -196,77 +218,85 @@ export function Shell() {
           view={view}
           onView={goView}
           conversations={chat.conversations}
+          profileIdForConversation={chat.profileIdForConversation}
           legacy={chat.legacy}
           selectedId={chat.selectedId}
           onSelect={(id) => {
             chat.select(id);
             goView('chat');
           }}
-          onNewChat={() => {
-            chat.newChat();
+          specialist={selectedAgent?.id === CEO_PROFILE_ID ? null : selectedAgent}
+          onNewChat={(recipientId) => {
+            chat.newChat(recipientId);
             goView('chat');
           }}
           onNewAgent={() => setNewAgent(true)}
           agents={company.agents}
-          onOpenAgent={(a) => void openChatWith(a)}
+          onOpenAgent={openChatWith}
           onSettings={() => setSettings('general')}
           activeRunIds={chat.activeRunIds}
           needsYou={needsYou}
           onNeedsYou={() => goView('results')}
           userName={userName}
+          userPhoto={profilePhoto.url}
           previews={previews}
         />
         {view === 'chat' && (
           <ChatView
             chat={chat}
-            engines={engines}
+            engines={chat.engines}
             conversation={conversation}
             legacyThread={legacyThread}
-            agent={chat.agentFor(chat.selectedId)}
+            agent={selectedAgent}
             onOpenProfile={() => goView('team')}
             onNewAgent={() => setNewAgent(true)}
             onManageProviders={() => setSettings('ai')}
+            agentDefaultsNotice={agentDefaultsNotice}
             ready={chat.loaded && company.loaded}
           />
         )}
         {(view === 'team' || view === 'contracts') && (
           <TeamView
             mode={view}
+            loaded={company.loaded}
+            contractsStatus={company.profilesConfirmed ? 'ready' : company.error !== null ? 'error' : 'loading'}
             teams={company.teams}
             agents={company.agents}
-            profiles={profiles}
+            profiles={company.profiles}
             missions={missions}
-            onOpenChat={(a) => void openChatWith(a)}
+            onOpenChat={openChatWith}
             onPollMissions={refreshMissions}
-            onChanged={() => {
-              void refreshCompany();
-              void company.reload();
-            }}
+            onChanged={() => void refreshCompany()}
             onNewAgent={() => setNewAgent(true)}
             onPanelChange={setPanelOpen}
           />
         )}
-        {view === 'results' && <ResultsView chat={chat} ceoActions={ceoActions} onCeoDecide={decideCeo} />}
-        {failedParts.length > 0 && (
-          <div
-            role="alert"
-            data-load-error
-            className="absolute left-1/2 top-3 z-40 flex max-w-[min(640px,calc(100%-24px))] -translate-x-1/2 items-start gap-2 rounded-lg border border-danger/30 bg-card px-3 py-2 text-[13px] text-danger shadow-lg"
-          >
-            <p dir="auto" className="min-w-0 break-words">
-              Could not refresh {failedParts.join(', ')}. Showing the last data that loaded. {failureDetail}
-            </p>
-            <button
-              type="button"
-              data-load-retry
-              className="shrink-0 font-medium underline"
-              onClick={() => {
-                void refreshCompany();
-                void company.reload();
-              }}
-            >
-              Retry
-            </button>
+        {view === 'results' && <ResultsView chat={chat} ceoActions={ceoActions} ceoActionsConfirmed={ceoActionsConfirmed} onCeoDecide={decideCeo} />}
+        {(chat.conversationListError || failedParts.length > 0) && (
+          <div className="absolute left-1/2 top-3 z-40 flex max-w-[min(640px,calc(100%-24px))] -translate-x-1/2 flex-col gap-2 rounded-lg border border-danger/30 bg-card px-3 py-2 text-[13px] text-danger shadow-lg">
+            {chat.conversationListError && (
+              <div role="alert" className="flex items-start gap-2">
+                <p dir="auto" className="min-w-0 break-words">{chat.conversationListError}</p>
+                <button
+                  type="button"
+                  className="shrink-0 font-medium underline disabled:opacity-60"
+                  disabled={chat.retryingConversationList}
+                  onClick={chat.retryConversationList}
+                >
+                  {chat.retryingConversationList ? 'Retrying…' : 'Retry'}
+                </button>
+              </div>
+            )}
+            {failedParts.length > 0 && (
+              <div role="alert" data-load-error className="flex items-start gap-2">
+                <p dir="auto" className="min-w-0 break-words">
+                  Could not refresh {failedParts.join(', ')}. Showing the last data that loaded. {failureDetail}
+                </p>
+                <button type="button" data-load-retry className="shrink-0 font-medium underline" onClick={() => void refreshCompany()}>
+                  Retry
+                </button>
+              </div>
+            )}
           </div>
         )}
         {notice && (
@@ -281,16 +311,15 @@ export function Shell() {
       {newAgent && (
         <NewAgentDialog
           onClose={() => setNewAgent(false)}
-          onCreated={async (profile) => {
+          onCreated={async () => {
             setNewAgent(false);
-            await company.reload();
-            await chat.openAgentChat(agentOf(profile)).catch(() => undefined);
-            goView('chat');
+            await refreshCompany();
           }}
         />
       )}
       {settings && (
         <SettingsModal
+          profilePhoto={profilePhoto}
           initialPage={settings}
           onClose={() => setSettings(null)}
           userName={userName}

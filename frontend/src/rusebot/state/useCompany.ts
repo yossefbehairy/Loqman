@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { CEO_PROFILE_ID, listProfiles, type Profile } from '../data/worker';
 import type { Agent, ModelReasoning, Team } from '../types';
 
@@ -7,9 +7,11 @@ export interface Company {
   agents: Agent[];
   teams: Team[];
   ceo: Agent | null;
-  /** True once the first profiles request has settled. */
+  /** True once a current profiles request has settled. */
   loaded: boolean;
-  /** Why the last profiles request failed; the agents shown are then the last ones that loaded. Null when it worked. */
+  /** True once a successful profile snapshot has been received, including an empty one. */
+  profilesConfirmed: boolean;
+  /** Why the current profiles request failed; the last good snapshot remains visible. */
   error: string | null;
   reload: () => Promise<void>;
 }
@@ -44,29 +46,33 @@ export function agentOf(profile: Profile): Agent {
   };
 }
 
+const EMPTY_PROFILES: Profile[] = [];
+
 /** Agents are the worker's profiles: the CEO plus whatever the user or the CEO has created. */
 export function useCompany(): Company {
-  const [profiles, setProfiles] = useState<Profile[]>([]);
+  const [snapshot, setProfiles] = useState<Profile[] | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const profilesRequest = useRef(0);
   const reload = useCallback(async () => {
+    const ticket = ++profilesRequest.current;
     try {
-      setProfiles(await listProfiles());
+      const next = await listProfiles();
+      if (ticket !== profilesRequest.current) return;
+      setProfiles(next);
       setError(null);
     } catch (e) {
       // A failed read never empties the team: the last agents that loaded stay on screen.
-      setError(e instanceof Error ? e.message : String(e));
+      if (ticket === profilesRequest.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoaded(true);
+      if (ticket === profilesRequest.current) setLoaded(true);
     }
   }, []);
-  useEffect(() => {
-    void reload();
-  }, [reload]);
 
+  const profiles = snapshot ?? EMPTY_PROFILES;
   const agents = profiles.map(agentOf);
   const names = new Map<string, string>();
   for (const a of agents) if (a.team && !names.has(a.team)) names.set(a.team, a.team === 'agents' ? 'Agents' : a.team);
   const teams: Team[] = [...names].map(([id, name]) => ({ id, name, desc: '', mgr: null, color: '' }));
-  return { profiles, agents, teams, ceo: agents.find((a) => a.mgr) ?? null, loaded, error, reload };
+  return { profiles, agents, teams, ceo: agents.find((a) => a.mgr) ?? null, loaded, profilesConfirmed: snapshot !== null, error, reload };
 }

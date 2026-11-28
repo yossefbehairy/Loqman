@@ -1,4 +1,5 @@
-import { expect, test, type Page, type Route } from '@playwright/test';
+import { expect, test, type Page, type Route, type Locator } from '@playwright/test';
+import { SKIN_IDS } from '../src/rusebot/lib/skins';
 
 /**
  * RuseBot-derived interface (src/rusebot). Runs against the isolated mock-mode
@@ -43,6 +44,9 @@ async function open(page: Page, path = '/?ui=rusebot', { asAgent = true } = {}) 
     await page.locator('#na-role').fill('Test agent');
     await page.locator('#na-instructions').fill('You are a test agent. Answer briefly.');
     await page.getByRole('button', { name: 'Create agent' }).click();
+    await expect(page.getByRole('dialog', { name: 'New agent', exact: true })).toHaveCount(0);
+    await ensureDrawerOpen(page);
+    await page.locator('[data-sidebar-agent-row]').filter({ hasText: agentName }).click();
     await expect(page.getByRole('textbox', { name: `Message ${agentName}` })).toBeVisible();
     // Start from a fresh chat with this agent (New chat stays with the current agent).
     await openDrawerIfNarrow(page);
@@ -79,7 +83,7 @@ const MOCK_REPLY = /Mock task execution succeeded/;
 
 test('model images never fetch remote URLs and local images still render', async ({ page }) => {
   const remote = 'https://example.com/model-tracker.png?secret=test';
-  const reply = `![Remote image](${remote})\n\n![Local image](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=)`;
+  const reply = `![Remote image](${remote})\r\r\n\r\r\n![Local image](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=)`;
   const conversation = { id: 'image-test', title: 'Images', profile_id: null, created_at: '2026-11-15T00:00:00Z', updated_at: '2026-11-15T00:00:00Z' };
   let created = false;
   let answered = false;
@@ -158,8 +162,11 @@ test.describe('look and layout match RuseBot 0.1.127', () => {
     await page.locator('[data-sidebar-nav=team]').click();
     const card = page.locator('article').filter({ hasText: name });
     await expect(card).toBeVisible();
-    await expect(card).not.toContainText('zz-old-model-9');
-    await expect(card).toContainText('Default');
+    await expect(card.locator('small')).toHaveAttribute('title', /Default/);
+    await card.getByRole('button', { name: `Open ${name}`, exact: true }).click();
+    const details = page.locator('[data-agent-panel]');
+    await expect(details).not.toContainText('zz-old-model-9');
+    await expect(details).toContainText('Default');
   });
 
   test('wide window: sidebar, composer, bubbles and fonts', async ({ page }) => {
@@ -250,7 +257,7 @@ test.describe('look and layout match RuseBot 0.1.127', () => {
     await expect.poll(async () => (await aside.boundingBox())!.width).toBe(REFERENCE.sidebarWidth);
   });
 
-  test('a side panel on a mid-size window folds the sidebar into the rail and overlays the panel', async ({ page }) => {
+  test('a side panel on a mid-size window folds the sidebar into the rail and reduces the Team canvas', async ({ page }) => {
     await page.setViewportSize({ width: 1100, height: 800 });
     await open(page);
     await page.getByRole('button', { name: 'Team', exact: true }).click();
@@ -261,7 +268,8 @@ test.describe('look and layout match RuseBot 0.1.127', () => {
     const panel = page.locator('[data-agent-panel]');
     await expect(panel).toBeVisible();
     await expect.poll(async () => (await aside.boundingBox())!.width).toBe(92);
-    expect(await panel.evaluate((el) => getComputedStyle(el).position)).toBe('absolute');
+    const chart = page.getByRole('region', { name: 'Team canvas' });
+    expect((await chart.boundingBox())!.width + (await panel.boundingBox())!.width).toBeLessThanOrEqual(1100 - 92);
     await page.getByRole('button', { name: 'Close details' }).click();
     await expect.poll(async () => (await aside.boundingBox())!.width).toBe(REFERENCE.sidebarWidth);
   });
@@ -272,9 +280,10 @@ test.describe('look and layout match RuseBot 0.1.127', () => {
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     const dialog = page.getByRole('dialog');
     await dialog.locator('[data-settings-page=appearance]').click();
-    await dialog.getByRole('combobox', { name: 'Theme' }).selectOption('midnight');
-    await dialog.getByRole('combobox', { name: 'Chat width' }).selectOption('wide');
-    await dialog.getByRole('combobox', { name: 'Font' }).selectOption('serif');
+    await dialog.getByRole('button', { name: /View all/ }).click();
+    await dialog.getByRole('button', { name: 'Use Midnight theme' }).click();
+    await dialog.getByRole('button', { name: 'Wide chat width' }).click();
+    await chooseSelect(dialog.getByRole('combobox', { name: 'Font' }), 'serif');
     await expect(page.locator('html')).toHaveAttribute('data-skin', 'midnight');
     await expect(page.locator('html')).toHaveAttribute('data-chat-width', 'wide');
     await expect(page.locator('html')).toHaveAttribute('data-font', 'serif');
@@ -430,13 +439,13 @@ test.describe('earlier chats from the classic interface', () => {
   const thread = {
     id: 'legacy-1',
     question: 'سؤال قديم about C:\\work\\src\\app.ts',
-    reply: 'مرحبا بك\n\n```ts\nconst x = 1;\n```\n\nUse `npm run build` at C:\\work\\src.',
+    reply: 'مرحبا بك\r\r\n\r\r\n```ts\r\r\nconst x = 1;\r\r\n```\r\r\n\r\r\nUse `npm run build` at C:\\work\\src.',
     proposed: [],
     ts: Date.UTC(2026, 10, 1, 9, 30),
     turns: [
       {
         question: 'سؤال قديم about C:\\work\\src\\app.ts',
-        reply: 'مرحبا بك\n\n```ts\nconst x = 1;\n```\n\nUse `npm run build` at C:\\work\\src.',
+        reply: 'مرحبا بك\r\r\n\r\r\n```ts\r\r\nconst x = 1;\r\r\n```\r\r\n\r\r\nUse `npm run build` at C:\\work\\src.',
         proposed: [],
         ts: Date.UTC(2026, 10, 1, 9, 30),
       },
@@ -566,18 +575,21 @@ test.describe('approvals and deliverables', () => {
 
   test('tool approval can be denied', async ({ page }) => {
     const decided: Array<Record<string, unknown>> = [];
+    const approval = { id: 'ap-2', run_id: 'run-fixture', action_summary: 'Run npm install', scope: 'shell', status: 'pending', expires_at: null };
+    let pending = true;
     await page.route('**/__agentos/call', async (route: Route) => {
       const req = JSON.parse(route.request().postData() ?? '{}');
       if (req.method === 'approvals.list') {
         await route.fulfill({
           contentType: 'application/json',
-          body: JSON.stringify({ result: { approvals: [{ id: 'ap-2', run_id: 'run-fixture', action_summary: 'Run npm install', scope: 'shell', status: 'pending', expires_at: null }] } }),
+          body: JSON.stringify({ result: { approvals: pending ? [approval] : [] } }),
         });
         return;
       }
       if (req.method === 'approvals.decide') {
         decided.push(req.params);
-        await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ result: {} }) });
+        pending = false;
+        await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ result: { ...approval, status: 'denied' } }) });
         return;
       }
       await route.continue();
@@ -682,6 +694,31 @@ test.describe('team, contracts and settings', () => {
     await expect.poll(async () => (await call<{ conversations: unknown[] }>(page, 'conversations.list')).conversations.length).toBeGreaterThanOrEqual(before);
   });
 
+  test('department roster opens contract editing and manual chat for the selected agent', async ({ page }) => {
+    const team = `Roster-${uid()}`;
+    const names = Array.from({ length: 4 }, (_, i) => `${team}-${i}`);
+    for (const name of names) {
+      await call(page, 'profiles.create', { name, role_type: 'custom', instructions: 'Test roster navigation.', settings_json: JSON.stringify({ team_name: team }) });
+    }
+    await open(page, '/?ui=rusebot', { asAgent: false });
+    await page.locator('[data-sidebar-nav=team]').click();
+    const more = page.getByRole('region', { name: team, exact: true }).getByRole('button', { name: 'View all 4 agents' });
+    const roster = page.getByRole('dialog', { name: team });
+    await more.click();
+    await roster.getByRole('button', { name: `Open ${names[3]}`, exact: true }).click();
+    const details = page.locator('[data-agent-panel]');
+    const id = await details.getAttribute('data-agent-panel');
+    await details.locator('#rb-contract').fill('Updated roster contract.');
+    await details.getByRole('button', { name: 'Save contract' }).click();
+    await expect(details.getByRole('status')).toHaveText('Contract saved.');
+    expect((await call<{ instructions: string }>(page, 'profiles.get', { profile_id: id })).instructions).toBe('Updated roster contract.');
+    await details.getByRole('button', { name: 'Close details' }).click();
+    await more.click();
+    await roster.getByRole('button', { name: `Open chat with ${names[3]}` }).click();
+    await expect(page.getByRole('textbox', { name: `Message ${names[3]}` })).toBeVisible();
+    await expect(page.getByRole('dialog', { name: team })).toHaveCount(0);
+  });
+
   test('delegating a task creates a mission that is listed with its status', async ({ page }) => {
     await open(page);
     await openDrawerIfNarrow(page);
@@ -721,11 +758,11 @@ test.describe('team, contracts and settings', () => {
 
   test('delegated missions update while active and open to their result and errors', async ({ page }) => {
     let listCalls = 0;
+    let done = false;
     await page.route('**/__agentos/call', async (route: Route) => {
       const req = JSON.parse(route.request().postData() ?? '{}');
       if (req.method !== 'missions.list') return route.continue();
       listCalls += 1;
-      const done = listCalls > 2;
       const missions = [
         {
           id: 'm-ok', title: 'Write the weekly note', objective: 'x', status: done ? 'succeeded' : 'running',
@@ -744,6 +781,7 @@ test.describe('team, contracts and settings', () => {
     await page.getByRole('button', { name: 'Team', exact: true }).click();
     const ok = page.locator('[data-mission=m-ok]');
     await expect(ok).toContainText('running');
+    done = true;
     // No navigation: the list refreshes by itself until the mission is terminal.
     await expect(ok).toContainText('succeeded', { timeout: 15000 });
     await ok.getByRole('button').click();
@@ -801,11 +839,11 @@ test.describe('agents: created by the user or by Loqman, no built-in specialists
     }
   });
 
-  test('the + menu creates an agent that appears in Team and gets its own chat', async ({ page }) => {
+  test('the + menu creates an agent without opening its chat, and it appears in Team', async ({ page }) => {
     await open(page, '/?ui=rusebot', { asAgent: false });
     await openDrawerIfNarrow(page);
     await page.locator('[data-sidebar-new]').click();
-    await expect(page.getByRole('menuitem')).toHaveText(['New chat', 'New agent']);
+    await expect(page.getByRole('menuitem')).toHaveText(['New chat with Loqman', 'New agent']);
     await page.locator('[data-new-agent]').click();
     const name = `Maker${uid()}`;
     await page.locator('#na-name').fill(name);
@@ -813,8 +851,10 @@ test.describe('agents: created by the user or by Loqman, no built-in specialists
     await expect(page.getByRole('button', { name: 'Create agent' })).toBeDisabled(); // instructions are required
     await page.locator('#na-instructions').fill('Make things.');
     await page.getByRole('button', { name: 'Create agent' }).click();
-    await expect(page.locator('[data-chathead-pill]')).toContainText(name);
-    await openDrawerIfNarrow(page);
+    await expect(page.getByRole('dialog', { name: 'New agent', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('textbox', { name: 'Message Loqman' })).toBeVisible();
+    await expect(page.locator('[data-chathead-pill]')).not.toContainText(name);
+    await ensureDrawerOpen(page);
     await page.locator('[data-sidebar-nav=team]').click();
     await expect(page.locator(`[aria-label="Open chat with ${name}"]`)).toBeVisible();
   });
@@ -826,6 +866,9 @@ test.describe('agents: created by the user or by Loqman, no built-in specialists
     await openDrawerIfNarrow(page);
     await page.locator('[data-sidebar-nav=team]').click();
     await page.locator(`[aria-label="Open ${name}"]`).click();
+    page.once('dialog', (d) => void d.dismiss());
+    await page.getByRole('button', { name: 'Delete agent' }).click();
+    await expect(page.locator('[data-agent-panel]')).toBeVisible();
     page.once('dialog', (d) => void d.accept());
     await page.getByRole('button', { name: 'Delete agent' }).click();
     await expect(page.locator(`[aria-label="Open ${name}"]`)).toHaveCount(0);
@@ -841,7 +884,7 @@ test.describe('agents: created by the user or by Loqman, no built-in specialists
     await openDrawerIfNarrow(page);
     await page.locator('[data-sidebar-nav=team]').click();
     const total = (await call<{ profiles: unknown[] }>(page, 'profiles.list')).profiles.length;
-    await expect(page.locator('[data-agent-card]')).toHaveCount(total);
+    await expect(page.locator('.org-summary span').last()).toHaveText(`${total - 1} ${total === 2 ? 'agent' : 'agents'}`);
   });
 });
 
@@ -1088,26 +1131,28 @@ test.describe('settings: AI providers (engine calls stubbed)', () => {
     expect(calls.filter((c) => c.method === 'engines.status' && c.params.force === true).length).toBeGreaterThan(0);
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Add', exact: true }).click();
-    await expect(page.locator('#rb-engine option[value=needs-login-e]')).toBeEnabled();
+    await page.locator('#rb-engine').click();
+    await expect(page.getByRole('option').and(page.locator('[data-value=needs-login-e]'))).toBeEnabled();
   });
 
   test('the default provider and model chosen in Settings show up in the Composer', async ({ page }) => {
     await stubProviders(page, FIVE_STATES);
-    const dialog = await openAiSettings(page);
-    await dialog.locator('#ai-default-engine').selectOption('ready-e');
+    const dialog = await openGeneralSettings(page);
+    await chooseDefault(dialog, 'engine', 'ready-e');
     await expect(dialog.locator('#ai-default-model')).toBeEnabled();
-    await dialog.locator('#ai-default-model').selectOption('m2');
+    await chooseDefault(dialog, 'model', 'm2');
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Add', exact: true }).click();
-    await expect(page.locator('#rb-engine')).toHaveValue('ready-e');
-    await expect(page.locator('#rb-model')).toHaveValue('m2');
+    await expect(page.locator('#rb-engine')).toHaveAttribute('data-value', 'ready-e');
+    await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm2');
+    await page.locator('#rb-engine').click();
     // Friendly titles, and providers that are not usable are disabled with the reason.
-    await expect(page.locator('#rb-engine option[value=ready-e]')).toHaveText('Alpha');
-    await expect(page.locator('#rb-engine option[value=not-installed-e]')).toBeDisabled();
-    await expect(page.locator('#rb-engine option[value=not-installed-e]')).toHaveText('Zeta (not installed)');
-    await expect(page.locator('#rb-engine option[value=needs-login-e]')).toBeDisabled();
-    await expect(page.locator('#rb-engine option[value=error-e]')).toBeDisabled();
-    await expect(page.locator('#rb-engine option[value=unverified-e]')).toBeEnabled();
+    await expect(page.getByRole('option').and(page.locator('[data-value=ready-e]'))).toHaveText('Alpha');
+    await expect(page.getByRole('option').and(page.locator('[data-value=not-installed-e]'))).toBeDisabled();
+    await expect(page.getByRole('option').and(page.locator('[data-value=not-installed-e]'))).toHaveText('Zeta (not installed)');
+    await expect(page.getByRole('option').and(page.locator('[data-value=needs-login-e]'))).toBeDisabled();
+    await expect(page.getByRole('option').and(page.locator('[data-value=error-e]'))).toBeDisabled();
+    await expect(page.getByRole('option').and(page.locator('[data-value=unverified-e]'))).toBeEnabled();
   });
 
   test('clicking a model marks it as the provider default and is remembered', async ({ page }) => {
@@ -1150,10 +1195,10 @@ test.describe('settings: AI providers (engine calls stubbed)', () => {
     await openDrawerIfNarrow(page);
     await page.locator('[data-sidebar-new]').click();
     await page.locator('[data-new-agent]').click();
-    await expect(page.locator('#na-engine')).toHaveValue('mock'); // starts from the current default
-    await page.locator('#na-engine').selectOption('ready-e');
+    await expect(page.locator('#na-engine')).toHaveAttribute('data-value', 'mock'); // starts from the current default
+    await chooseSelect(page.locator('#na-engine'), 'ready-e');
     await expect(page.locator('#na-model')).toBeEnabled();
-    await page.locator('#na-model').selectOption('m2');
+    await chooseSelect(page.locator('#na-model'), 'm2');
     await page.locator('#na-name').fill('Picker');
     await page.locator('#na-instructions').fill('Pick things.');
     await page.getByRole('button', { name: 'Create agent' }).click();
@@ -1173,13 +1218,13 @@ test.describe('settings: AI providers (engine calls stubbed)', () => {
         return { models: MODELS };
       },
     });
-    const dialog = await openAiSettings(page);
-    await dialog.locator('#ai-default-engine').selectOption('ready-e'); // slow
-    await dialog.locator('#ai-default-engine').selectOption('unverified-e'); // fast, chosen last
+    const dialog = await openGeneralSettings(page);
+    await chooseDefault(dialog, 'engine', 'ready-e'); // slow
+    await chooseDefault(dialog, 'engine', 'unverified-e'); // fast, chosen last
     await expect(dialog.locator('#ai-default-model')).toBeEnabled();
     await page.waitForTimeout(2200); // the slow answer has landed by now
-    await expect(dialog.locator('#ai-default-engine')).toHaveValue('unverified-e');
-    await expect(dialog.locator('#ai-default-model')).toHaveValue('m1');
+    await expect(dialog.locator('#ai-default-engine')).toHaveAttribute('data-value', 'unverified-e');
+    await expect(dialog.locator('#ai-default-model')).toHaveAttribute('data-value', 'm1');
   });
 
   test('R1: the first default pick does not overwrite a provider the user picked while it was loading', async ({ page }) => {
@@ -1190,10 +1235,10 @@ test.describe('settings: AI providers (engine calls stubbed)', () => {
         return { models: MODELS };
       },
     });
-    const dialog = await openAiSettings(page, true);
-    await dialog.locator('#ai-default-engine').selectOption('unverified-e'); // while the automatic pick still waits
+    const dialog = await openGeneralSettings(page, true);
+    await chooseDefault(dialog, 'engine', 'unverified-e'); // while the automatic pick still waits
     await page.waitForTimeout(3200);
-    await expect(dialog.locator('#ai-default-engine')).toHaveValue('unverified-e');
+    await expect(dialog.locator('#ai-default-engine')).toHaveAttribute('data-value', 'unverified-e');
   });
 
   test('R2: with no usable provider nothing is chosen and sending is disabled with a pointer to Settings', async ({ page }) => {
@@ -1204,7 +1249,7 @@ test.describe('settings: AI providers (engine calls stubbed)', () => {
     await expect(page.locator('[data-composer-no-provider]')).toContainText('Settings > AI');
     await expect(page.getByRole('button', { name: 'Send' })).toBeDisabled();
     await page.getByRole('button', { name: 'Add', exact: true }).click();
-    await expect(page.locator('#rb-engine')).toHaveValue(''); // no engine is preselected
+    await expect(page.locator('#rb-engine')).toHaveAttribute('data-value', ''); // no engine is preselected
   });
 
   test('R2: a remembered choice that is no longer usable is cleared when the replacement has no models', async ({ page }) => {
@@ -1240,7 +1285,11 @@ test.describe('settings: AI providers (engine calls stubbed)', () => {
     });
     const dialog = await openAiSettings(page, true);
     await expect(dialog.locator('[data-engine-card=ready-e] [data-engine-state]')).toHaveText('Problem');
-    await expect(dialog.locator('#ai-default-engine option[value=ready-e]')).toBeDisabled();
+    await dialog.locator('[data-settings-page=general]').click();
+    await dialog.locator('#ai-default-engine').click();
+    await expect(page.getByRole('option').and(page.locator('[data-value=ready-e]'))).toHaveAttribute('aria-disabled', 'true');
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('listbox')).toHaveCount(0);
     await page.keyboard.press('Escape');
     await page.getByRole('textbox', { name: 'Message Loqman' }).fill('hello');
     await expect(page.locator('[data-composer-no-provider]')).toBeVisible();
@@ -1271,7 +1320,8 @@ test.describe('settings: AI providers (engine calls stubbed)', () => {
     await expect(dialog.getByText(/no longer installed/)).toBeVisible();
     await page.keyboard.press('Escape');
     await page.getByRole('button', { name: 'Add', exact: true }).click();
-    await expect(page.locator('#rb-engine option[value=ready-e]')).toBeDisabled();
+    await page.locator('#rb-engine').click();
+    await expect(page.getByRole('option').and(page.locator('[data-value=ready-e]'))).toBeDisabled();
   });
 
   test('R7: an unverified provider also offers the sign-in step, below its models and test', async ({ page }) => {
@@ -1646,10 +1696,10 @@ test.describe('routing: the worker default decides, Loqman sends the chosen engi
         return saved;
       },
     });
-    let dialog = await openAiSettings(page, true);
-    await dialog.locator('#ai-default-engine').selectOption('unverified-e');
+    let dialog = await openGeneralSettings(page, true);
+    await chooseDefault(dialog, 'engine', 'unverified-e');
     await expect(dialog.locator('#ai-default-model')).toBeEnabled();
-    await dialog.locator('#ai-default-model').selectOption('m2');
+    await chooseDefault(dialog, 'model', 'm2');
     await expect.poll(() => saved).toEqual({ engine: 'unverified-e', model_id: 'm2' });
     expect(calls.filter((c) => c.method === 'preferences.set_default').at(-1)?.params).toEqual({ engine: 'unverified-e', model_id: 'm2' });
     // The browser cache is gone: only the worker still knows the default.
@@ -1662,9 +1712,9 @@ test.describe('routing: the worker default decides, Loqman sends the chosen engi
     await openDrawerIfNarrow(page);
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     dialog = page.getByRole('dialog');
-    await dialog.locator('[data-settings-page=ai]').click();
-    await expect(dialog.locator('#ai-default-engine')).toHaveValue('unverified-e');
-    await expect(dialog.locator('#ai-default-model')).toHaveValue('m2');
+    await dialog.locator('[data-settings-page=general]').click();
+    await expect(dialog.locator('#ai-default-engine')).toHaveAttribute('data-value', 'unverified-e');
+    await expect(dialog.locator('#ai-default-model')).toHaveAttribute('data-value', 'm2');
   });
 
   test('the worker default wins over a stale remembered choice, and a failed save is shown', async ({ page }) => {
@@ -1676,10 +1726,10 @@ test.describe('routing: the worker default decides, Loqman sends the chosen engi
         throw new Error('disk is full');
       },
     });
-    const dialog = await openAiSettings(page, true);
-    await expect(dialog.locator('#ai-default-engine')).toHaveValue('unverified-e');
-    await expect(dialog.locator('#ai-default-model')).toHaveValue('m2');
-    await dialog.locator('#ai-default-model').selectOption('m1');
+    const dialog = await openGeneralSettings(page, true);
+    await expect(dialog.locator('#ai-default-engine')).toHaveAttribute('data-value', 'unverified-e');
+    await expect(dialog.locator('#ai-default-model')).toHaveAttribute('data-value', 'm2');
+    await chooseDefault(dialog, 'model', 'm1');
     await expect(dialog.getByRole('alert').filter({ hasText: 'Could not save the default' })).toBeVisible();
   });
 });
@@ -1695,25 +1745,38 @@ test.describe('P3: startup and Settings', () => {
 
   test('a model chosen while the worker default is still loading is not overwritten by it', async ({ page }) => {
     let answered = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
     await stubProviders(page, ENGINES, {
       'engines.capabilities': capsWithoutMock(ENGINES),
       'preferences.get': async () => {
-        await sleep(2500);
+        await held;
         answered = true;
         return { engine: 'ready-e', model_id: 'm1' };
       },
     });
-    await page.goto('/?ui=rusebot');
-    await expect(page.locator('[data-rusebot-shell]')).toBeVisible();
-    // The user's choice arrives while preferences.get is pending (the store module is the one the app uses).
-    await page.evaluate(async () => {
-      const store = await import(/* @vite-ignore */ '/src/rusebot/state/useProviders.ts');
-      store.setProviderChoice({ engine: 'unverified-e', model: 'm2' });
-    });
-    await expect.poll(() => answered, { timeout: 15000 }).toBe(true);
-    await page.waitForTimeout(800); // the late worker answer has been handled
-    await expect(page.locator('[data-chathead-pill] [title="unverified-e · m2"]')).toBeVisible();
-    await expect(page.locator('[data-chathead-pill] [title="ready-e · m1"]')).toHaveCount(0);
+    try {
+      await page.goto('/?ui=rusebot');
+      await page.getByRole('button', { name: 'Add', exact: true }).click();
+      const engine = page.locator('#rb-engine');
+      await engine.click();
+      await page.getByRole('option').and(page.locator('[data-value=unverified-e]')).click();
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm1');
+      await page.locator('#rb-model').click();
+      await page.getByRole('option').and(page.locator('[data-value=m2]')).click();
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm2');
+      await page.getByRole('textbox', { name: 'Message Loqman' }).fill('Wait for startup discovery.');
+      const send = page.getByRole('button', { name: 'Send', exact: true });
+      await expect(send).toBeDisabled();
+      expect(answered).toBe(false);
+      release();
+      await expect.poll(() => answered, { timeout: 15000 }).toBe(true);
+      await expect(send).toBeEnabled();
+      await expect(page.locator('[data-chathead-pill] [title="unverified-e · m2"]')).toBeVisible();
+      await expect(page.locator('[data-chathead-pill] [title="ready-e · m1"]')).toHaveCount(0);
+    } finally {
+      release();
+    }
   });
 
   const BRIDGE_INIT = (mode: string) => {
@@ -1832,42 +1895,84 @@ test.describe('P3: missions and Loqman', () => {
   });
 
   test('while Loqman answers, the current step is shown; polling never overlaps and stops with the answer', async ({ page }) => {
-    let polls = 0;
+    const pollIntervalMs = 1500;
+    const progressRequests: unknown[] = [];
     let inflight = 0;
     let maxInflight = 0;
     const asked: Array<Record<string, unknown>> = [];
+    let releaseAsk!: () => void;
+    let releaseFirstPoll!: () => void;
+    const askCompletion = new Promise<void>(resolve => { releaseAsk = resolve; });
+    const firstPollResponse = new Promise<void>(resolve => { releaseFirstPoll = resolve; });
     await page.route('**/__agentos/call', async (route: Route) => {
       const req = reqOf(route);
+      if (req.method === 'engines.status') return okJson(route, { engines: [] });
       if (req.method === 'ceo.ask') {
         asked.push(req.params ?? {});
-        await sleep(4200);
+        await askCompletion;
         return okJson(route, { reply: 'done', actions_proposed: [], agents_created: [], iterations: 2, fast: false });
       }
       if (req.method === 'ceo.ask_progress') {
-        polls += 1;
+        progressRequests.push(req.params?.request_id);
+        const first = progressRequests.length === 1;
         inflight += 1;
         maxInflight = Math.max(maxInflight, inflight);
-        await sleep(300);
-        inflight -= 1;
-        const first = polls === 1;
-        return okJson(route, { stage: first ? 'thinking' : 'tool', detail: first ? '' : 'web_search', iteration: first ? 1 : 2, done: false });
+        try {
+          if (first) await firstPollResponse;
+          await okJson(route, { stage: first ? 'thinking' : 'tool', detail: first ? '' : 'web_search', iteration: first ? 1 : 2, done: false });
+        } finally {
+          inflight -= 1;
+        }
+        return;
       }
       return route.continue();
     });
-    await openBare(page);
-    const box = page.getByRole('textbox', { name: 'Message Loqman' });
-    await box.fill(`progress-${uid()}`);
-    await box.press('Enter');
-    const working = page.locator('[data-working]');
-    await expect(working).toContainText('Working');
-    await expect(working).toContainText('Thinking', { timeout: 8000 });
-    await expect(working).toContainText('Using web_search (step 2)', { timeout: 8000 });
-    expect(String(asked[0].request_id)).toMatch(/^ceo-/);
-    await expect(working).toHaveCount(0, { timeout: 10000 });
-    const after = polls;
-    await page.waitForTimeout(3500);
-    expect(polls).toBe(after);
-    expect(maxInflight).toBe(1);
+    try {
+      await page.clock.install();
+      await openBare(page);
+      const box = page.getByRole('textbox', { name: 'Message Loqman' });
+      const send = page.getByRole('button', { name: 'Send', exact: true });
+      const prompt = `progress-${uid()}`;
+      await box.fill(prompt);
+      await expect(send).toBeEnabled({ timeout: 8000 });
+      await page.clock.pauseAt(await page.evaluate(() => Date.now() + 60_000));
+      await box.press('Enter');
+
+      const working = page.locator('[data-working]');
+      await expect(working).toContainText('Working');
+      await expect.poll(() => asked).toHaveLength(1);
+      const selectedChat = page.locator('[data-sidebar-thread-row][aria-current=page]');
+      await expect(selectedChat).toHaveAttribute('data-sidebar-thread-row', /.+/);
+      expect(asked[0]).toMatchObject({
+        question: prompt,
+        conversation_id: await selectedChat.getAttribute('data-sidebar-thread-row'),
+        request_id: expect.stringMatching(/^ceo-/),
+      });
+      const requestId = asked[0].request_id;
+
+      await page.clock.runFor(pollIntervalMs);
+      await expect.poll(() => progressRequests).toEqual([requestId]);
+      // Keep the first response pending past two poll intervals to catch overlapping requests.
+      await page.clock.runFor(2 * pollIntervalMs);
+      expect(progressRequests).toEqual([requestId]);
+      releaseFirstPoll();
+      await expect(working).toContainText('Thinking', { timeout: 8000 });
+
+      await page.clock.runFor(pollIntervalMs);
+      await expect(working).toContainText('Using web_search (step 2)', { timeout: 8000 });
+      expect(progressRequests).toEqual([requestId, requestId]);
+      releaseAsk();
+      await expect(working).toHaveCount(0, { timeout: 10000 });
+      await page.clock.runFor(2 * pollIntervalMs);
+      await expect(working).toHaveCount(0);
+      expect(progressRequests).toEqual([requestId, requestId]);
+      expect(asked).toHaveLength(1);
+      expect(maxInflight).toBe(1);
+    } finally {
+      releaseFirstPoll();
+      releaseAsk();
+      await page.unrouteAll({ behavior: 'wait' });
+    }
   });
 
   const HISTORY = { id: 'legacy-ceo-history', title: 'CEO history', workspace_id: null, profile_id: null, created_at: '2026-11-01T10:00:00+00:00', updated_at: '2026-11-01T10:00:00+00:00' };
@@ -1976,12 +2081,13 @@ test.describe('chat: streaming replies', () => {
     emit(page, 'content.delta', driver('content.delta', itemId, { stream_kind: 'assistant_text', delta: text }));
 
   /** Starts a chat whose run is a stub; the stored assistant message appears once the run ends as succeeded. */
-  async function startRun(page: Page, text: string) {
+  async function startRun(page: Page, text: string, history: typeof longTranscript = []) {
     await fakeStream(page);
+    const userSeq = history.length + 1;
     const state = { cid: '', stored: false, cancelled: false, status: 'running', answer: 'The stored final answer.' };
     const snap = () => ({
-      id: RUN_ID, conversation_id: state.cid, engine: 'mock', model_id: 'mock', status: state.status, user_message_seq: 1,
-      assistant_message_seq: state.stored ? 2 : null, assistant_content: null, error: null, tool_mode: 'none',
+      id: RUN_ID, conversation_id: state.cid, engine: 'mock', model_id: 'mock', status: state.status, user_message_seq: userSeq,
+      assistant_message_seq: state.stored ? userSeq + 1 : null, assistant_content: null, error: null, tool_mode: 'none',
       created_at: '2026-11-15T00:00:00', started_at: null, finished_at: null,
     });
     await page.route('**/__agentos/call', async (route: Route) => {
@@ -2001,8 +2107,9 @@ test.describe('chat: streaming replies', () => {
         const base = { conversation_id: state.cid, client_message_id: null, created_at: '2026-11-15T00:00:00+00:00' };
         const after = Number(params?.after ?? 0);
         const all = [
-          { ...base, seq: 1, role: 'user', content: text },
-          ...(state.stored ? [{ ...base, seq: 2, role: 'assistant', content: state.answer }] : []),
+          ...history.map(message => ({ ...base, ...message })),
+          { ...base, seq: userSeq, role: 'user', content: text },
+          ...(state.stored ? [{ ...base, seq: userSeq + 1, role: 'assistant', content: state.answer }] : []),
         ];
         return okJson(route, { messages: all.filter((m) => m.seq > after) });
       }
@@ -2111,6 +2218,37 @@ test.describe('chat: streaming replies', () => {
     await expect(live(page)).toHaveCount(0);
   });
 
+  test('chat layout follows streaming at the bottom and preserves older reading through completion', async ({ page }, info) => {
+    const sent = `Streaming layout ${uid()}`;
+    const run = await startRun(page, sent, longTranscript);
+    const viewport = chatViewport(page);
+    const pin = () => expect.poll(() => bottomGap(page)).toBeLessThanOrEqual(2);
+    await expect(page.locator('[data-message-row]').filter({ hasText: sent })).toBeVisible();
+    await pin();
+    await expectSeparateChatRows(page);
+    await delta(page, 'layout', '## Live answer\n\n' + 'فقرة جديدة — A new paragraph.\n\n'.repeat(24));
+    await expect(live(page)).toContainText('A new paragraph.');
+    await pin();
+    await expectSeparateChatRows(page);
+    await page.screenshot({ path: info.outputPath('streaming.png'), animations: 'disabled' });
+    // Wait for the scroll event so this exercises the same follow state as a reader scrolling up.
+    const readingAt = await viewport.evaluate(el => new Promise<number>(resolve => {
+      el.addEventListener('scroll', () => resolve(el.scrollTop), { once: true });
+      el.scrollTop = 260;
+    }));
+    await delta(page, 'layout', '\n\nAnother chunk for the live answer.');
+    await expect(live(page)).toContainText('Another chunk');
+    expect(await viewport.evaluate(el => el.scrollTop)).toBe(readingAt);
+    await run.finish('succeeded');
+    await expect(page.locator('[data-message-row]').filter({ hasText: run.state.answer })).toBeVisible();
+    await expect(live(page)).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled();
+    expect(await viewport.evaluate(el => el.scrollTop)).toBe(readingAt);
+    await viewport.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    await pin();
+    await expectFinalLine(page, run.state.answer);
+  });
+
   test('hundreds of deltas are coalesced into few renders', async ({ page }) => {
     const run = await startRun(page, `burst-${uid()}`);
     const mutations = await page.evaluate(async () => {
@@ -2171,6 +2309,10 @@ test.describe('review fixes: chat state', () => {
     await page.goto('/?ui=rusebot');
     const chip = page.locator('[data-chathead-model]');
     await expect(chip).toBeVisible({ timeout: 30000 });
+    await expect(chip).toHaveAttribute('data-model-override', 'false');
+    await page.getByRole('button', { name: 'Add', exact: true }).click();
+    await page.locator('#rb-model').click();
+    await page.getByRole('option').nth(1).click();
     await expect(chip).toHaveAttribute('data-model-override', 'true');
     await expect(chip).toHaveAttribute('title', /saved-model-xyz/);
     await expect(chip).toContainText('override');
@@ -2336,4 +2478,608 @@ test.describe('review fixes: missions and load errors', () => {
     await expect(banner).toHaveCount(0);
     await expect(page.locator('[data-mission=keep-1]')).toBeVisible();
   });
+});
+
+
+async function openGeneralSettings(page: Page, bare = false) {
+  if (bare) await openBare(page);
+  else await open(page);
+  await ensureDrawerOpen(page);
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  return page.getByRole('dialog');
+}
+
+
+test.describe('General settings profile and layout', () => {
+  async function image(page: Page, type: string, color: string) {
+    const data = await page.evaluate(({ type, color }) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 640; canvas.height = 480;
+      const context = canvas.getContext('2d')!;
+      context.fillStyle = color; context.fillRect(0, 0, 640, 480);
+      return canvas.toDataURL(type).split(',')[1];
+    }, { type, color });
+    return { name: `avatar.${type.split('/')[1]}`, mimeType: type, buffer: Buffer.from(data, 'base64') };
+  }
+
+  for (const skin of ['meadow', 'midnight']) {
+    for (const width of [1440, 390]) {
+      test(`profile upload replace restore remove and layout ${skin} ${width}`, async ({ page }, testInfo) => {
+        await page.setViewportSize({ width, height: 900 });
+        await page.addInitScript(skin => localStorage.setItem('rusebot-skin', skin), skin);
+        let dialog = await openGeneralSettings(page, true);
+        await expect(dialog.locator('[data-settings-block=general] > div')).toHaveCount(3);
+        await dialog.getByLabel('Your name').fill('Sara');
+        await expect(dialog.locator('[data-user-avatar]')).toHaveText('S');
+        const input = dialog.getByLabel('Choose profile photo');
+        await expect(dialog.getByRole('button', { name: 'Change photo' })).toBeEnabled();
+        await input.setInputFiles(await image(page, 'image/png', '#559977'));
+        const avatar = dialog.getByRole('img', { name: 'Your profile photo' });
+        await expect(avatar).toBeVisible();
+        const first = await avatar.getAttribute('src');
+        await input.setInputFiles(await image(page, 'image/jpeg', '#996655'));
+        await expect(avatar).not.toHaveAttribute('src', first!);
+        await expect(dialog.getByRole('button', { name: 'Change photo' })).toBeEnabled();
+        await input.setInputFiles(await image(page, 'image/webp', '#557799'));
+        await expect(dialog.getByRole('button', { name: 'Change photo' })).toBeEnabled();
+        const dimensions = await page.evaluate(async () => {
+          const blob = await new Promise<Blob>((resolve, reject) => {
+            const request = indexedDB.open('loqman-profile-ui-v1', 1);
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+              const db = request.result;
+              const transaction = db.transaction('photos');
+              const read = transaction.objectStore('photos').get('user');
+              read.onsuccess = () => resolve(read.result);
+              transaction.oncomplete = () => db.close();
+            };
+          });
+          const bitmap = await createImageBitmap(blob);
+          const result = [bitmap.width, bitmap.height, blob.type]; bitmap.close(); return result;
+        });
+        expect(dimensions).toEqual([256, 256, 'image/webp']);
+        await page.keyboard.press('Escape');
+        await ensureDrawerOpen(page);
+        const settings = page.getByRole('button', { name: 'Settings', exact: true });
+        await expect(settings).toContainText('Sara');
+        await expect(settings.getByRole('img')).toBeVisible();
+        await settings.click();
+        await page.reload();
+        await expect(page.locator('[data-rusebot-shell]')).toBeVisible();
+        await ensureDrawerOpen(page);
+        await page.getByRole('button', { name: 'Settings', exact: true }).click();
+        dialog = page.getByRole('dialog');
+        await expect(dialog.getByLabel('Your name')).toHaveValue('Sara');
+        await expect(dialog.getByRole('img', { name: 'Your profile photo' })).toBeVisible();
+        await expect(dialog.locator('[data-backup-button]')).toBeDisabled();
+        await expect(dialog).toContainText('Backups are available in the desktop app.');
+        const bounds = await dialog.evaluate(el => ({ width: el.clientWidth, scroll: el.scrollWidth }));
+        expect(bounds.scroll).toBeLessThanOrEqual(bounds.width);
+        const selects = dialog.locator('[data-providers-default] [role=combobox]');
+        const a = await selects.nth(0).boundingBox(); const b = await selects.nth(1).boundingBox();
+        if (width === 1440) expect(Math.abs(a!.y - b!.y)).toBeLessThan(1);
+        else expect(a!.y).toBeLessThan(b!.y);
+        await dialog.locator('[data-backup-button]').scrollIntoViewIfNeeded();
+        await expect(dialog.locator('[data-backup-button]')).toBeVisible();
+        await dialog.locator('[data-settings-block=general]').evaluate(el => { el.parentElement!.scrollTop = 0; });
+        await dialog.screenshot({ path: testInfo.outputPath('general-settings.png') });
+        await dialog.getByRole('button', { name: 'Remove photo', exact: true }).click();
+        await expect(dialog.getByRole('img', { name: 'Your profile photo' })).toHaveCount(0);
+        await expect(dialog.locator('[data-user-avatar]')).toHaveText('S');
+        await page.reload();
+        await ensureDrawerOpen(page);
+        await expect(page.getByRole('button', { name: 'Settings', exact: true }).getByRole('img')).toHaveCount(0);
+        const box = page.locator('[data-tour=composer] textarea');
+        await box.fill('Hello مرحبا 😀\r\r\nSecond line');
+        expect(await box.evaluate(el => getComputedStyle(el).color)).not.toBe('rgba(0, 0, 0, 0)');
+      });
+    }
+  }
+
+  test('invalid photos and storage failures keep the current photo and show an error', async ({ page }) => {
+    const dialog = await openGeneralSettings(page, true);
+    const input = dialog.getByLabel('Choose profile photo');
+    await expect(dialog.getByRole('button', { name: 'Change photo' })).toBeEnabled();
+    await input.setInputFiles(await image(page, 'image/png', '#559977'));
+    const avatar = dialog.getByRole('img', { name: 'Your profile photo' });
+    await expect(avatar).toBeVisible();
+    const original = await avatar.getAttribute('src');
+    for (const invalid of [
+      { name: 'file.svg', mimeType: 'image/svg+xml', buffer: Buffer.from('<svg/>') },
+      { name: 'broken.png', mimeType: 'image/png', buffer: Buffer.from('not an image') },
+      { name: 'corrupt.png', mimeType: 'image/png', buffer: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]) },
+      { name: 'renamed.png', mimeType: 'image/png', buffer: Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64') },
+      { name: 'huge.png', mimeType: 'image/png', buffer: Buffer.alloc(10 * 1024 * 1024 + 1) },
+    ]) {
+      await input.setInputFiles(invalid);
+      await expect(dialog.getByRole('alert')).toBeVisible();
+      await expect(avatar).toHaveAttribute('src', original!);
+    }
+    await page.evaluate(() => {
+      IDBObjectStore.prototype.put = () => { throw new DOMException('Quota exceeded', 'QuotaExceededError'); };
+    });
+    await input.setInputFiles(await image(page, 'image/jpeg', '#996655'));
+    await expect(dialog.getByRole('alert')).toContainText('storage is unavailable');
+    await expect(avatar).toHaveAttribute('src', original!);
+    await expect(dialog.getByRole('button', { name: 'Change photo' })).toBeEnabled();
+    await page.evaluate(() => {
+      IDBObjectStore.prototype.delete = () => { throw new DOMException('Blocked', 'SecurityError'); };
+    });
+    await dialog.getByRole('button', { name: 'Remove photo', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('storage is unavailable');
+    await expect(avatar).toHaveAttribute('src', original!);
+  });
+
+  test('unavailable photo storage is reported without blocking settings', async ({ page }) => {
+    await page.addInitScript(() => {
+      IDBFactory.prototype.open = () => { throw new DOMException('Blocked', 'SecurityError'); };
+    });
+    const dialog = await openGeneralSettings(page, true);
+    await expect(dialog.getByRole('alert')).toContainText('Could not restore your photo');
+    await dialog.getByLabel('Your name').fill('Mona');
+    await expect(dialog.locator('[data-user-avatar]')).toHaveText('M');
+    await expect(dialog.getByRole('button', { name: 'Change photo' })).toBeEnabled();
+  });
+
+  test('provider defaults appear only in General and AI retains its management controls', async ({ page }) => {
+    await stubProviders(page, FIVE_STATES);
+    const dialog = await openGeneralSettings(page, true);
+    await expect(dialog.locator('[data-providers-default]')).toHaveCount(1);
+    await dialog.locator('[data-settings-page=ai]').click();
+    await expect(dialog.locator('[data-providers-default]')).toHaveCount(0);
+    await expect(dialog.getByText('Default for new chats')).toHaveCount(0);
+    await expect(dialog.locator('[data-providers-refresh]')).toBeVisible();
+    await expect(dialog.locator('[data-engine-card]')).toHaveCount(5);
+  });
+});
+
+async function ensureDrawerOpen(page: Page) {
+  const toggle = page.getByRole('button', { name: 'Open chat list' });
+  if (await toggle.isVisible() && await toggle.getAttribute('aria-expanded') !== 'true') await toggle.click();
+}
+
+async function chooseDefault(dialog: ReturnType<Page['getByRole']>, field: 'engine' | 'model', value: string) {
+  await dialog.locator(`#ai-default-${field}`).click();
+  await dialog.page().getByRole('option').and(dialog.page().locator(`[data-value="${value}"]`)).click();
+  await expect(dialog.page().getByRole('listbox')).toHaveCount(0);
+}
+
+
+test.describe('General custom dropdowns', () => {
+  for (const skin of ['meadow', 'midnight']) for (const width of [1440, 390]) {
+    test(`mouse keyboard positioning and persistence ${skin} ${width}`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width, height: 760 });
+      await page.addInitScript(skin => localStorage.setItem('rusebot-skin', skin), skin);
+      const models = Array.from({ length: 80 }, (_, i) => ({ id: `m${i+1}`, name: `Model ${String(i+1).padStart(2, '0')} — A very long model name with detailed capabilities and context window` }));
+      let saved = { engine: 'ready-e', model_id: 'm1' };
+      await stubProviders(page, FIVE_STATES, {
+        'engines.capabilities': capsWithoutMock(FIVE_STATES),
+        'preferences.get': () => saved,
+        'preferences.set_default': params => { saved = { engine: String(params.engine), model_id: String(params.model_id) }; return saved; },
+        'engines.models': params => ({ models: params.engine_id === 'unverified-e' ? [{ id: 'g1', name: 'Gamma Model' }] : models }),
+      });
+      let dialog = await openGeneralSettings(page, true);
+      const provider = dialog.locator('#ai-default-engine');
+      const model = dialog.locator('#ai-default-model');
+      await expect(provider).toHaveAttribute('data-value', 'ready-e');
+      for (const trigger of [provider, model]) {
+        const arrow = trigger.locator('.settings-select-chevron');
+        expect(await arrow.evaluate(el => getComputedStyle(el).right)).toBe('14px');
+        expect(await trigger.evaluate((el: HTMLButtonElement) => el.offsetHeight)).toBe(36);
+        await trigger.click();
+        await expect(page.getByRole('listbox')).toBeVisible();
+        await page.keyboard.press('Escape');
+        await expect(page.getByRole('listbox')).toHaveCount(0);
+        await expect(dialog).toBeVisible();
+        await expect(trigger).toBeFocused();
+      }
+      await provider.click();
+      await expect(page.getByRole('option').filter({ hasText: 'Zeta (not installed)' })).toHaveAttribute('aria-disabled', 'true');
+      await expect(page.getByRole('option').filter({ hasText: 'Delta (sign-in required)' })).toHaveAttribute('aria-disabled', 'true');
+      await expect(page.getByRole('option', { selected: true }).locator('.settings-select-check')).toBeVisible();
+      await page.screenshot({ path: testInfo.outputPath('provider-menu.png'), animations: 'disabled' });
+      const outside = await page.locator('[role=dialog]').getByText('Display Name', { exact: true }).boundingBox();
+      await page.mouse.click(outside!.x + 10, outside!.y + 5);
+      await expect(page.getByRole('listbox')).toHaveCount(0);
+      await model.focus();
+      await page.keyboard.press('Space');
+      await expect(page.getByRole('listbox')).toBeVisible();
+      await expect(page.getByRole('option').and(page.locator('[data-value=m1]'))).toBeFocused();
+      await page.keyboard.press('ArrowDown');
+      await expect(page.getByRole('option').and(page.locator('[data-value=m2]'))).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(model).toHaveAttribute('data-value', 'm2');
+      await expect.poll(() => saved.model_id).toBe('m2');
+      await expect(page.getByRole('listbox')).toHaveCount(0);
+      await model.press('ArrowDown');
+      await expect(page.getByRole('option').and(page.locator('[data-value=m2]'))).toBeFocused();
+      await page.keyboard.press('ArrowUp');
+      await expect(page.getByRole('option').and(page.locator('[data-value=m1]'))).toBeFocused();
+      await page.keyboard.press('Space');
+      await expect(model).toHaveAttribute('data-value', 'm1');
+      await expect(page.getByRole('listbox')).toHaveCount(0);
+      await model.click();
+      await expect(page.getByRole('option').and(page.locator('[data-value=m1]'))).toBeFocused();
+      await page.keyboard.press('End');
+      const last = page.getByRole('option').and(page.locator('[data-value=m80]'));
+      await expect(last).toBeFocused();
+      expect(await page.locator('.settings-select-viewport').evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+      const menuBounds = await page.getByRole('listbox').boundingBox();
+      const dialogBounds = await page.locator('[role=dialog]').boundingBox();
+      expect(menuBounds!.y).toBeGreaterThanOrEqual(dialogBounds!.y);
+      expect(menuBounds!.y + menuBounds!.height).toBeLessThanOrEqual(dialogBounds!.y + dialogBounds!.height);
+      expect(menuBounds!.x + menuBounds!.width).toBeLessThanOrEqual(width);
+      await page.screenshot({ path: testInfo.outputPath('model-menu.png'), animations: 'disabled' });
+      await page.keyboard.press('Enter');
+      await expect.poll(() => saved.model_id).toBe('m80');
+      await page.reload();
+      await ensureDrawerOpen(page);
+      await page.getByRole('button', { name: 'Settings', exact: true }).click();
+      dialog = page.getByRole('dialog');
+      await expect(dialog.locator('#ai-default-model')).toHaveAttribute('data-value', 'm80');
+      await chooseDefault(dialog, 'engine', 'unverified-e');
+      await expect(dialog.locator('#ai-default-model')).toHaveAttribute('data-value', 'g1');
+      await expect(dialog.locator('#ai-default-model')).toContainText('Gamma Model');
+    });
+  }
+});
+
+
+test.describe('agent creation preserves the workspace', () => {
+  async function fillAgent(page: Page, name: string) {
+    await page.locator('#na-name').fill(name);
+    await page.locator('#na-role').fill('Workspace tester');
+    await page.locator('#na-instructions').fill(`Instructions for ${name}`);
+  }
+  async function conversations(page: Page) {
+    const out = await call<{ conversations: Array<{ id: string }> }>(page, 'conversations.list');
+    return out.conversations.map(c => c.id).sort();
+  }
+  for (const view of ['team', 'contracts'] as const) {
+    test(`creation stays on ${view}, refreshes details and preserves the canvas`, async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 600 });
+      await open(page, '/?ui=rusebot', { asAgent: false });
+      await Promise.all(Array.from({ length: 10 }, (_, i) => call(page, 'profiles.create', {
+        name: `Canvas${uid()}-${i}`, role_type: 'custom', instructions: 'Make this canvas scrollable.',
+        settings_json: JSON.stringify({ team_name: `Canvas department ${i}` }),
+      })));
+      await page.locator(`[data-sidebar-nav=${view}]`).click();
+      const workspace = page.locator(`main[data-view=${view}]`);
+      const canvas = workspace.getByRole('region', { name: view === 'team' ? 'Team canvas' : 'Contracts', exact: true });
+      await expect(workspace).toBeVisible();
+      await expect.poll(() => canvas.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true);
+      const scroll = await canvas.evaluate(el => { el.setAttribute('data-instance-check', 'preserved'); el.scrollTop = 80; return el.scrollTop; });
+      expect(scroll).toBeGreaterThan(0);
+      const before = await conversations(page);
+      const creates: string[] = [];
+      page.on('request', request => { if (request.url().endsWith('/__agentos/call') && request.postDataJSON()?.method === 'conversations.create') creates.push(request.postData()!); });
+      await page.locator('[data-new-agent-page]').click();
+      const name = `Stay-${uid()}`;
+      await fillAgent(page, name);
+      await page.getByRole('button', { name: 'Create agent', exact: true }).click();
+      await expect(page.getByRole('dialog', { name: 'New agent', exact: true })).toHaveCount(0);
+      await expect(workspace).toBeVisible();
+      await expect(canvas).toHaveAttribute('data-instance-check', 'preserved');
+      expect(await canvas.evaluate(el => el.scrollTop)).toBe(scroll);
+      expect(await conversations(page)).toEqual(before);
+      expect(creates).toEqual([]);
+      const card = workspace.locator(view === 'team' ? '[data-agent-card]' : '[data-contract-row]').filter({ hasText: name });
+      await expect(card).toBeVisible();
+      if (view === 'team') await card.getByRole('button', { name: `Open ${name}`, exact: true }).click();
+      else await card.click();
+      const panel = page.getByRole('complementary', { name: `${name} details`, exact: true });
+      await expect(panel).toBeVisible();
+      await expect(panel.locator('#rb-contract')).toHaveValue(`Instructions for ${name}`);
+      await panel.getByRole('button', { name: 'Open chat', exact: true }).click();
+      await expect(page.getByRole('textbox', { name: `Message ${name}`, exact: true })).toBeVisible();
+      expect(creates).toHaveLength(1);
+    });
+  }
+  test('creation from an existing chat preserves the selection and draft without creating a chat', async ({ page }) => {
+    await open(page);
+    await send(page, `original-${uid()}`);
+    await expect(page.locator('[data-chat-bubble]').filter({ hasText: MOCK_REPLY })).toBeVisible({ timeout: 20000 });
+    const selected = page.locator('[data-sidebar-thread-row][aria-current=page]');
+    const id = await selected.getAttribute('data-sidebar-thread-row');
+    const before = await conversations(page);
+    const box = page.getByRole('textbox', { name: `Message ${agentName}`, exact: true });
+    await box.fill('Keep my draft');
+    await page.getByRole('button', { name: 'Add', exact: true }).click();
+    await page.locator('[data-composer-new-agent]').click();
+    await fillAgent(page, `Chat-stay-${uid()}`);
+    await page.getByRole('button', { name: 'Create agent', exact: true }).click();
+    await expect(page.getByRole('dialog', { name: 'New agent', exact: true })).toHaveCount(0);
+    await expect(selected).toHaveAttribute('data-sidebar-thread-row', id!);
+    await expect(box).toHaveValue('Keep my draft');
+    await expect(page.locator('[data-chat-bubble]').filter({ hasText: MOCK_REPLY })).toBeVisible();
+    expect(await conversations(page)).toEqual(before);
+  });
+  test('a failed creation keeps the dialog, form and Team workspace intact', async ({ page }) => {
+    await open(page, '/?ui=rusebot', { asAgent: false });
+    await page.locator('[data-sidebar-nav=team]').click();
+    await page.route('**/__agentos/call', route => reqOf(route).method === 'profiles.create' ? failJson(route, 500, 'Creation failed for this test') : route.fallback());
+    const before = await conversations(page);
+    await page.locator('[data-new-agent-page]').click();
+    const name = `Failed-${uid()}`;
+    await fillAgent(page, name);
+    await page.getByRole('button', { name: 'Create agent', exact: true }).click();
+    await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Creation failed for this test');
+    await expect(page.locator('#na-name')).toHaveValue(name);
+    await expect(page.getByRole('button', { name: 'Create agent', exact: true })).toBeEnabled();
+    await expect(page.locator('main[data-view=team]')).toBeVisible();
+    expect(await conversations(page)).toEqual(before);
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(page.locator('main[data-view=team]')).toBeVisible();
+    await expect(page.locator('[data-agent-card]').filter({ hasText: name })).toHaveCount(0);
+  });
+});
+
+async function chooseSelect(trigger: Locator, value: string) {
+  await trigger.click();
+  const page = trigger.page();
+  await page.getByRole('option').and(page.locator(`[data-value="${value}"]`)).click();
+  await expect(page.getByRole('listbox')).toHaveCount(0);
+}
+
+test.describe('shared dropdown interactions', () => {
+  for (const skin of ['meadow', 'midnight']) for (const width of [1440, 390]) {
+    test(`nested controls and appearance ${skin} ${width}`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width, height: 820 });
+      await page.addInitScript(skin => { if (!localStorage.getItem('rusebot-skin')) localStorage.setItem('rusebot-skin', skin); }, skin);
+      const models = Array.from({ length: 80 }, (_, i) => ({ id: `m${i + 1}`, name: `Model ${i + 1} — A very long label with context window and capabilities` }));
+      const calls = await stubProviders(page, FIVE_STATES, {
+        'engines.capabilities': capsWithoutMock(FIVE_STATES),
+        'preferences.get': () => ({ engine: 'ready-e', model_id: 'm1' }),
+        'engines.models': () => ({ models }),
+      });
+      await openBare(page);
+      const add = page.getByRole('button', { name: 'Add', exact: true });
+      await add.click();
+      const parent = page.getByRole('menu', { name: 'Engine and model' });
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm1');
+      await chooseSelect(page.locator('#rb-model'), 'm2');
+      await expect(parent).toBeVisible();
+      await expect(page.locator('#rb-model')).toBeFocused();
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm2');
+      await page.locator('#rb-engine').click();
+      await expect(page.getByRole('option').and(page.locator('[data-value=needs-login-e]'))).toBeDisabled();
+      await page.keyboard.press('Escape');
+      await expect(parent).toBeVisible();
+      await expect(page.locator('#rb-engine')).toBeFocused();
+      await page.locator('#rb-model').press('Space');
+      await page.keyboard.press('End');
+      await expect(page.getByRole('option').and(page.locator('[data-value=m80]'))).toBeFocused();
+      expect(await page.locator('.settings-select-viewport').evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+      const bounds = await page.getByRole('listbox').boundingBox();
+      expect(bounds!.y).toBeGreaterThanOrEqual(0);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+      await page.screenshot({ path: testInfo.outputPath('composer-dropdown.png'), animations: 'disabled' });
+      await page.keyboard.press('Enter');
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm80');
+      await page.locator('#rb-engine').click();
+      const parentBounds = await page.locator('[role=menu][aria-label="Engine and model"]').boundingBox();
+      await page.mouse.click(parentBounds!.x + 1, parentBounds!.y + parentBounds!.height - 1);
+      await expect(page.getByRole('listbox')).toHaveCount(0);
+      await expect(parent).toBeVisible();
+      await page.locator('[data-composer-new-agent]').click();
+      const dialog = page.locator('[role=dialog][aria-labelledby=new-agent-title]');
+      await expect(dialog.locator('#na-model')).toHaveAttribute('data-value', 'm1');
+      await chooseSelect(dialog.locator('#na-model'), 'm80');
+      await expect(dialog.locator('#na-model')).toHaveAttribute('data-value', 'm80');
+      for (const id of ['na-engine', 'na-model']) {
+        const trigger = dialog.locator(`#${id}`);
+        await trigger.press('Space');
+        await expect(page.getByRole('listbox')).toBeVisible();
+        await page.keyboard.press('Escape');
+        await expect(page.getByRole('listbox')).toHaveCount(0);
+        await expect(dialog).toBeVisible();
+        await expect(trigger).toBeFocused();
+        expect(await trigger.locator('.settings-select-chevron').evaluate(el => getComputedStyle(el).right)).toBe('14px');
+      }
+      await dialog.locator('#na-model').press('ArrowDown');
+      await expect(page.getByRole('listbox')).toBeVisible();
+      await expect(page.getByRole('option').and(page.locator('[data-value=m80]'))).toBeFocused();
+      await page.keyboard.press('Home');
+      await expect(page.getByRole('option').and(page.locator('[data-value=m1]'))).toBeFocused();
+      await page.keyboard.press('ArrowDown');
+      await expect(page.getByRole('option').and(page.locator('[data-value=m2]'))).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(dialog.locator('#na-model')).toHaveAttribute('data-value', 'm2');
+      await dialog.locator('#na-model').click();
+      await page.keyboard.press('End');
+      const menuBounds = await page.getByRole('listbox').boundingBox();
+      const dialogBounds = await dialog.boundingBox();
+      expect(menuBounds!.y).toBeGreaterThanOrEqual(dialogBounds!.y);
+      expect(menuBounds!.y + menuBounds!.height).toBeLessThanOrEqual(dialogBounds!.y + dialogBounds!.height);
+      await page.screenshot({ path: testInfo.outputPath('new-agent-dropdown.png'), animations: 'disabled' });
+      await page.keyboard.press('Escape');
+      await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      expect(calls.some(c => c.method === 'profiles.create')).toBe(false);
+      await add.click();
+      await expect(page.locator('#rb-model')).toHaveAttribute('data-value', 'm80');
+      await page.keyboard.press('Escape');
+      await ensureDrawerOpen(page);
+      await page.getByRole('button', { name: 'Settings', exact: true }).click();
+      const settings = page.getByRole('dialog');
+      if (width < 640) {
+        const nav = settings.getByRole('combobox', { name: 'Settings page' });
+        await nav.press('Space');
+        await page.keyboard.press('Escape');
+        await expect(settings).toBeVisible();
+        await expect(nav).toBeFocused();
+        await chooseSelect(nav, 'appearance');
+      } else await settings.locator('[data-settings-page=appearance]').click();
+      const trigger = settings.getByRole('combobox', { name: 'Font', exact: true });
+      await trigger.press('Space');
+      await page.keyboard.press('Escape');
+      await expect(settings).toBeVisible();
+      await expect(trigger).toBeFocused();
+      await chooseSelect(trigger, 'serif');
+      await settings.getByRole('button', { name: 'Wide chat width' }).click();
+      await settings.getByRole('button', { name: /View all/ }).click();
+      await settings.locator(`[data-theme-card="${skin === 'meadow' ? 'midnight' : 'meadow'}"]`).click();
+      await page.screenshot({ path: testInfo.outputPath('appearance-gallery.png'), animations: 'disabled' });
+      await page.keyboard.press('Escape');
+      await page.reload();
+      await expect(page.locator('html')).toHaveAttribute('data-font', 'serif');
+      await expect(page.locator('html')).toHaveAttribute('data-chat-width', 'wide');
+      await expect(page.locator('html')).toHaveAttribute('data-skin', skin === 'meadow' ? 'midnight' : 'meadow');
+    });
+  }
+  test('empty provider and model controls remain disabled with readable placeholders', async ({ page }) => {
+    await stubProviders(page, [], { 'engines.capabilities': () => ({}) });
+    const dialog = await openGeneralSettings(page, true);
+    await expect(dialog.locator('#ai-default-engine')).toBeDisabled();
+    await expect(dialog.locator('#ai-default-engine')).toContainText('No providers found');
+    await expect(dialog.locator('#ai-default-model')).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: 'Add', exact: true }).click();
+    await page.locator('[data-composer-new-agent]').click();
+    await expect(page.locator('#na-engine')).toBeDisabled();
+    await expect(page.locator('#na-model')).toBeDisabled();
+  });
+});
+
+
+
+const chatViewport = (page: Page) => page.locator('main .glass-scroller');
+const chatComposer = (page: Page) => page.locator('[data-tour=composer]');
+const bottomGap = (page: Page) => chatViewport(page).evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop);
+
+async function expectSeparateChatRows(page: Page) {
+  await expect.poll(async () => {
+    const viewport = (await chatViewport(page).boundingBox())!;
+    const composer = (await chatComposer(page).boundingBox())!;
+    return viewport.y + viewport.height - composer.y;
+  }).toBeLessThanOrEqual(1);
+}
+
+const longTranscript = Array.from({ length: 52 }, (_, i) => ({
+  seq: i + 1,
+  role: i % 2 ? 'assistant' : 'user',
+  created_at: '2026-11-18T12:00:00Z',
+  client_message_id: null,
+  content: i === 51
+    ? ['## Release notes', ...Array.from({ length: 14 }, (_, n) => `- ${n + 1}. A longer Markdown entry with **formatted text** and a code sample.`), '', '```javascript', `const status = '${'ready-'.repeat(35)}';`, '```', '', 'هذه آخر رسالة. The final message is fully readable.'].join('\n')
+    : `Message ${i + 1}. Repeated conversation text so the transcript scrolls. هذه رسالة بالعربية والإنجليزية.`,
+}));
+
+async function seedLongTranscript(page: Page, title: string) {
+  const cid = await seedChat(page, title);
+  await page.route('**/__agentos/call', route => {
+    const { method, params } = reqOf(route);
+    if (method !== 'conversations.messages' || params?.conversation_id !== cid) return route.fallback();
+    const after = Number(params.after ?? 0);
+    return okJson(route, { messages: longTranscript.filter(message => message.seq > after).map(message => ({ ...message, conversation_id: cid })) });
+  });
+}
+
+test('chat viewport stays above the composer in a long Midnight conversation', async ({ page }, info) => {
+  await page.setViewportSize({ width: 1440, height: 780 });
+  await page.addInitScript(() => localStorage.setItem('rusebot-skin', 'midnight'));
+  const title = `Long conversation ${uid()}`;
+  await seedLongTranscript(page, title);
+  await open(page, '/?ui=rusebot', { asAgent: false });
+  await openChatByTitle(page, title);
+  await expect(page.locator('[data-message-row]')).toHaveCount(52);
+  await expectSeparateChatRows(page);
+  await expectFinalLine(page);
+  await page.screenshot({ path: info.outputPath('midnight-long-bottom.png'), animations: 'disabled' });
+});
+
+async function expectFinalLine(page: Page, text = 'The final message is fully readable.') {
+  const line = page.getByText(text, { exact: false }).last();
+  await expect.poll(async () => {
+    const extent = (await chatViewport(page).boundingBox())!;
+    const terminal = (await line.boundingBox())!;
+    return Math.min(terminal.y - extent.y, extent.y + extent.height - terminal.y - terminal.height);
+  }).toBeGreaterThanOrEqual(-1);
+}
+
+for (const { width, height, chatWidth, textSize } of [
+  { width: 1440, height: 780, chatWidth: 'standard', textSize: 'default' },
+  { width: 1280, height: 520, chatWidth: 'wide', textSize: 'small' },
+  { width: 1024, height: 325, chatWidth: 'full', textSize: 'large' },
+  { width: 768, height: 500, chatWidth: 'wide', textSize: 'default' },
+  { width: 390, height: 680, chatWidth: 'full', textSize: 'large' },
+]) {
+  test(`chat layout adapts to ${width}x${height} with ${chatWidth} width and ${textSize} text`, async ({ page }, info) => {
+    await page.setViewportSize({ width, height });
+    await page.addInitScript(({ chatWidth, textSize }) => {
+      localStorage.setItem('rusebot-skin', 'atelier');
+      localStorage.setItem('rusebot-chat-width', chatWidth);
+      localStorage.setItem('rusebot-text-size', textSize);
+    }, { chatWidth, textSize });
+    const title = `Transcript ${uid()}`;
+    await seedLongTranscript(page, title);
+    await open(page, '/?ui=rusebot', { asAgent: false });
+    await openChatByTitle(page, title);
+    await expect(page.locator('[data-message-row]')).toHaveCount(52);
+    await expect(page.getByText('The final message is fully readable.', { exact: false })).toHaveAttribute('dir', 'rtl');
+    await expect(page.locator('.chat-md pre').last()).toContainText('const status');
+    const viewport = chatViewport(page);
+    const textarea = chatComposer(page).locator('textarea');
+    const original = (await viewport.boundingBox())!;
+    const dockBottom = () => chatComposer(page).evaluate(el => el.getBoundingClientRect().bottom);
+    const initialBottom = await dockBottom();
+    await expectFinalLine(page);
+    await textarea.fill('أسطر متعددة مع English text.\nThis draft has multiple lines.\nThe composer stays in its own row.');
+    expect((await viewport.boundingBox())!.height).toBeLessThan(original.height);
+    await expectSeparateChatRows(page);
+    expect(await dockBottom()).toBeCloseTo(initialBottom, 0);
+    await expect.poll(() => bottomGap(page)).toBeLessThanOrEqual(2);
+    await expectFinalLine(page);
+    if (width === 1440 || width === 390 || width === 1024) {
+      await page.screenshot({ path: info.outputPath(`atelier-multiline-${width}.png`), animations: 'disabled' });
+    }
+    await textarea.fill('سطر طويل - a multiline draft.\n'.repeat(26));
+    const inputHeight = await textarea.evaluate(el => ({ height: el.clientHeight, content: el.scrollHeight }));
+    expect(inputHeight.height).toBeLessThanOrEqual(Math.min(144, height * .4) + 1);
+    expect(inputHeight.content).toBeGreaterThan(inputHeight.height);
+    await textarea.evaluate(el => { el.scrollTop = el.scrollHeight; });
+    expect(await textarea.evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+    await expectSeparateChatRows(page);
+    await expectFinalLine(page);
+    await textarea.clear();
+    await expect.poll(async () => Math.abs((await viewport.boundingBox())!.height - original.height)).toBeLessThanOrEqual(1);
+    await expect.poll(() => bottomGap(page)).toBeLessThanOrEqual(2);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    if (width === 1440) {
+      for (const skin of SKIN_IDS) {
+        await page.locator('html').evaluate((el, skin) => { el.dataset.skin = skin; }, skin);
+        await expectSeparateChatRows(page);
+        await expectFinalLine(page);
+        await expect(chatComposer(page)).toHaveCSS('background-color', /^rgb\(/);
+      }
+    }
+  });
+}
+
+test('chat layout resets to the selected conversation tail and follows window and sidebar resizing', async ({ page }) => {
+  const title = `Reading history ${uid()}`;
+  const second = `Short conversation ${uid()}`;
+  await seedLongTranscript(page, title);
+  await seedChat(page, second, 'Only the selected conversation appears here.');
+  await open(page, '/?ui=rusebot', { asAgent: false });
+  await openChatByTitle(page, title);
+  await expectFinalLine(page);
+  await chatViewport(page).evaluate(el => { el.scrollTop = 200; });
+  await expect.poll(() => chatViewport(page).evaluate(el => el.scrollTop)).toBe(200);
+  await openChatByTitle(page, second);
+  await expect(page.locator('[data-message-row]')).toHaveCount(1);
+  await expectFinalLine(page, 'Only the selected conversation appears here.');
+  await openChatByTitle(page, title);
+  await expectFinalLine(page);
+  const sidebarToggle = page.getByRole('button', { name: 'Collapse sidebar' });
+  await sidebarToggle.click();
+  await expect(page.getByRole('button', { name: 'Expand sidebar' })).toBeVisible();
+  await expect.poll(() => bottomGap(page)).toBeLessThanOrEqual(2);
+  await page.getByRole('button', { name: 'Expand sidebar' }).click();
+  await page.setViewportSize({ width: 390, height: 515 });
+  await expectSeparateChatRows(page);
+  await expectFinalLine(page);
+  await page.getByRole('button', { name: 'Open chat list' }).click();
+  await page.mouse.click(385, 150);
+  await expect.poll(() => bottomGap(page)).toBeLessThanOrEqual(2);
+  await expectFinalLine(page);
 });

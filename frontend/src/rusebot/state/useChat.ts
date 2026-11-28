@@ -13,6 +13,7 @@ import {
   createDraft,
   followRun,
   getRun,
+  hasConversationMessages,
   importLegacyCeo,
   isTerminal,
   listApprovals,
@@ -26,35 +27,42 @@ import {
   type Conversation,
   type ConvMessage,
   type Draft,
-  type EngineCapabilities,
-  type EngineModel,
-  type EngineStateId,
-  type EngineStatus,
+  type Profile,
   type RunSnapshot,
 } from '../data/worker';
-import type { StreamHandle } from '../../api/transport';
+import { ApiError, type StreamHandle } from '../../api/transport';
 import { emptyLive, freezeLive, hasLiveContent, reduceLive, type LiveTurn } from './liveTurn';
 import { readLegacyThreads, type LegacyThread } from '../data/legacy';
 import type { Agent } from '../types';
 import {
+  isExecutableChoice,
   loadProviderModels,
-  selectProviderEngine,
-  setProviderChoice,
+  refreshProviders,
+  retryProviderReadiness,
   useProviders,
   type EngineChoice,
 } from './useProviders';
+import { discardDraftChoice, getChatExecution, getDraftOverride, transferDraftChoice, useChatEngines, type EngineState } from './useChatEngines';
 
 const KEY_DRAFTS = 'agentos.rusebot.drafts.v1';
+const CEO_SUBMISSION_PREFIX = 'ceo-submission:';
+const SUBMISSION_PREFIX = 'agentos.rusebot.submission.v1.';
 const KEY_RUNS = 'agentos.rusebot.runs.v1';
 const KEY_SELECTED = 'agentos.rusebot.selected.v1';
 const KEY_AGENTS = 'agentos.rusebot.convAgents.v1';
+const DRAFT_OWNER_PREFIX = 'new:';
 
 /** ceo.ask refuses longer questions (backend/pyworker/api/ceo.py), so refuse them before anything is saved. */
 export const CEO_MAX_CHARS = 2000;
 
 /** The conversation the legacy import creates for old CEO exchanges; hidden while it has nothing in it. */
 const CEO_HISTORY_ID = 'legacy-ceo-history';
+const WORKER_CONVERSATION_LIMIT = 500;
 const CEO_PROGRESS_MS = 1500;
+const RUN_STREAM_IDLE_MS = 15_000;
+const RUN_STATUS_RETRY_MAX_MS = 15_000;
+const RUN_STATUS_SLOW_MS = 8_000;
+const runConnectionWarning = 'Could not verify this run’s status with the worker. Still checking for updates.';
 
 /** One short line for the pending reply area, from what ceo.ask_progress reports. */
 export function progressText(p: CeoProgress): string | null {
@@ -101,49 +109,79 @@ function writeJson(key: string, value: unknown): void {
   }
 }
 
-export type { EngineChoice } from './useProviders';
-
-export interface EngineState {
-  engines: Array<{ id: string; status: EngineStatus | null; caps: EngineCapabilities; state: EngineStateId; title: string }>;
-  /** Models of the current provider. */
-  models: EngineModel[];
-  choice: EngineChoice | null;
-  loading: boolean;
-  setChoice: (choice: EngineChoice) => void;
-  /** Switch provider and use its preferred model. */
-  selectEngine: (engine: string) => Promise<void>;
-  loadModels: (engine: string) => Promise<EngineModel[]>;
+interface ChatSelection {
+  id: string | null;
+  draftAgentId: string | null;
 }
 
-/** Thin adapter over the shared provider store (see useProviders.ts). */
-export function useEngines(): EngineState {
-  const s = useProviders();
-  const engines = useMemo(
-    () => s.selectable.map((e) => ({ id: e.id, status: e.status, caps: e.caps, state: e.state, title: e.title })),
-    [s.selectable]
-  );
-  const models = s.choice ? (s.models[s.choice.engine]?.list ?? NO_MODELS) : NO_MODELS;
-  return {
-    engines,
-    models,
-    choice: s.choice,
-    loading: s.loading,
-    setChoice: setProviderChoice,
-    selectEngine: selectProviderEngine,
-    loadModels: loadProviderModels,
-  };
+function isSelectionId(value: unknown, max: number): value is string {
+  if (typeof value !== 'string' || !value || value !== value.trim()) return false;
+  const characters = Array.from(value);
+  return characters.length <= max && characters.every(character => character >= ' ' && character !== '\u007f');
 }
 
-const NO_MODELS: EngineModel[] = [];
+function readChatSelection(): ChatSelection {
+  const stored = readJson<unknown>(KEY_SELECTED, null);
+  if (isSelectionId(stored, 160) && !stored.startsWith(DRAFT_OWNER_PREFIX)) {
+    return { id: stored, draftAgentId: null };
+  }
+  const owner = stored && typeof stored === 'object' && 'draftOwner' in stored ? stored.draftOwner : null;
+  const profileId = typeof owner === 'string' && owner.startsWith(DRAFT_OWNER_PREFIX)
+    ? owner.slice(DRAFT_OWNER_PREFIX.length)
+    : null;
+  return { id: null, draftAgentId: isSelectionId(profileId, 64) ? profileId : null };
+}
 
 export interface RunState {
   runId: string;
   status: string;
   error: string | null;
+  hideSubmittedDraft?: boolean;
+  connectionWarning?: boolean;
+}
+
+interface ResultsDrafts {
+  list: Draft[] | null;
+  loading: boolean;
+  error: string | null;
+}
+
+interface ApprovalRead {
+  list: Approval[] | null;
+  loading: boolean;
+  error: string | null;
+}
+
+type ToolDecision = 'approve' | 'deny';
+type ToolDecisionRecord = { approval: Approval; index: number } & (
+  | { phase: 'pending'; requested: ToolDecision }
+  | { phase: 'confirmed'; outcome: ToolDecision }
+  | { phase: 'unavailable'; error: string }
+  | { phase: 'recovery'; error: string; readAfter: number; retryable: boolean }
+);
+
+function approvalKey(approval: Approval): string {
+  return JSON.stringify([approval.run_id, approval.id]);
+}
+
+const RETAINED_APPROVAL_OUTCOMES = 100;
+const isSettledApproval = (entry?: ToolDecisionRecord) => entry?.phase === 'confirmed' || entry?.phase === 'unavailable';
+
+interface ToolApprovalCard {
+  key: string;
+  approval: Approval;
+  locked: boolean;
+  outcome?: ToolDecision;
+  error?: string;
+  canRefresh: boolean;
 }
 
 export interface ChatState {
+  engines: EngineState;
   conversations: Conversation[];
+  conversationListError: string | null;
+  retryingConversationList: boolean;
+  retryConversationList: () => void;
   legacy: LegacyThread[];
   selectedId: string | null;
   select: (id: string | null) => void;
@@ -154,33 +192,46 @@ export interface ChatState {
   run: RunState | null;
   /** The reply as it streams in (normalised driver events) in the selected chat; null when nothing is streaming. */
   live: LiveTurn | null;
+  /** Saved assistant replies and terminal outcomes for user messages without replies. */
   runsBySeq: Record<number, RunSnapshot>;
   approvals: Approval[];
+  toolApprovalCards: ToolApprovalCard[];
+  approvalRead: ApprovalRead;
+  refreshApprovals: () => Promise<void>;
   drafts: Record<string, Draft[]>;
+  resultsDrafts: ResultsDrafts;
   error: string | null;
   dismissError: () => void;
-  /** Runs the failed step again (resend the message, reload the chat or the list); null when there is nothing to retry. */
+  /** Retries an unconfirmed submission, or is null when there is nothing to retry. */
   retry: (() => void) | null;
+  retryProviderCheck: 'checking' | 'unavailable' | 'failed' | null;
   /** The selected chat's messages could not be read: it is not empty, it just did not load. */
   threadError: string | null;
+  threadLoading: boolean;
   retryThread: () => void;
   /** Stop was pressed and the worker has not confirmed yet. */
   stopping: boolean;
+  sending: boolean;
   /** The selected run can be cancelled (a Loqman answer cannot once it has started). */
   canStop: boolean;
   draft: string;
   setDraft: (text: string) => void;
   send: (text: string) => Promise<void>;
   stop: () => Promise<void>;
-  newChat: () => void;
-  decide: (approval: Approval, decision: 'approve' | 'deny') => Promise<void>;
-  makeDeliverable: (runId: string) => Promise<void>;
-  reviewDraft: (draft: Draft, decision: 'approve' | 'reject') => Promise<void>;
+  newChat: (recipientId?: string) => void;
+  decide: (approval: Approval, decision: ToolDecision, origin?: { conversationId: string | null }) => Promise<void>;
+  draftSaves: Record<string, { pending: boolean; error?: string }>;
+  makeDeliverable: (run: RunSnapshot) => Promise<void>;
+  reviewDraft: (draft: Draft, decision: 'approve' | 'reject') => Promise<string | void>;
   downloadDraft: (draft: Draft) => Promise<void>;
   loaded: boolean;
   activeRunIds: Record<string, string>;
+  selectedAgentId: string | null;
+  draftRecipientUnverified: boolean;
+  profileIdForConversation: (conversation: Conversation) => string;
   agentFor: (conversationId: string | null) => Agent | null;
-  openAgentChat: (agent: Agent) => Promise<string>;
+  openAgentChat: (agent: Agent, onOpen: () => void, onError: (message: string) => void) => Promise<void>;
+  invalidateNavigation: () => void;
   reloadConversations: () => Promise<void>;
   loadAllDrafts: () => Promise<void>;
 }
@@ -189,29 +240,106 @@ export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * The agent a chat belongs to. The conversation's own profile_id (stored in SQLite by the worker) decides; the
- * browser-side map only covers chats made before conversations were bound, and Loqman is the last resort.
- */
-export function resolveAgent(
-  profileId: string | null | undefined,
-  mappedId: string | null | undefined,
-  agents: Agent[],
-  ceo: Agent | null
-): Agent | null {
-  const bound = profileId ? agents.find((a) => a.id === profileId) : undefined;
-  const mapped = mappedId ? agents.find((a) => a.id === mappedId) : undefined;
-  return bound ?? mapped ?? ceo;
+interface ExecutionSettings {
+  /** Absent on recovery records written before execution settings were saved. */
+  execution?: EngineChoice;
+  /** The first legacy turn may include an agent contract in its worker payload. */
+  wirePrompt?: string;
+}
+
+interface SendAttempt extends ExecutionSettings {
+  cid: string | null;
+  agentId: string;
+  prompt: string;
+  draftRevision: symbol | undefined;
+  createdCeoChat?: boolean;
+  requestId?: string;
+  deferredSource?: string;
+  draftOverride?: EngineChoice;
+  /** Source draft kept when the created chat already has independent work. */
+  retainedSourceKey?: string;
+}
+
+interface SubmissionRecord extends ExecutionSettings {
+  cid: string | null;
+  agentId: string;
+  prompt: string;
+  requestId: string;
+  ownsDraft: boolean;
+  acknowledged?: boolean;
+  rejected?: boolean;
+  createdCeoChat?: boolean;
+  deferredSource?: string;
+  draftOverride?: EngineChoice;
+}
+
+function readSubmissions(): Map<string, SubmissionRecord> {
+  const records = new Map<string, SubmissionRecord>();
+  try {
+    for (const key of Object.keys(localStorage)) {
+      if (!key.startsWith(SUBMISSION_PREFIX)) continue;
+      const record = readJson<Partial<SubmissionRecord> | null>(key, null);
+      if (!record || (record.cid !== null && (typeof record.cid !== 'string' || !record.cid)) || typeof record.agentId !== 'string' ||
+          !record.agentId || typeof record.prompt !== 'string' || !record.prompt.trim() ||
+          typeof record.ownsDraft !== 'boolean' || typeof record.requestId !== 'string' ||
+          key !== SUBMISSION_PREFIX + record.requestId ||
+          !/^(ui|ceo)-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(record.requestId) ||
+          record.requestId.startsWith('ceo-') !== (record.agentId === CEO_PROFILE_ID) ||
+          (record.deferredSource !== undefined && record.deferredSource !== chatOwnerKey(null, record.agentId) &&
+            !(typeof record.deferredSource === 'string' && record.deferredSource.startsWith('legacy:')))) continue;
+      if (typeof record.execution?.engine !== 'string' || !record.execution.engine ||
+          typeof record.execution.model !== 'string' || !record.execution.model ||
+          (record.wirePrompt !== undefined && typeof record.wirePrompt !== 'string')) delete record.execution;
+      if (typeof record.draftOverride?.engine !== 'string' || !record.draftOverride.engine ||
+          typeof record.draftOverride.model !== 'string' || !record.draftOverride.model) delete record.draftOverride;
+      records.set(record.requestId, record as SubmissionRecord);
+    }
+  } catch { /* Storage unavailable. Live sends still use in-memory state. */ }
+  return records;
+}
+
+const deliveryWarning = 'Delivery was not confirmed. Check the conversation before retrying';
+const creationWarning = 'Conversation creation was not confirmed. Check your chat list before retrying';
+const rejectionNotice = 'The worker rejected this request';
+const missingSettings = 'The original execution settings were not saved. Check the conversation before dismissing this notice and sending again';
+const missingLegacyProfilesKey = 'agentos.rusebot.missingLegacyProfiles.v1';
+const missingLegacyProfile = 'This chat’s specialist is no longer available. Your draft stays here. Retry to check the binding again, or open a chat with an available specialist';
+
+function needsConversation(cid: string | null): cid is null | `legacy:${string}` {
+  return cid === null || cid.startsWith('legacy:');
+}
+
+function chatOwnerKey(cid: string | null, agentId: string): string {
+  // The reserved CEO profile ID owns the unsaved Loqman slot.
+  return cid ?? DRAFT_OWNER_PREFIX + agentId;
 }
 
 /** An error shown in the chat, with what "Retry" does about it. */
 interface ChatErrorEntry {
   message: string;
-  retry: 'send' | 'load' | null;
+  retry: SendAttempt | null;
 }
 
 const NO_MESSAGES: ConvMessage[] = [];
 const NO_RUNS: Record<number, RunSnapshot> = {};
+const NO_APPROVALS: Approval[] = [];
+
+function upsertDraft(list: Draft[], draft: Draft): Draft[] {
+  return list.some((item) => item.id === draft.id)
+    ? list.map((item) => item.id === draft.id ? draft : item)
+    : [...list, draft];
+}
+
+function mergeRecoveredMessages(history: ConvMessage[], recovered: ConvMessage[]): ConvMessage[] {
+  if (!recovered.length) return history;
+  const bySeq = new Map(recovered.map((message) => [message.seq, message]));
+  for (const message of history) bySeq.set(message.seq, message);
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+}
+
+function hasSavedCeoReply(messages: ConvMessage[], requestId: string): boolean {
+  return messages.some((message) => message.role === 'assistant' && message.client_message_id === `ask:${requestId}:assistant`);
+}
 
 function cacheRuns(conversationId: string, ids: string[]): void {
   const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -219,12 +347,70 @@ function cacheRuns(conversationId: string, ids: string[]): void {
   writeJson(KEY_RUNS, all);
 }
 
-export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAgentsChanged?: () => void): ChatState {
+function newestFirst(field: 'created_at' | 'updated_at') {
+  return (a: Conversation, b: Conversation) => {
+    // Worker timestamps are UTC ISO strings. Keep their sub-millisecond precision.
+    if (a[field] !== b[field]) return a[field] < b[field] ? 1 : -1;
+    return a.id.localeCompare(b.id);
+  };
+}
+
+async function findSpecialistChat(agentId: string, stillOpening: () => boolean): Promise<Conversation | undefined> {
+  const chats = await listConversations();
+  if (!stillOpening()) return;
+  if (!Array.isArray(chats) || chats.some((chat) => typeof chat?.id !== 'string' || !chat.id ||
+    (chat.profile_id !== null && typeof chat.profile_id !== 'string'))) {
+    throw new Error('The worker returned incomplete conversation information.');
+  }
+  if (chats.length >= WORKER_CONVERSATION_LIMIT) {
+    throw new Error('There are too many chats to verify this Agent’s conversations in the worker list.');
+  }
+  const candidates = chats.filter((chat) => chat.profile_id === agentId && chat.id !== CEO_HISTORY_ID);
+  if (candidates.length <= 1) return candidates[0];
+  if (candidates.some((chat) => !Number.isFinite(Date.parse(chat.created_at)) || !Number.isFinite(Date.parse(chat.updated_at)))) {
+    throw new Error('The worker returned incomplete conversation timestamps.');
+  }
+  for (const chat of candidates.sort(newestFirst('updated_at'))) {
+    if (!stillOpening()) return;
+    // A new empty chat also has an updated_at. A single row proves message activity.
+    if (await hasConversationMessages(chat.id)) return chat;
+  }
+  return candidates.sort(newestFirst('created_at'))[0];
+}
+
+interface AgentOpen {
+  intent: { revision: number };
+  result: Promise<Conversation | null>;
+}
+
+export function useChat(
+  agents: Agent[],
+  profiles: Profile[],
+  profilesKnown: boolean,
+  onAgentsChanged?: () => void,
+  onCeoActionsChanged?: () => void
+): ChatState {
+  const providers = useProviders();
   const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversationListError, setConversationListError] = useState<string | null>(null);
+  const [retryingConversationList, setRetryingConversationList] = useState(false);
+  const conversationListRetryInFlight = useRef(false);
+  // List reads and locally acknowledged conversation records share one publication order.
+  const conversationListRevision = useRef(0);
+  const rememberConversation = useCallback((chat: Conversation) => {
+    conversationListRevision.current++;
+    setConversations((prev) => {
+      const existing = prev.find((row) => row.id === chat.id);
+      if (!existing) return [chat, ...prev];
+      if (!existing.profile_id && chat.profile_id) return prev.map((row) => row.id === chat.id ? chat : row);
+      return prev;
+    });
+  }, []);
   const [legacy] = useState<LegacyThread[]>(() => readLegacyThreads());
-  const [selectedId, setSelectedId] = useState<string | null>(() => readJson<string | null>(KEY_SELECTED, null));
+  const [{ id: selectedId, draftAgentId }, setSelection] = useState(readChatSelection);
   // The messages and runs of ONE chat, tagged with it: after a switch the old chat's text is never shown in the new one.
-  const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
+  const [thread, setThread] = useState<{ cid: string | null; list: ConvMessage[]; recovered?: ConvMessage[] }>({ cid: null, list: NO_MESSAGES });
+  const lastReconciledThread = useRef<{ cid: string; list: ConvMessage[] } | null>(null);
   const [runsThread, setRunsThread] = useState<{ cid: string | null; map: Record<number, RunSnapshot> }>({ cid: null, map: NO_RUNS });
   const [pendingUser, setPendingUser] = useState<string | null>(null);
   const [ceoStep, setCeoStep] = useState<{ cid: string; text: string } | null>(null);
@@ -237,9 +423,18 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
   }, []);
   const historyUsed = useRef(false);
   const [runs, setRuns] = useState<Record<string, RunState>>({});
+  // Stream callbacks and RPC replies can arrive before React commits the previous run update.
+  const currentRuns = useRef(runs);
+  const updateRuns = useCallback((update: (current: Record<string, RunState>) => Record<string, RunState>) => {
+    const next = update(currentRuns.current);
+    if (next === currentRuns.current) return;
+    currentRuns.current = next;
+    setRuns(next);
+  }, []);
   const [live, setLive] = useState<Record<string, LiveTurn>>({});
   const liveRuns = useRef(new Map<string, LiveTurn>());
   const stoppedRuns = useRef(new Set<string>());
+  const terminalRuns = useRef(new Set<string>());
   const liveDirty = useRef(new Map<string, string>());
   const liveFrame = useRef<number | null>(null);
   const liveLastFlush = useRef(0);
@@ -260,7 +455,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
         const next = { ...prev };
         for (const [cid, rid] of entries) {
           const turn = liveRuns.current.get(rid);
-          if (turn) next[cid] = turn;
+          if (turn && currentRuns.current[cid]?.runId === rid) next[cid] = turn;
         }
         return next;
       });
@@ -283,7 +478,7 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     stoppedRuns.current.delete(runId);
     if (liveDirty.current.get(conversationId) === runId) liveDirty.current.delete(conversationId);
     setLive((prev) => {
-      if (!(conversationId in prev)) return prev;
+      if (prev[conversationId]?.runId !== runId) return prev;
       const next = { ...prev };
       delete next[conversationId];
       return next;
@@ -295,46 +490,171 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     },
     []
   );
-  const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [approvalRead, setApprovalRead] = useState<ApprovalRead>({ list: null, loading: true, error: null });
+  const approvalsRequest = useRef({ ticket: 0, pending: false, list: NO_APPROVALS });
+  const [toolDecisions, setToolDecisions] = useState(() => new Map<string, ToolDecisionRecord>());
+  const toolDecisionsRef = useRef(toolDecisions);
+  const publishToolDecisions = useCallback((next: Map<string, ToolDecisionRecord>) => {
+    toolDecisionsRef.current = next;
+    setToolDecisions(next);
+  }, []);
+  const reconcileToolDecisions = useCallback((ticket: number, list: Approval[] | null) => {
+    const current = toolDecisionsRef.current;
+    if (!current.size) return;
+    const pending = new Set(list?.filter(item => item.status === 'pending').map(approvalKey));
+    const next = new Map(current);
+    const evictable: string[] = [];
+    let changed = false;
+    for (const [key, entry] of current) {
+      if (entry.phase === 'recovery' && ticket > entry.readAfter) {
+        const retryable = pending.has(key);
+        if (retryable !== entry.retryable) {
+          next.set(key, { ...entry, retryable });
+          changed = true;
+        }
+      }
+      // Evict older terminal feedback only after a successful read omits it.
+      if (list && isSettledApproval(entry) && !pending.has(key)) evictable.push(key);
+    }
+    for (const key of evictable.slice(0, Math.max(0, evictable.length - RETAINED_APPROVAL_OUTCOMES))) {
+      next.delete(key);
+      changed = true;
+    }
+    if (changed) publishToolDecisions(next);
+  }, [publishToolDecisions]);
+  const refreshApprovals = useCallback(async () => {
+    const ticket = ++approvalsRequest.current.ticket;
+    approvalsRequest.current.pending = true;
+    setApprovalRead((prev) => prev.loading ? prev : { ...prev, loading: true });
+    try {
+      const list = await listApprovals();
+      if (mounted.current && ticket === approvalsRequest.current.ticket) {
+        approvalsRequest.current.list = list;
+        reconcileToolDecisions(ticket, list);
+        setApprovalRead({ list, loading: false, error: null });
+      }
+    } catch (e) {
+      if (mounted.current && ticket === approvalsRequest.current.ticket) {
+        reconcileToolDecisions(ticket, null);
+        setApprovalRead((prev) => ({ ...prev, loading: false, error: messageOf(e) }));
+      }
+    } finally {
+      if (ticket === approvalsRequest.current.ticket) approvalsRequest.current.pending = false;
+    }
+  }, [reconcileToolDecisions]);
   const [drafts, setDrafts] = useState<Record<string, Draft[]>>({});
-  // Errors belong to the chat they happened in ('' = no chat open yet or the list itself); another chat never shows them.
-  const [errors, setErrors] = useState<Record<string, ChatErrorEntry>>({});
+  const [draftSaves, setDraftSaves] = useState<ChatState['draftSaves']>({});
+  const savingDrafts = useRef(new Set<string>());
+  const draftReads = useRef(new Map<string, number>());
+  const readRunDrafts = useCallback(async (runId: string) => {
+    const ticket = (draftReads.current.get(runId) ?? 0) + 1;
+    draftReads.current.set(runId, ticket);
+    return { ticket, list: await listDrafts(runId) };
+  }, []);
+  const [resultsDrafts, setResultsDrafts] = useState<ResultsDrafts>({ list: null, loading: true, error: null });
+  const resultsRead = useRef({ ticket: 0, pending: false });
+  // Keep the legacy '' entry in storage for recovery. Its agent is unknown.
+  const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
+  const [submissions] = useState(readSubmissions);
+  // Keep a definitive rejection across reloads, even when its submission is dismissed.
+  const [missingLegacyProfiles] = useState(() => new Set(readJson<string[]>(missingLegacyProfilesKey, [])));
+  const createdCeoSubmissions = useRef(new Map<string, SendAttempt>());
+  const forgetSubmission = useCallback((id: string) => {
+    const record = submissions.get(id);
+    submissions.delete(id);
+    try { localStorage.removeItem(SUBMISSION_PREFIX + id); } catch { /* storage unavailable */ }
+    if (!record?.createdCeoChat || !record.cid) return;
+    createdCeoSubmissions.current.delete(record.cid);
+    const compatibilityKey = CEO_SUBMISSION_PREFIX + record.cid;
+    setDraftMap((prev) => {
+      if (prev[compatibilityKey] !== record.prompt) return prev;
+      const next = { ...prev };
+      delete next[compatibilityKey];
+      writeJson(KEY_DRAFTS, next);
+      return next;
+    });
+  }, [submissions]);
+  const [errors, setErrors] = useState<Record<string, ChatErrorEntry>>(() => {
+    const recovered: Record<string, ChatErrorEntry> = {};
+    for (const [key, prompt] of Object.entries(draftMap)) {
+      if (!key.startsWith(CEO_SUBMISSION_PREFIX) || typeof prompt !== 'string' || !prompt.trim()) continue;
+      const cid = key.slice(CEO_SUBMISSION_PREFIX.length);
+      if ([...submissions.values()].some(record => record.cid === cid && record.createdCeoChat && record.prompt === prompt)) continue;
+      recovered[cid] = {
+        message: `${missingSettings}: ${prompt}`,
+        // The ordinary draft belongs to a separate edit, even if its text is identical.
+        retry: { cid, agentId: CEO_PROFILE_ID, prompt, draftRevision: Symbol(), createdCeoChat: true },
+      };
+    }
+    for (const record of submissions.values()) {
+      if (record.acknowledged) continue;
+      const owner = chatOwnerKey(record.cid, record.agentId);
+      const draft = draftMap[owner];
+      const notice = !record.execution ? missingSettings : missingLegacyProfiles.has(record.agentId) ? missingLegacyProfile :
+        record.rejected === true ? rejectionNotice : needsConversation(record.cid) ? creationWarning : deliveryWarning;
+      recovered[SUBMISSION_PREFIX + record.requestId] = {
+        message: `${notice}: ${record.prompt}`,
+        retry: { ...record,
+          draftRevision: record.ownsDraft && typeof draft === 'string' && draft.trim() === record.prompt ? undefined : Symbol() },
+      };
+    }
+    return recovered;
+  });
   const [threadErrors, setThreadErrors] = useState<Record<string, string>>({});
   const [stoppingRuns, setStoppingRuns] = useState<Record<string, true>>({});
-  const failedSend = useRef<{ cid: string | null; prompt: string } | null>(null);
-  const raise = useCallback((cid: string | null, message: string, retry: ChatErrorEntry['retry'] = null) => {
-    setErrors((prev) => ({ ...prev, [cid ?? '']: { message, retry } }));
+  const [sendLocks, setSendLocks] = useState<ReadonlyMap<string, symbol>>(() => new Map());
+  const sending = useRef(sendLocks);
+  const publishLocks = useCallback((locks: Map<string, symbol>) => {
+    sending.current = locks;
+    setSendLocks(locks);
   }, []);
-  const clearError = useCallback((cid: string | null) => {
+  const draftRevisions = useRef(new Map<string, symbol | undefined>());
+  const selectionRevision = useRef(0);
+  const agentOpens = useRef(new Map<string, AgentOpen>());
+  const raise = useCallback((owner: string, message: string, retry: ChatErrorEntry['retry'] = null) => {
+    setErrors((prev) => ({ ...prev, [owner]: { message, retry } }));
+  }, []);
+  const clearError = useCallback((owner: string) => {
     setErrors((prev) => {
-      if (!((cid ?? '') in prev)) return prev;
+      if (!(owner in prev)) return prev;
       const next = { ...prev };
-      delete next[cid ?? ''];
+      delete next[owner];
       return next;
     });
   }, []);
-  const [draftMap, setDraftMap] = useState<Record<string, string>>(() => readJson(KEY_DRAFTS, {}));
   const [loaded, setLoaded] = useState(false);
-  const [draftAgentId, setDraftAgentId] = useState<string | null>(null);
-  const draftAgentRef = useRef<string | null>(null);
-  draftAgentRef.current = draftAgentId;
   const [agentMap, setAgentMap] = useState<Record<string, string>>(() => readJson(KEY_AGENTS, {}));
   const agentMapRef = useRef(agentMap);
   agentMapRef.current = agentMap;
-  const ceo = useMemo(() => agents.find((a) => a.mgr && !a.team) ?? agents[0] ?? null, [agents]);
   const bindAgent = useCallback((cid: string, agentId: string) => {
     const next = { ...agentMapRef.current, [cid]: agentId };
     agentMapRef.current = next;
     setAgentMap(next);
     writeJson(KEY_AGENTS, next);
   }, []);
-  const agentFor = useCallback(
-    (cid: string | null) =>
-      cid
-        ? resolveAgent(conversations.find((c) => c.id === cid)?.profile_id, agentMap[cid], agents, ceo)
-        : (agents.find((a) => a.id === draftAgentId) ?? ceo),
-    [agents, agentMap, ceo, draftAgentId, conversations]
+  const newChatAgentId = draftAgentId ?? CEO_PROFILE_ID;
+  // Only a known, unbound conversation can use the browser's legacy recipient hint.
+  const profileIdForConversation = useCallback(
+    (conversation: Conversation) => conversation.profile_id ?? agentMap[conversation.id] ?? CEO_PROFILE_ID,
+    [agentMap]
   );
+  const recipientIdFor = useCallback((cid: string | null) => {
+    if (cid === null) return newChatAgentId;
+    if (cid.startsWith('legacy:')) return legacy.some((t) => `legacy:${t.id}` === cid) ? CEO_PROFILE_ID : null;
+    const row = conversations.find((c) => c.id === cid);
+    return row ? profileIdForConversation(row) : null;
+  }, [newChatAgentId, legacy, conversations, profileIdForConversation]);
+  const agentFor = useCallback((cid: string | null) => {
+    const id = recipientIdFor(cid);
+    return agents.find((a) => a.id === id) ?? null;
+  }, [agents, recipientIdFor]);
+  const selectedOwnerKey = chatOwnerKey(selectedId, newChatAgentId);
+  const recipient = recipientIdFor(selectedId);
+  const profile = recipient === null || recipient === CEO_PROFILE_ID
+    ? undefined
+    : profiles.find((entry) => entry.id === recipient) ?? null;
+  const draftRecipientUnverified = selectedId === null && profile === null;
+  const engines = useChatEngines(selectedOwnerKey, providers, profile);
   const streams = useRef(new Map<string, StreamHandle>());
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
@@ -352,9 +672,23 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     return list.filter((c) => c.id !== history.id);
   }, []);
 
-  const refreshConversations = useCallback(async () => {
-    setConversations(await withoutEmptyHistory(await listConversations()));
+  const readConversationList = useCallback(async (isActive = () => mounted.current) => {
+    const revision = ++conversationListRevision.current;
+    const isCurrent = () => isActive() && revision === conversationListRevision.current;
+    try {
+      const list = await withoutEmptyHistory(await listConversations());
+      if (!isCurrent()) return null;
+      setConversations(list);
+      return list;
+    } catch (error) {
+      if (isCurrent()) throw error;
+      return null;
+    }
   }, [withoutEmptyHistory]);
+
+  const refreshConversations = useCallback(async () => {
+    await readConversationList();
+  }, [readConversationList]);
 
   // Every read of a chat takes a number; an older answer that arrives after a newer one is dropped,
   // and an answer for a chat that is no longer open is never shown.
@@ -364,47 +698,119 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     readSeq.current.set(cid, n);
     return n;
   };
-  const fetchMessages = useCallback(async (conversationId: string): Promise<ConvMessage[] | null> => {
-    const ticket = nextRead(conversationId);
-    const list = await listMessages(conversationId);
-    if (readSeq.current.get(conversationId) !== ticket) return null;
-    if (selectedRef.current === conversationId) setThread({ cid: conversationId, list });
-    return list;
+  const publishThread = useCallback((cid: string, list: ConvMessage[]) => {
+    setThread((prev) => {
+      const recovered = prev.cid === cid ? prev.recovered : undefined;
+      if (!recovered?.length) return { cid, list };
+      const seen = new Set(list.map((message) => message.seq));
+      const missing = recovered.filter((message) => !seen.has(message.seq));
+      return { cid, list: mergeRecoveredMessages(list, missing), recovered: missing };
+    });
   }, []);
-
-  const loadThread = useCallback(async (conversationId: string) => {
-    const ticket = nextRead(conversationId);
+  const reconcileThread = useCallback((cid: string, list: ConvMessage[]) => {
+    lastReconciledThread.current = { cid, list };
+    publishThread(cid, list);
     setThreadErrors((prev) => {
-      if (!(conversationId in prev)) return prev;
+      if (!(cid in prev)) return prev;
       const next = { ...prev };
-      delete next[conversationId];
+      delete next[cid];
       return next;
     });
-    const list = await listMessages(conversationId);
+    // Only a saved assistant message with this ask ID reconciles its submission.
+    for (const record of submissions.values()) {
+      if (record.cid !== cid || record.agentId !== CEO_PROFILE_ID ||
+          (!record.acknowledged && sending.current.has(cid)) ||
+          !hasSavedCeoReply(list, record.requestId)) continue;
+      forgetSubmission(record.requestId);
+      clearError(SUBMISSION_PREFIX + record.requestId);
+      if (record.ownsDraft) setDraftMap((prev) => {
+        if (prev[cid]?.trim() !== record.prompt) return prev;
+        const next = { ...prev };
+        delete next[cid];
+        writeJson(KEY_DRAFTS, next);
+        return next;
+      });
+    }
+  }, [publishThread, submissions, forgetSubmission, clearError]);
+  const readThreadMessages = useCallback(async (cid: string, ticket: number, errorPrefix: string) => {
+    try {
+      return await listMessages(cid);
+    } catch (error) {
+      if (mounted.current && readSeq.current.get(cid) === ticket) {
+        setThreadErrors((prev) => ({ ...prev, [cid]: errorPrefix + messageOf(error) }));
+      }
+      return null;
+    }
+  }, []);
+  const fetchMessages = useCallback(async (conversationId: string, acknowledgedCeo = false): Promise<ConvMessage[] | null> => {
+    const ticket = nextRead(conversationId);
+    const list = acknowledgedCeo
+      ? await readThreadMessages(conversationId, ticket, 'Loqman answered, but the conversation could not be refreshed. ')
+      : await listMessages(conversationId);
+    if (!list || !mounted.current || readSeq.current.get(conversationId) !== ticket) return null;
+    if (selectedRef.current === conversationId) {
+      if (acknowledgedCeo) reconcileThread(conversationId, list);
+      else publishThread(conversationId, list);
+    }
+    return list;
+  }, [publishThread, reconcileThread, readThreadMessages]);
+
+  const loadThread = useCallback(async (
+    conversationId: string,
+    observeRun?: (conversationId: string, snap: RunSnapshot, previousRun?: RunState) => void,
+  ) => {
+    const ticket = nextRead(conversationId);
+    const previousRun = currentRuns.current[conversationId];
+    const list = await readThreadMessages(conversationId, ticket, '');
+    if (!list || !mounted.current) return;
     if (readSeq.current.get(conversationId) === ticket && selectedRef.current === conversationId) {
-      setThread({ cid: conversationId, list });
+      reconcileThread(conversationId, list);
+      const run = currentRuns.current[conversationId];
+      if (run?.status === 'succeeded' && liveRuns.current.has(run.runId)) dropLive(conversationId, run.runId);
     }
     // The worker knows this conversation's runs; the browser index is only a fallback when it is unreachable.
     let snaps: Array<RunSnapshot | null> | null = await listRuns(conversationId, 30).catch(() => null);
+    const listAvailable = snaps !== null;
     if (snaps) {
       cacheRuns(conversationId, snaps.map((s) => s!.id));
     } else {
       const ids = readJson<Record<string, string[]>>(KEY_RUNS, {})[conversationId] ?? [];
       snaps = await Promise.all(ids.slice(-30).map((id) => getRun(id).catch(() => null)));
     }
+    if (observeRun && readSeq.current.get(conversationId) === ticket) {
+      const latest = snaps.at(-1);
+      if (latest?.conversation_id === conversationId) {
+        observeRun(conversationId, latest, listAvailable ? previousRun : undefined);
+      }
+      if (!listAvailable) {
+        const current = currentRuns.current[conversationId];
+        if (!current || !streams.current.has(current.runId)) {
+          throw new Error('Could not verify the latest run with the worker.');
+        }
+      }
+    }
     const bySeq: Record<number, RunSnapshot> = {};
-    const nextDrafts: Record<string, Draft[]> = {};
+    const nextDrafts: Record<string, Awaited<ReturnType<typeof readRunDrafts>>> = {};
     for (const snap of snaps) {
-      if (!snap) continue;
+      if (!snap || snap.conversation_id !== conversationId) continue;
       if (snap.assistant_message_seq != null) bySeq[snap.assistant_message_seq] = snap;
-      if (snap.status === 'succeeded') nextDrafts[snap.id] = await listDrafts(snap.id).catch(() => []);
+      else if (snap.user_message_seq != null && (snap.status === 'failed' || snap.status === 'interrupted')) {
+        bySeq[snap.user_message_seq] = snap;
+      }
+      if (snap.status === 'succeeded') {
+        const read = await readRunDrafts(snap.id).catch(() => null);
+        if (read) nextDrafts[snap.id] = read;
+      }
     }
     if (selectedRef.current === conversationId && readSeq.current.get(conversationId) === ticket) {
       setRunsThread({ cid: conversationId, map: bySeq });
-      setDrafts((prev) => ({ ...prev, ...nextDrafts }));
+      const currentDrafts = Object.entries(nextDrafts)
+        .filter(([id, read]) => draftReads.current.get(id) === read.ticket)
+        .map(([id, read]) => [id, read.list]);
+      setDrafts((prev) => ({ ...prev, ...Object.fromEntries(currentDrafts) }));
     }
     return snaps.filter((s): s is RunSnapshot => s !== null);
-  }, []);
+  }, [dropLive, reconcileThread, readRunDrafts, readThreadMessages]);
 
   const remember = (conversationId: string, runId: string) => {
     const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
@@ -413,117 +819,259 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
     writeJson(KEY_RUNS, all);
   };
 
-  const follow = useCallback(
-    (conversationId: string, runId: string) => {
-      if (streams.current.has(runId)) return;
-      const finish = async (status: string, err: string | null) => {
-        const handle = streams.current.get(runId);
-        handle?.close();
-        streams.current.delete(runId);
-        setRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error: err } }));
-        setStoppingRuns((prev) => {
-          if (!(runId in prev)) return prev;
-          const next = { ...prev };
-          delete next[runId];
-          return next;
-        });
-        if (selectedRef.current === conversationId) setPendingUser(null);
-        if (err && status !== 'cancelled') raise(conversationId, err);
-        const partial = liveRuns.current.get(runId);
-        if (status === 'cancelled' && hasLiveContent(partial)) {
-          // Keep what was written, marked as stopped; a reload shows only what the worker stored.
-          const kept = freezeLive(partial);
-          liveRuns.current.set(runId, kept);
-          setLive((prev) => ({ ...prev, [conversationId]: kept }));
-        } else {
-          // The stored reply replaces the live one in the same render, so the text never shows twice or disappears.
-          if (status === 'succeeded') await fetchMessages(conversationId).catch(() => null);
-          dropLive(conversationId, runId);
+  const closeFollower = useCallback((runId: string) => {
+    const follower = streams.current.get(runId);
+    streams.current.delete(runId);
+    follower?.close();
+  }, []);
+
+  const clearStopping = useCallback((runId: string) => {
+    setStoppingRuns((prev) => {
+      if (!(runId in prev)) return prev;
+      const next = { ...prev };
+      delete next[runId];
+      return next;
+    });
+  }, []);
+
+  const finishRun = useCallback(async (conversationId: string, runId: string, status: string, error: string | null) => {
+    const ownsRun = () => mounted.current && currentRuns.current[conversationId]?.runId === runId;
+    const current = currentRuns.current[conversationId];
+    if (!mounted.current || (current && (current.runId !== runId || isTerminal(current.status)))) return;
+    terminalRuns.current.add(runId);
+    closeFollower(runId);
+    updateRuns((prev) => ({ ...prev, [conversationId]: { runId, status, error } }));
+    clearStopping(runId);
+    if (selectedRef.current === conversationId) setPendingUser(null);
+    if (error && status !== 'cancelled') raise(conversationId, error);
+
+    const partial = liveRuns.current.get(runId);
+    if (status === 'cancelled' && hasLiveContent(partial)) {
+      const kept = freezeLive(partial);
+      liveRuns.current.set(runId, kept);
+      setLive((prev) => ({ ...prev, [conversationId]: kept }));
+    } else if (status === 'succeeded') {
+      // The terminal event and snapshot are published after the reply is committed.
+      const history = await fetchMessages(conversationId).catch(() => null);
+      if (history !== null) dropLive(conversationId, runId);
+    } else {
+      dropLive(conversationId, runId);
+    }
+    if (!ownsRun()) return;
+    await refreshConversations().catch(() => undefined);
+    if (ownsRun() && selectedRef.current === conversationId) {
+      await loadThread(conversationId).catch((error: unknown) => {
+        if (ownsRun() && selectedRef.current === conversationId) {
+          setThreadErrors((prev) => ({ ...prev, [conversationId]: messageOf(error) }));
         }
-        await refreshConversations().catch(() => undefined);
-        if (selectedRef.current === conversationId) await loadThread(conversationId).catch(() => undefined);
-        setApprovals(await listApprovals().catch(() => []));
+      });
+    }
+    if (!ownsRun()) return;
+    await refreshApprovals();
+  }, [clearStopping, closeFollower, dropLive, fetchMessages, loadThread, raise, refreshApprovals, refreshConversations, updateRuns]);
+
+  const follow = useCallback((conversationId: string, runId: string) => {
+    const run = currentRuns.current[conversationId];
+    if (!mounted.current || streams.current.has(runId) || terminalRuns.current.has(runId) ||
+        run?.runId !== runId || isTerminal(run.status)) return;
+    let handle: StreamHandle | undefined;
+    let subscription: symbol | undefined;
+    let timer: number | undefined;
+    let checking = false;
+    let lastEventId = 0;
+    let lastActivity = performance.now();
+    let retries = 0;
+    let statusFailures = 0;
+
+    const closeSubscription = () => {
+      subscription = undefined;
+      handle?.close();
+      handle = undefined;
+    };
+    const follower = {
+      close() {
+        window.clearTimeout(timer);
+        closeSubscription();
+      },
+    };
+    const isCurrent = () => mounted.current && streams.current.get(runId) === follower &&
+      currentRuns.current[conversationId]?.runId === runId;
+    const warning = (visible: boolean) => {
+      if (!isCurrent()) return;
+      updateRuns((prev) => {
+        const run = prev[conversationId];
+        return Boolean(run.connectionWarning) === visible ? prev :
+          { ...prev, [conversationId]: { ...run, connectionWarning: visible } };
+      });
+    };
+    const schedule = (callback: () => void, delay: number) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(callback, delay);
+    };
+    const retryDelay = () => {
+      const attempt = retries++;
+      return attempt === 0 ? 0 : Math.min(500 * 2 ** Math.min(attempt - 1, 5), RUN_STATUS_RETRY_MAX_MS);
+    };
+    const markRunning = () => {
+      updateRuns((prev) => {
+        const run = prev[conversationId];
+        return run.status === 'queued' ? { ...prev, [conversationId]: { ...run, status: 'running' } } : prev;
+      });
+    };
+
+    function checkWhenQuiet() {
+      if (!isCurrent()) return;
+      const remaining = RUN_STREAM_IDLE_MS - (performance.now() - lastActivity);
+      if (remaining > 0) schedule(checkWhenQuiet, remaining);
+      else void checkStatus();
+    }
+
+    async function checkStatus() {
+      if (!isCurrent() || checking) return;
+      checking = true;
+      schedule(() => warning(true), RUN_STATUS_SLOW_MS);
+      const snap = await getRun(runId).catch(() => null);
+      checking = false;
+      if (!isCurrent()) return;
+      window.clearTimeout(timer);
+      if (!snap || snap.id !== runId || snap.conversation_id !== conversationId) {
+        if (++statusFailures >= 3) warning(true);
+        schedule(() => void checkStatus(), retryDelay());
+        return;
+      }
+      statusFailures = 0;
+      warning(false);
+      if (isTerminal(snap.status)) {
+        void finishRun(conversationId, runId, snap.status, snap.error);
+        return;
+      }
+      if (snap.status === 'running') markRunning();
+      if (!subscription) connect();
+      else {
+        // EventSource can reconnect on its own. Check status after silence without opening another stream.
+        schedule(checkWhenQuiet, RUN_STREAM_IDLE_MS);
+      }
+    }
+
+    function connect() {
+      const attempt = Symbol();
+      subscription = attempt;
+      const isSubscribed = () => isCurrent() && subscription === attempt;
+      const disconnected = () => {
+        if (!isSubscribed()) return;
+        closeSubscription();
+        if (!checking) schedule(() => void checkStatus(), retryDelay());
       };
-      const placeholder = { close: () => undefined } as StreamHandle;
-      streams.current.set(runId, placeholder);
-      followRun(
-        runId,
-        (type, data) => {
-          // Only a lifecycle terminal ends the run; driver events feed the live reply; anything else is ignored.
-          if (isTerminal(type)) void finish(type, typeof data.error === 'string' ? data.error : null);
-          else if (type === 'queued' || type === 'running') {
-            setRuns((prev) => ({ ...prev, [conversationId]: { runId, status: type, error: null } }));
-          } else applyLive(conversationId, runId, type, data);
-        },
-        () => {
-          if (streams.current.has(runId)) {
-            void getRun(runId).then((snap) => {
-              if (isTerminal(snap.status)) void finish(snap.status, snap.error);
-              else streams.current.delete(runId);
-            });
-          }
-        },
-        0,
-        'normalised-v1'
-      )
-        .then((handle) => {
-          if (streams.current.has(runId)) streams.current.set(runId, handle);
-          else handle.close();
-        })
-        .catch((e) => {
-          streams.current.delete(runId);
-          raise(conversationId, messageOf(e));
-        });
-    },
-    [loadThread, fetchMessages, refreshConversations, applyLive, dropLive, raise]
-  );
+      lastActivity = performance.now();
+      schedule(checkWhenQuiet, RUN_STREAM_IDLE_MS);
+      const after = lastEventId;
+      let replayThrough = after;
+      void followRun(runId, (type, data, id) => {
+        if (!isSubscribed()) return;
+        if (typeof id === 'number') {
+          // A browser reconnect can replay from the original URL cursor.
+          if (id < lastEventId) replayThrough = lastEventId;
+          if (id <= replayThrough) return;
+          lastEventId = id;
+        }
+        lastActivity = performance.now();
+        retries = 0;
+        statusFailures = 0;
+        warning(false);
+        if (isTerminal(type)) void finishRun(conversationId, runId, type, typeof data.error === 'string' ? data.error : null);
+        else if (type === 'running') markRunning();
+        else if (type !== 'queued') applyLive(conversationId, runId, type, data);
+      }, disconnected, after, 'normalised-v1').then((opened) => {
+        if (isSubscribed()) handle = opened;
+        else opened.close();
+      }).catch(disconnected);
+    }
+
+    streams.current.set(runId, follower);
+    connect();
+  }, [applyLive, finishRun, updateRuns]);
+
+  const observeRun = useCallback((conversationId: string, snap: RunSnapshot, previousRun?: RunState) => {
+    if (!mounted.current || snap.conversation_id !== conversationId) return;
+    const current = currentRuns.current[conversationId];
+    if (isTerminal(snap.status)) {
+      terminalRuns.current.add(snap.id);
+      if (current?.runId === snap.id && !isTerminal(current.status)) {
+        void finishRun(conversationId, snap.id, snap.status, snap.error);
+      }
+      return;
+    }
+    if (terminalRuns.current.has(snap.id)) return;
+    if (current?.runId !== snap.id) {
+      // Only a current list read may advance past an already settled run of this chat.
+      if (current && (current !== previousRun || !isTerminal(current.status))) return;
+      updateRuns((prev) => ({ ...prev, [conversationId]: { runId: snap.id, status: snap.status, error: null } }));
+    }
+    follow(conversationId, snap.id);
+  }, [finishRun, follow, updateRuns]);
+
+  const loadStartupConversations = useCallback(async (isActive: () => boolean) => {
+    let list: Conversation[] | null;
+    try {
+      list = await readConversationList(isActive);
+    } catch (error) {
+      if (isActive()) setConversationListError(`Could not load your chats. ${messageOf(error)}`);
+      return;
+    }
+    if (!list || !isActive()) return;
+    setConversationListError(null);
+
+    const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
+    // Discover recent runs that were unavailable while the conversation list was missing.
+    const lastRun: Record<string, string | undefined> = {};
+    const discoveredRuns = new Map<string, RunSnapshot>();
+    for (const [cid, ids] of Object.entries(all)) lastRun[cid] = ids[ids.length - 1];
+    const unknown = list.filter((c) => !(c.id in lastRun)).slice(0, 10);
+    await Promise.all(unknown.map(async (c) => {
+      const [latest] = await listRuns(c.id, 1).catch(() => []);
+      if (latest?.conversation_id !== c.id) return;
+      lastRun[c.id] = latest.id;
+      discoveredRuns.set(c.id, latest);
+    }));
+    for (const [cid, last] of Object.entries(lastRun)) {
+      if (!isActive()) return;
+      if (!last) continue;
+      const snap = await getRun(last).catch(() => discoveredRuns.get(cid));
+      if (!isActive()) return;
+      if (snap?.id === last) observeRun(cid, snap);
+    }
+  }, [observeRun, readConversationList]);
+
+  const retryConversationList = useCallback(async () => {
+    if (conversationListRetryInFlight.current) return;
+    conversationListRetryInFlight.current = true;
+    setRetryingConversationList(true);
+    try {
+      await loadStartupConversations(() => mounted.current);
+    } finally {
+      conversationListRetryInFlight.current = false;
+      if (mounted.current) setRetryingConversationList(false);
+    }
+  }, [loadStartupConversations]);
 
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
         await importLegacyCeo().catch(() => undefined);
-        const all0 = await listConversations();
-        const list = await withoutEmptyHistory(all0);
         if (!alive) return;
-        setConversations(list);
-        const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
-        // Recover from the cache, and ask the worker about recent chats the cache does not know (cleared storage).
-        const lastRun: Record<string, string | undefined> = {};
-        for (const [cid, ids] of Object.entries(all)) lastRun[cid] = ids[ids.length - 1];
-        const unknown = list.filter((c) => !(c.id in lastRun)).slice(0, 10);
-        await Promise.all(
-          unknown.map(async (c) => {
-            const found = await listRuns(c.id, 1).catch(() => []);
-            if (found[0]) lastRun[c.id] = found[0].id;
-          })
-        );
-        if (!alive) return;
-        const active: Record<string, RunState> = {};
-        for (const [cid, last] of Object.entries(lastRun)) {
-          if (!last) continue;
-          const snap = await getRun(last).catch(() => null);
-          if (snap && !isTerminal(snap.status)) {
-            active[cid] = { runId: snap.id, status: snap.status, error: null };
-            follow(cid, snap.id);
-          }
-        }
-        if (!alive) return;
-        setRuns(active);
-        setApprovals(await listApprovals().catch(() => []));
-      } catch (e) {
-        if (alive) raise(null, `Could not load your chats. ${messageOf(e)}`, 'load');
+        await loadStartupConversations(() => alive);
       } finally {
+        if (alive) await refreshApprovals();
         if (alive) setLoaded(true);
       }
     })();
     const open = streams.current;
     return () => {
       alive = false;
-      for (const handle of open.values()) handle.close();
-      open.clear();
+      for (const id of open.keys()) closeFollower(id);
     };
-  }, [follow, withoutEmptyHistory, raise]);
+  }, [closeFollower, loadStartupConversations, refreshApprovals]);
 
   useEffect(() => {
     if (!selectedId || selectedId.startsWith('legacy:')) {
@@ -532,108 +1080,277 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
       return;
     }
     let alive = true;
-    loadThread(selectedId).catch((e) => {
+    loadThread(selectedId, observeRun).catch((e) => {
       if (alive) setThreadErrors((prev) => ({ ...prev, [selectedId]: messageOf(e) }));
     });
     return () => {
       alive = false;
     };
-  }, [selectedId, loadThread]);
+  }, [selectedId, loadThread, observeRun]);
 
   const anyActive = Object.values(runs).some((r) => !isTerminal(r.status));
   useEffect(() => {
     if (!anyActive) return;
     const timer = window.setInterval(() => {
-      listApprovals()
-        .then(setApprovals)
-        .catch(() => undefined);
+      if (!approvalsRequest.current.pending) void refreshApprovals();
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [anyActive]);
+  }, [anyActive, refreshApprovals]);
 
-  const select = useCallback((id: string | null) => {
-    setDraftAgentId(null);
-    setSelectedId(id);
-    writeJson(KEY_SELECTED, id);
-    setPendingUser(null);
+  const invalidateNavigation = useCallback(() => {
+    selectionRevision.current++;
   }, []);
+
+  const rememberSelection = useCallback((id: string | null, agentId: string | null = null) => {
+    selectedRef.current = id;
+    const draftAgentId = id === null ? agentId : null;
+    setSelection({ id, draftAgentId });
+    // A single write replaces the prior selection. Keep saved IDs and the CEO draft in their legacy formats.
+    writeJson(KEY_SELECTED, id ?? (draftAgentId && draftAgentId !== CEO_PROFILE_ID
+      ? { draftOwner: chatOwnerKey(null, draftAgentId) }
+      : null));
+  }, []);
+
+  const select = useCallback((id: string | null, agentId: string | null = null) => {
+    invalidateNavigation();
+    rememberSelection(id, agentId);
+    setPendingUser(null);
+  }, [invalidateNavigation, rememberSelection]);
 
   const setDraft = useCallback(
     (text: string) => {
-      const key = selectedRef.current ?? '';
+      const key = selectedOwnerKey;
+      for (const record of submissions.values()) {
+        if (chatOwnerKey(record.cid, record.agentId) === key && record.ownsDraft) {
+          record.ownsDraft = false;
+          writeJson(SUBMISSION_PREFIX + record.requestId, record);
+        }
+      }
+      const submitted = createdCeoSubmissions.current.get(key);
+      draftRevisions.current.set(key, Symbol());
+      updateRuns((prev) => prev[key]?.hideSubmittedDraft
+        ? { ...prev, [key]: { ...prev[key], hideSubmittedDraft: false } }
+        : prev);
       setDraftMap((prev) => {
         const next = { ...prev };
+        if (submitted) next[CEO_SUBMISSION_PREFIX + key] = submitted.prompt;
         if (text) next[key] = text;
         else delete next[key];
         writeJson(KEY_DRAFTS, next);
         return next;
       });
     },
-    []
+    [selectedOwnerKey, submissions, updateRuns]
   );
 
-  const send = useCallback(
-    async (text: string) => {
-      const prompt = text.trim();
-      if (!prompt) return;
-      if (!engine?.model) {
-        raise(selectedRef.current, 'No AI provider is ready. Open Settings > AI to sign in or pick a model.');
+  const sendAttempt = useCallback(
+    async (attempt: SendAttempt, retryOwner?: string) => {
+      const { prompt, agentId, draftRevision } = attempt;
+      let { cid } = attempt;
+      let key = chatOwnerKey(cid, agentId);
+      const errorOwner = retryOwner ?? key;
+      let retainedSourceKey = attempt.retainedSourceKey;
+      const deferredSource = attempt.deferredSource;
+      let recoverySource = deferredSource;
+      const previous = createdCeoSubmissions.current.get(key);
+      // Pressing Send on the unchanged restored draft acknowledges the same submission as Retry.
+      const createdCeoChat = agentId === CEO_PROFILE_ID &&
+        (attempt.createdCeoChat || needsConversation(cid) ||
+          (previous?.prompt === prompt && previous.draftRevision === draftRevision));
+      if (sending.current.has(key) || (deferredSource && sending.current.has(deferredSource))) return;
+      const execution = attempt.execution;
+      if (!execution) {
+        raise(errorOwner, `${missingSettings}: ${prompt}`, attempt);
         return;
       }
-      let cid = selectedRef.current;
-      clearError(cid);
-      failedSend.current = null;
-      const draftKey = cid ?? '';
-      const known = cid && !cid.startsWith('legacy:') ? cid : null;
-      const target = known
-        ? resolveAgent(conversations.find((c) => c.id === known)?.profile_id, agentMapRef.current[known], agents, ceo)
-        : (agents.find((a) => a.id === draftAgentRef.current) ?? ceo);
-      if ((!target || target.id === CEO_PROFILE_ID) && prompt.length > CEO_MAX_CHARS) {
+      // Send can also recover an unchanged draft. Check the live store for both entry points.
+      if (attempt.requestId && agentId !== CEO_PROFILE_ID && retryProviderReadiness(execution) !== 'ready') return;
+      if (agentId === CEO_PROFILE_ID && prompt.length > CEO_MAX_CHARS) {
         raise(
-          cid,
+          errorOwner,
           `Loqman reads messages of up to ${CEO_MAX_CHARS.toLocaleString('en-US')} characters; this one has ${prompt.length.toLocaleString('en-US')}. Shorten it and send again.`
         );
         return;
       }
-      let boundProfile: string | null | undefined = cid ? conversations.find((c) => c.id === cid)?.profile_id : null;
-      const keepDraft = (key: string) =>
+      // A saved CEO draft must keep its original Retry action until history can reconcile it.
+      const recoveringSavedCeo = agentId === CEO_PROFILE_ID && Boolean(attempt.requestId) && !needsConversation(cid);
+      if (!recoveringSavedCeo) clearError(errorOwner);
+      const lock = Symbol();
+      const locks = new Map(sending.current).set(key, lock);
+      if (deferredSource) locks.set(deferredSource, lock);
+      publishLocks(locks);
+      const releaseLock = () => {
+        const current = sending.current;
+        if (current.get(key) !== lock) return;
+        const next = new Map(current);
+        next.delete(key);
+        if (deferredSource && next.get(deferredSource) === lock) next.delete(deferredSource);
+        publishLocks(next);
+      };
+      const selectionAtStart = selectionRevision.current;
+      let boundProfile = conversations.find((c) => c.id === cid)?.profile_id;
+      const ownsDraft = (owner: string) => draftRevisions.current.get(owner) === draftRevision;
+      const requestId = attempt.requestId ?? (agentId === CEO_PROFILE_ID ? 'ceo-' : 'ui-') + crypto.randomUUID();
+      const submissionKey = SUBMISSION_PREFIX + requestId;
+      let previewedSpecialistPrompt = false;
+      let wirePrompt = attempt.wirePrompt;
+      const recoveryAttempt = (): SendAttempt => ({ ...attempt, cid, wirePrompt, retainedSourceKey, createdCeoChat, requestId,
+        deferredSource: recoverySource });
+      const persist = (owned: boolean, recoveryFallback?: string) => {
+        const record: SubmissionRecord = { cid, agentId, prompt, execution, wirePrompt, requestId, ownsDraft: owned,
+          createdCeoChat, deferredSource: recoverySource, draftOverride: attempt.draftOverride };
+        try {
+          localStorage.setItem(submissionKey, JSON.stringify(record));
+          submissions.set(requestId, record);
+          return true;
+        } catch {
+          raise(submissionKey, `Could not save this submission for recovery. Sending is paused until browser storage is available: ${prompt}`,
+            { ...recoveryAttempt(), deferredSource: recoveryFallback ?? recoverySource });
+          return false;
+        }
+      };
+      const fail = (message: string, cause?: unknown, noticeOverride?: string) => {
+        const rejected = cause instanceof ApiError && cause.status === 422;
+        const record = submissions.get(requestId);
+        if (record && rejected) {
+          record.rejected = true;
+          writeJson(submissionKey, record);
+        }
+        const notice = noticeOverride ?? (rejected ? rejectionNotice : needsConversation(cid) ? creationWarning : deliveryWarning);
+        raise(submissionKey, `${message}. ${notice}: ${prompt}`, recoveryAttempt());
+        const draftKey = key;
+        if (!ownsDraft(draftKey)) return;
         setDraftMap((prev) => {
-          // A failed send gives the text back in the chat it belongs to, and never over something typed since.
-          const next = { ...prev, [key]: prev[key] || prompt };
-          if (draftKey !== key) delete next[draftKey];
+          if (prev[draftKey]) return prev;
+          const next = { ...prev, [draftKey]: prompt };
           writeJson(KEY_DRAFTS, next);
           return next;
         });
+      };
       try {
-        if (!cid || cid.startsWith('legacy:')) {
+        if (!persist(ownsDraft(key))) return;
+        // CEO recovery still loads its original catalog on demand.
+        if (attempt.requestId && agentId === CEO_PROFILE_ID && !isExecutableChoice(execution)) await loadProviderModels(execution.engine);
+        const requireOriginalModel = () => {
+          if (!isExecutableChoice(execution)) throw new Error('The original engine and model are currently unavailable');
+        };
+        if (needsConversation(cid)) {
+          requireOriginalModel();
           const created = await createConversation(
             prompt.replace(/\s+/g, ' ').slice(0, 60),
-            target && target.id !== CEO_PROFILE_ID ? target.id : undefined
+            agentId !== CEO_PROFILE_ID ? agentId : undefined
           );
+          const sourceKey = key;
+          const stillHere = selectedRef.current === cid && selectionRevision.current === selectionAtStart;
+          const sourceRevision = draftRevisions.current.get(sourceKey);
+          const sourceEdited = sourceRevision !== draftRevision;
           cid = created.id;
           boundProfile = created.profile_id;
-          setConversations((prev) => [created, ...prev]);
-          selectedRef.current = cid;
-          setSelectedId(cid);
-          writeJson(KEY_SELECTED, cid);
-          const starter = agents.find((a) => a.id === draftAgentRef.current) ?? ceo;
-          if (starter) bindAgent(cid, starter.id);
+          const destinationEdited = draftRevisions.current.has(cid);
+          const moveDraft = !destinationEdited && (!sourceEdited || stillHere);
+          transferDraftChoice(sourceKey, cid, moveDraft && !sending.current.has(cid), attempt.draftOverride);
+          rememberConversation(created);
+          bindAgent(cid, agentId);
+          if (sending.current.has(cid)) {
+            // The destination has its own send. Offer an explicit Retry at the source, targeting the created ID.
+            retainedSourceKey = sourceKey;
+            recoverySource = sourceKey;
+            if (persist(false)) {
+              raise(submissionKey, `Another message is being sent in the created chat. Retry here when it finishes: ${prompt}`,
+                recoveryAttempt());
+            }
+            return;
+          }
+          const nextLocks = new Map(sending.current);
+          if (nextLocks.get(sourceKey) === lock) nextLocks.delete(sourceKey);
+          key = cid;
+          publishLocks(nextLocks.set(key, lock));
+          // Preserve edits if a concurrent list refresh exposed the new chat before creation returned.
+          if (!destinationEdited) {
+            draftRevisions.current.set(cid, stillHere ? sourceRevision : draftRevision);
+          } else {
+            retainedSourceKey = sourceKey;
+          }
+          // Record the actual destination before moving the draft or sending the prompt.
+          if (!persist(ownsDraft(cid), sourceKey)) return;
+          // Only remove the source here if its text actually moves to the destination.
+          if (moveDraft) {
+            setDraftMap((prev) => {
+              if (!(sourceKey in prev)) return prev;
+              const next = { ...prev };
+              next[created.id] = prev[sourceKey];
+              delete next[sourceKey];
+              writeJson(KEY_DRAFTS, next);
+              return next;
+            });
+          }
+          if (stillHere) {
+            rememberSelection(cid);
+          }
         }
         const chatId = cid;
-        const agent = resolveAgent(boundProfile, agentMapRef.current[chatId], agents, ceo);
-        const clearDraft = () =>
+        const clearDraft = (owner: string) => {
+          if (!ownsDraft(owner)) return;
           setDraftMap((prev) => {
+            if (!(owner in prev)) return prev;
             const next = { ...prev };
-            delete next[draftKey];
+            delete next[owner];
             writeJson(KEY_DRAFTS, next);
             return next;
           });
-        if (!agent || agent.id === CEO_PROFILE_ID) {
+        };
+        if (agentId === CEO_PROFILE_ID) {
           // Loqman (the CEO) answers through the CEO loop, which is the path that can create agents.
-          const ticket = `ceo-${crypto.randomUUID()}`;
-          setPendingUser(prompt);
-          clearDraft();
-          setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null } }));
+          const ticket = requestId;
+          if (attempt.requestId && attempt.cid === chatId) {
+            const readAtStart = readSeq.current.get(chatId);
+            const history = await listMessages(chatId);
+            const exchange = history.filter((m) => m.conversation_id === chatId && m.client_message_id === `ask:${ticket}:${m.role}`);
+            if (exchange.some((m) => m.role === 'assistant')) {
+              // If the user left, normal history loading will reconcile and clear the record on return.
+              if (!mounted.current || selectedRef.current !== chatId) return;
+              const newerRead = readSeq.current.get(chatId) !== readAtStart;
+              if (!newerRead) nextRead(chatId);
+              setThread((prev) => {
+                const sameChat = prev.cid === chatId;
+                const list = newerRead && sameChat ? prev.list : history;
+                // A newer read can publish independently of recovery, even if it missed the recovered exchange.
+                const recovered = mergeRecoveredMessages(exchange, sameChat ? prev.recovered ?? NO_MESSAGES : NO_MESSAGES);
+                return { cid: chatId, list: mergeRecoveredMessages(list, recovered), recovered };
+              });
+              forgetSubmission(ticket);
+              clearError(errorOwner);
+              clearDraft(chatId);
+              if (retainedSourceKey) clearDraft(retainedSourceKey);
+              return;
+            }
+            const progress = await ceoAskProgress(ticket).catch((e: unknown) => {
+              if (e instanceof ApiError && e.status === 404) return null;
+              throw e;
+            });
+            if ((progress && (!progress.done || progress.stage === 'done')) ||
+                (!progress && history.some((m) => m.client_message_id === `ask:${ticket}:user`))) {
+              fail('The worker has received this question. Check its reply before retrying');
+              return;
+            }
+          }
+          if (recoveringSavedCeo) clearError(errorOwner);
+          if (selectedRef.current === chatId) setPendingUser(prompt);
+          const recoveryKey = CEO_SUBMISSION_PREFIX + chatId;
+          const hideSubmittedDraft = ownsDraft(chatId);
+          // Keep the existing new-CEO draft format compatible. The submission record owns recovery.
+          if (createdCeoChat) {
+            createdCeoSubmissions.current.set(chatId, attempt);
+            // Creation may already have transferred a newer edit into the saved composer.
+            setDraftMap((prev) => {
+              if (prev[chatId]?.trim() === prompt && hideSubmittedDraft) return prev;
+              const next = { ...prev, [recoveryKey]: prompt };
+              writeJson(KEY_DRAFTS, next);
+              return next;
+            });
+          }
+          // Hide the submitted revision until the ask settles. Reload reads the persisted draft.
+          updateRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: 'running', error: null, hideSubmittedDraft } }));
           // Ask the worker where the answer has got to. One request at a time; it ends with the ask, a chat switch or unmount.
           let polling = true;
           void (async () => {
@@ -653,213 +1370,394 @@ export function useChat(engine: EngineChoice | null, agents: Agent[] = [], onAge
           try {
             // The worker stores both sides of the exchange in this chat (the question before generating, the
             // reply after), so a reload mid-generation keeps the message. A failed ask removes its question.
-            const answer = await askCeo(prompt, engine.engine, engine.model, ticket, chatId);
+            requireOriginalModel();
+            const answer = await askCeo(prompt, execution.engine, execution.model, ticket, chatId);
+            const record = submissions.get(requestId);
+            const reconciled = lastReconciledThread.current;
+            if (reconciled?.cid === chatId && hasSavedCeoReply(reconciled.list, requestId)) {
+              forgetSubmission(requestId);
+            } else if (record) {
+              // Keep the original ID for history reconciliation, while disarming the send Retry.
+              record.acknowledged = true;
+              writeJson(submissionKey, record);
+            }
+            clearError(submissionKey);
+            clearDraft(chatId);
+            if (retainedSourceKey) clearDraft(retainedSourceKey);
             if (answer.agents_created.length) onAgentsChanged?.();
+            // The ask is acknowledged. Read the worker's pending list after any automatic decisions.
+            if (answer.actions_proposed.length || answer.agents_created.length) onCeoActionsChanged?.();
           } catch (e) {
             failure = messageOf(e);
-            failedSend.current = { cid: chatId, prompt };
-            raise(chatId, failure, 'send');
-            keepDraft(chatId);
+            fail(failure, e);
           } finally {
             polling = false;
-            setCeoStep(null);
+            setCeoStep((prev) => (prev?.cid === chatId ? null : prev));
             if (selectedRef.current === chatId) setPendingUser(null);
             // A failed answer is a failed run, not a finished one.
-            setRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: failure ? 'failed' : 'succeeded', error: failure } }));
+            updateRuns((prev) => ({ ...prev, [chatId]: { runId: ticket, status: failure ? 'failed' : 'succeeded', error: failure } }));
+            // The answer is settled. A slow history refresh must not swallow the next Retry.
+            releaseLock();
             await refreshConversations().catch(() => undefined);
-            await fetchMessages(chatId).catch(() => null);
+            await fetchMessages(chatId, !failure).catch(() => null);
           }
           return;
         }
-        // A chat made before conversations were bound to their agent has no profile: bind it now so the
-        // worker applies the agent's instructions; only if that fails does the first message carry the contract.
-        let outgoing = prompt;
-        if (agent && !boundProfile) {
-          const bound = await bindConversationProfile(chatId, agent.id).catch(() => null);
+        // Revalidate an unbound legacy recipient even when Retry already has a prepared payload.
+        let outgoing = wirePrompt ?? prompt;
+        if (!boundProfile) {
+          requireOriginalModel();
+          const agent = agents.find((a) => a.id === agentId);
+          const bound = await bindConversationProfile(chatId, agentId).catch((e: unknown) => {
+            if (e instanceof ApiError) {
+              if (e.status === 409 || (e.status === 404 && e.detail === 'Conversation not found')) throw e;
+              if (e.status === 404 && e.detail === 'Profile not found' && !missingLegacyProfiles.has(agentId)) {
+                missingLegacyProfiles.add(agentId);
+                writeJson(missingLegacyProfilesKey, [...missingLegacyProfiles]);
+              }
+            }
+            if (!agent && !missingLegacyProfiles.has(agentId)) throw e;
+            return null;
+          });
           if (bound) {
+            conversationListRevision.current++;
             setConversations((prev) => prev.map((c) => (c.id === bound.id ? bound : c)));
-          } else if (agent.prompt && (await listMessages(chatId).catch(() => [{}])).length === 0) {
+            if (bound.profile_id !== agentId) throw new Error('The conversation is bound to a different agent.');
+            if (missingLegacyProfiles.delete(agentId)) writeJson(missingLegacyProfilesKey, [...missingLegacyProfiles]);
+          } else if (!missingLegacyProfiles.has(agentId) && wirePrompt === undefined && agent?.prompt &&
+              (await listMessages(chatId).catch(() => [{}])).length === 0) {
             outgoing = `${CONTRACT_OPEN}
 ${agent.prompt}
 ${CONTRACT_CLOSE}
 
 ${prompt}`;
           }
+          if (!bound && missingLegacyProfiles.has(agentId)) {
+            fail(missingLegacyProfile, undefined, 'No new turn was submitted by this attempt');
+            return;
+          }
+          // An earlier start may already be accepted. Preserve its exact payload for the same request key.
+          if (wirePrompt === undefined) {
+            wirePrompt = outgoing;
+            if (!persist(ownsDraft(key))) return;
+          }
         }
-        setPendingUser(prompt);
-        setLive((prev) => {
-          if (!(chatId in prev)) return prev;
-          const next = { ...prev };
-          delete next[chatId];
-          return next;
+        requireOriginalModel();
+        const before = currentRuns.current[chatId];
+        if (selectedRef.current === chatId && (!before || isTerminal(before.status))) {
+          setPendingUser(prompt);
+          previewedSpecialistPrompt = true;
+        }
+        const snap = await startTurn({
+          conversationId: chatId,
+          engine: execution.engine,
+          modelId: execution.model,
+          prompt: outgoing,
+          requestKey: requestId,
         });
-        try {
-          const snap = await startTurn({
-            conversationId: chatId,
-            engine: engine.engine,
-            modelId: engine.model,
-            prompt: outgoing,
-            requestKey: `ui-${crypto.randomUUID()}`,
-          });
-          remember(chatId, snap.id);
-          clearDraft();
-          setRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
-          await fetchMessages(chatId).catch(() => null);
-          follow(chatId, snap.id);
-        } catch (e) {
-          if (selectedRef.current === chatId) setPendingUser(null);
-          failedSend.current = { cid: chatId, prompt };
-          raise(chatId, messageOf(e), 'send');
-          keepDraft(chatId);
+        forgetSubmission(requestId);
+        clearDraft(chatId);
+        if (retainedSourceKey) clearDraft(retainedSourceKey);
+        const current = currentRuns.current[chatId];
+        if (terminalRuns.current.has(snap.id) ||
+            (current && (current.runId === snap.id ? isTerminal(current.status) : isTerminal(snap.status)))) {
+          // A delayed acknowledgement cannot replace a settled run or take ownership from a newer run.
+          if (previewedSpecialistPrompt && selectedRef.current === chatId) setPendingUser(null);
+          await loadThread(chatId).catch(() => null);
+          return;
         }
+        remember(chatId, snap.id);
+        if (current && current.runId !== snap.id) {
+          closeFollower(current.runId);
+          clearStopping(current.runId);
+          dropLive(chatId, current.runId);
+        }
+        if (isTerminal(snap.status)) {
+          await finishRun(chatId, snap.id, snap.status, snap.error);
+          return;
+        }
+        updateRuns((prev) => ({ ...prev, [chatId]: { runId: snap.id, status: snap.status, error: null } }));
+        await fetchMessages(chatId).catch(() => null);
+        follow(chatId, snap.id);
       } catch (e) {
-        // Creating the chat or binding it failed before anything was sent.
-        setPendingUser(null);
-        failedSend.current = { cid, prompt };
-        raise(cid, messageOf(e), 'send');
-        keepDraft(cid ?? '');
+        if (previewedSpecialistPrompt && selectedRef.current === cid) setPendingUser(null);
+        fail(messageOf(e), e);
+      } finally {
+        releaseLock();
       }
     },
-    [engine, follow, agents, ceo, bindAgent, onAgentsChanged, refreshConversations, conversations, fetchMessages, raise, clearError]
+    [follow, agents, bindAgent, onAgentsChanged, onCeoActionsChanged, refreshConversations, conversations, fetchMessages, loadThread, dropLive, updateRuns, raise, clearError, publishLocks, submissions, missingLegacyProfiles, forgetSubmission, clearStopping, closeFollower, finishRun, rememberConversation, rememberSelection]
   );
 
+  const send = useCallback((text: string) => {
+    const prompt = text.trim();
+    if (!prompt) return Promise.resolve();
+    const cid = selectedRef.current;
+    if (cid !== selectedId || draftRecipientUnverified) return Promise.resolve();
+    const agentId = recipientIdFor(cid);
+    if (agentId === null) return Promise.resolve();
+    const revision = draftRevisions.current.get(chatOwnerKey(cid, agentId));
+    for (const [errorKey, entry] of Object.entries(errors)) {
+      const action = entry.retry;
+      if (typeof action === 'object' && action?.requestId && action.cid === cid && action.agentId === agentId &&
+          action.prompt === prompt && action.draftRevision === revision) return sendAttempt(action, errorKey);
+    }
+    const execution = getChatExecution(selectedOwnerKey, profile);
+    if (!execution || execution.engine !== engines.choice?.engine || execution.model !== engines.choice.model) return Promise.resolve();
+    return sendAttempt({
+      cid, prompt, agentId, execution,
+      draftOverride: needsConversation(cid) ? getDraftOverride(selectedOwnerKey) : undefined,
+      draftRevision: revision,
+    });
+  }, [recipientIdFor, sendAttempt, errors, selectedId, selectedOwnerKey, profile, engines.choice, draftRecipientUnverified]);
+
   const openAgentChat = useCallback(
-    async (agent: Agent) => {
-      const existing = Object.entries(agentMapRef.current).find(
-        ([cid, id]) => id === agent.id && conversations.some((c) => c.id === cid)
-      )?.[0];
-      if (existing) {
-        select(existing);
-        return existing;
+    async (agent: Agent, onOpen: () => void, onError: (message: string) => void) => {
+      const revision = ++selectionRevision.current;
+      const current = (ticket: number) => mounted.current && selectionRevision.current === ticket;
+      let pending = agentOpens.current.get(agent.id);
+      if (pending) {
+        pending.intent.revision = revision;
+      } else {
+        const intent = { revision };
+        const stillOpening = () => current(intent.revision);
+        const result = (async () => {
+          const isCeo = agent.id === CEO_PROFILE_ID;
+          // Keep Loqman's existing history lookup. Specialist ownership must come from the worker.
+          const existing = isCeo
+            ? Object.keys(agentMapRef.current)
+                .filter((id) => agentMapRef.current[id] === CEO_PROFILE_ID)
+                .map((id) => conversations.find((chat) => chat.id === id && (chat.profile_id ?? CEO_PROFILE_ID) === CEO_PROFILE_ID))
+                .find((chat) => chat !== undefined)
+            : await findSpecialistChat(agent.id, stillOpening);
+          if (!stillOpening()) return null;
+          const chat = existing ?? await createConversation(
+            `${agent.name} — ${agent.role}`.slice(0, 120), isCeo ? undefined : agent.id
+          );
+          if (!mounted.current) return null;
+          if (!isCeo && chat.profile_id !== agent.id) throw new Error('The worker did not confirm the Agent binding.');
+          if (isCeo && !existing) bindAgent(chat.id, agent.id);
+          rememberConversation(chat);
+          return chat;
+        })().finally(() => agentOpens.current.delete(agent.id));
+        pending = { intent, result };
+        agentOpens.current.set(agent.id, pending);
       }
-      const created = await createConversation(
-        `${agent.name} — ${agent.role}`.slice(0, 120),
-        agent.id !== CEO_PROFILE_ID ? agent.id : undefined
-      );
-      bindAgent(created.id, agent.id);
-      setConversations((prev) => [created, ...prev]);
-      select(created.id);
-      return created.id;
+      try {
+        const chat = await pending.result;
+        if (!chat || !current(revision)) return;
+        select(chat.id);
+        onOpen();
+      } catch (error) {
+        if (current(revision)) onError(`Could not verify the chat with ${agent.name}. ${messageOf(error)} Open a chat from the sidebar or retry Open Chat.`);
+      }
     },
-    [conversations, bindAgent, select]
+    [conversations, bindAgent, rememberConversation, select]
   );
 
   const stop = useCallback(async () => {
     const cid = selectedRef.current;
-    const run = cid ? runs[cid] : undefined;
+    const run = cid ? currentRuns.current[cid] : undefined;
     // A Loqman answer is one request to the worker that cannot be cancelled midway; the button is disabled for it.
-    if (!cid || !run || run.runId.startsWith('ceo-') || isTerminal(run.status) || stoppingRuns[run.runId]) return;
+    if (!cid || !run || run.runId.startsWith('ceo-') || isTerminal(run.status) || stoppedRuns.current.has(run.runId)) return;
     // The text stops changing the moment Stop is pressed, before the worker confirms.
     stoppedRuns.current.add(run.runId);
     setStoppingRuns((prev) => ({ ...prev, [run.runId]: true }));
-    const turn = liveRuns.current.get(run.runId);
-    if (turn) {
-      const frozen = freezeLive(turn);
-      liveRuns.current.set(run.runId, frozen);
-      setLive((prev) => ({ ...prev, [cid]: frozen }));
-    }
     try {
-      await cancelRun(run.runId);
-    } catch (e) {
-      stoppedRuns.current.delete(run.runId);
-      setStoppingRuns((prev) => {
-        const next = { ...prev };
-        delete next[run.runId];
-        return next;
-      });
-      if (turn) {
-        liveRuns.current.set(run.runId, turn);
-        setLive((prev) => ({ ...prev, [cid]: turn }));
+      const result = await cancelRun(run.runId);
+      if (result.id === run.runId && result.conversation_id === cid && isTerminal(result.status)) {
+        await finishRun(cid, run.runId, result.status, result.error);
+        return;
       }
-      raise(cid, `Could not stop the reply. ${messageOf(e)}`);
-    }
-  }, [runs, stoppingRuns, raise]);
-
-  const decide = useCallback(async (approval: Approval, decision: 'approve' | 'deny') => {
-    try {
-      await decideApproval(approval.run_id, approval.id, decision);
-    } finally {
-      setApprovals(await listApprovals().catch(() => []));
-    }
-  }, []);
-
-  const makeDeliverable = useCallback(async (runId: string) => {
-    try {
-      await createDraft(runId);
     } catch (e) {
-      raise(selectedRef.current, messageOf(e));
+      const current = currentRuns.current[cid];
+      if (current?.runId === run.runId && !isTerminal(current.status)) {
+        raise(cid, `Could not stop the reply. ${messageOf(e)}`);
+      }
     }
-    const list = await listDrafts(runId).catch(() => []);
-    setDrafts((prev) => ({ ...prev, [runId]: list }));
-  }, [raise]);
+    stoppedRuns.current.delete(run.runId);
+    clearStopping(run.runId);
+  }, [clearStopping, finishRun, raise]);
+
+  const decide = useCallback(async (approval: Approval, decision: ToolDecision, origin?: { conversationId: string | null }) => {
+    if (origin) {
+      const cid = selectedRef.current;
+      const run = cid ? currentRuns.current[cid] : undefined;
+      if (cid !== origin.conversationId || run?.runId !== approval.run_id || isTerminal(run.status)) return;
+    }
+    const key = approvalKey(approval);
+    const existing = toolDecisionsRef.current.get(key);
+    if (existing && (existing.phase !== 'recovery' || !existing.retryable)) return;
+    const index = approvalsRequest.current.list.findIndex(item => item.status === 'pending' && approvalKey(item) === key);
+    if (index < 0) return;
+    const card = { approval, index: existing?.index ?? index };
+    const attempt: ToolDecisionRecord = { ...card, phase: 'pending', requested: decision };
+    // Claim synchronously before dispatch. Both views use the same record, even before either rerenders.
+    publishToolDecisions(new Map(toolDecisionsRef.current).set(key, attempt));
+
+    let settled: ToolDecisionRecord;
+    try {
+      const confirmed = await decideApproval(approval.run_id, approval.id, attempt.requested);
+      if (!confirmed || approvalKey(confirmed) !== key || (confirmed.status !== 'approved' && confirmed.status !== 'denied')) {
+        throw new Error('The worker did not return a confirmed approval outcome.');
+      }
+      settled = { ...card, phase: 'confirmed', outcome: confirmed.status === 'approved' ? 'approve' : 'deny' };
+    } catch (error) {
+      const status = error instanceof ApiError ? error.status : undefined;
+      const detail = messageOf(error);
+      settled = status === 404 || status === 409
+        ? { ...card, phase: 'unavailable', error: detail }
+        : {
+          ...card, phase: 'recovery', readAfter: approvalsRequest.current.ticket, retryable: false,
+          error: status === 422 ? detail : `Could not confirm the approval decision. ${detail}`,
+        };
+    }
+    if (!mounted.current || toolDecisionsRef.current.get(key) !== attempt) return;
+    const next = new Map(toolDecisionsRef.current);
+    next.delete(key);
+    next.set(key, settled);
+    publishToolDecisions(next);
+    if (isSettledApproval(settled)) {
+      const exclude = (list: Approval[]) => list.filter(item => approvalKey(item) !== key);
+      approvalsRequest.current.list = exclude(approvalsRequest.current.list);
+      setApprovalRead(prev => prev.list ? { ...prev, list: exclude(prev.list) } : prev);
+    }
+    await refreshApprovals();
+  }, [publishToolDecisions, refreshApprovals]);
 
   const loadAllDrafts = useCallback(async () => {
-    const next: Record<string, Draft[]> = {};
-    const fromWorker = await listAllDrafts().catch(() => null);
-    if (fromWorker) {
+    const ticket = ++resultsRead.current.ticket;
+    resultsRead.current.pending = true;
+    setResultsDrafts((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const fromWorker = await listAllDrafts();
+      if (!mounted.current || ticket !== resultsRead.current.ticket) return;
+      const next: Record<string, Draft[]> = {};
       for (const d of fromWorker) (next[d.run_id] ??= []).push(d);
       for (const list of Object.values(next)) list.reverse(); // the worker lists newest first; cards read oldest first
-    } else {
-      const all = readJson<Record<string, string[]>>(KEY_RUNS, {});
-      for (const id of Object.values(all).flat()) {
-        const list = await listDrafts(id).catch(() => []);
-        if (list.length) next[id] = list;
+      setResultsDrafts({ list: Object.values(next).flat(), loading: false, error: null });
+    } catch (e) {
+      if (mounted.current && ticket === resultsRead.current.ticket) {
+        setResultsDrafts((prev) => ({ ...prev, loading: false, error: messageOf(e) }));
       }
+    } finally {
+      if (ticket === resultsRead.current.ticket) resultsRead.current.pending = false;
     }
-    setDrafts((prev) => ({ ...prev, ...next }));
   }, []);
 
-  const reviewDraft = useCallback(async (draft: Draft, decision: 'approve' | 'reject') => {
+  const makeDeliverable = useCallback(async (run: RunSnapshot) => {
+    const { id: runId, conversation_id: origin } = run;
+    if (selectedRef.current !== origin || savingDrafts.current.has(runId)) return;
+    savingDrafts.current.add(runId);
+    setDraftSaves((prev) => ({ ...prev, [runId]: { pending: true } }));
     try {
-      await decideDraft(draft.run_id, draft.id, decision, draft.content_sha256);
-    } catch (e) {
-      raise(selectedRef.current, messageOf(e));
+      let created: Draft;
+      try {
+        created = await createDraft(runId);
+      } catch (e) {
+        if (mounted.current) setDraftSaves((prev) => ({ ...prev, [runId]: { pending: false, error: messageOf(e) } }));
+        return;
+      }
+      if (!mounted.current) return;
+      setDrafts((prev) => ({ ...prev, [runId]: upsertDraft(prev[runId] ?? [], created) }));
+      setResultsDrafts((prev) => prev.list ? { ...prev, list: upsertDraft(prev.list, created) } : prev);
+      setDraftSaves((prev) => {
+        const next = { ...prev };
+        delete next[runId];
+        return next;
+      });
+      if (resultsRead.current.pending) void loadAllDrafts();
+      // Creation is already confirmed. A read failure leaves the confirmed card available.
+      const read = await readRunDrafts(runId).catch(() => null);
+      if (mounted.current && read && read.ticket === draftReads.current.get(runId)) {
+        const list = read.list.some((draft) => draft.id === created.id) ? read.list : [...read.list, created];
+        setDrafts((prev) => ({ ...prev, [runId]: list }));
+      }
+    } finally {
+      savingDrafts.current.delete(runId);
     }
-    const list = await listDrafts(draft.run_id).catch(() => []);
-    setDrafts((prev) => ({ ...prev, [draft.run_id]: list }));
-  }, [raise]);
+  }, [loadAllDrafts, readRunDrafts]);
+
+  const reviewDraft = useCallback(async (draft: Draft, decision: 'approve' | 'reject') => {
+    const updated = await decideDraft(draft.run_id, draft.id, decision, draft.content_sha256);
+    const replace = (item: Draft) => item.id === updated.id ? { ...item, ...updated } : item;
+    setDrafts((prev) => {
+      const list = prev[draft.run_id];
+      return list ? { ...prev, [draft.run_id]: list.map(replace) } : prev;
+    });
+    setResultsDrafts((prev) => prev.list ? { ...prev, list: prev.list.map(replace) } : prev);
+    // A read started before the decision may still carry the pre-review state.
+    if (resultsRead.current.pending) void loadAllDrafts();
+    try {
+      const read = await readRunDrafts(draft.run_id);
+      if (read.ticket === draftReads.current.get(draft.run_id)) {
+        setDrafts((prev) => ({ ...prev, [draft.run_id]: read.list }));
+      }
+    } catch (e) {
+      return messageOf(e);
+    }
+  }, [loadAllDrafts, readRunDrafts]);
 
   const downloadDraft = useCallback(async (draft: Draft) => {
+    const out = await draftContent(draft.run_id, draft.id);
+    const url = URL.createObjectURL(new Blob([out.content], { type: out.media_type }));
+    const link = document.createElement('a');
     try {
-      const out = await draftContent(draft.run_id, draft.id);
-      const url = URL.createObjectURL(new Blob([out.content], { type: out.media_type }));
-      const link = document.createElement('a');
       link.href = url;
       link.download = out.filename;
       document.body.appendChild(link);
       link.click();
+    } finally {
       link.remove();
       URL.revokeObjectURL(url);
-    } catch (e) {
-      raise(selectedRef.current, messageOf(e));
     }
-  }, [raise]);
+  }, []);
 
   const messages = thread.cid !== null && thread.cid === selectedId ? thread.list : NO_MESSAGES;
   const runsBySeq = runsThread.cid !== null && runsThread.cid === selectedId ? runsThread.map : NO_RUNS;
-  const shownError = (selectedId && errors[selectedId]) || errors[''] || null;
-  const errorKey = selectedId && errors[selectedId] ? selectedId : '';
+  const selectedAgentId = draftRecipientUnverified && profilesKnown ? null : recipient;
+  const submissionKey = Object.keys(errors).reverse().find((key) => {
+    const action = errors[key].retry;
+    return key.startsWith(SUBMISSION_PREFIX) && action !== null && typeof action === 'object' && action.agentId === recipient &&
+      (action.cid === selectedId || action.deferredSource === selectedOwnerKey);
+  });
+  const errorKey = errors[selectedOwnerKey] ? selectedOwnerKey : submissionKey ?? '';
+  const shownError = errors[errorKey];
   const threadError = selectedId ? (threadErrors[selectedId] ?? null) : null;
+  const recovery = shownError?.retry;
+  const retryChoice = recovery && recovery.agentId !== CEO_PROFILE_ID ? recovery.execution : null;
+  const retryReadiness = retryChoice ? retryProviderReadiness(retryChoice, providers) : 'ready';
+  const retryEngine = retryChoice?.engine;
+  useEffect(() => {
+    // Startup typically loads the composer catalog, which may use a different engine.
+    if (retryReadiness === 'needs-catalog' && retryEngine) void loadProviderModels(retryEngine);
+  }, [retryReadiness, retryEngine]);
 
   const retry = useMemo(() => {
-    if (!shownError?.retry) return null;
-    const kind = shownError.retry;
+    if (!shownError?.retry || draftRecipientUnverified) return null;
+    const action = shownError.retry;
+    if (!action.execution) return null;
     return () => {
-      if (kind === 'send') {
-        const failed = failedSend.current;
-        if (failed) void send(failed.prompt);
+      if (action.cid && !action.cid.startsWith('legacy:')) {
+        const chat = conversations.find((c) => c.id === action.cid);
+        if (!chat || (chat.profile_id && chat.profile_id !== action.agentId)) {
+          raise(errorKey, 'The original conversation or its agent is no longer available.', action.requestId ? action : null);
+          return;
+        }
+      }
+      if (retryChoice && retryProviderReadiness(retryChoice) === 'failed') {
+        void refreshProviders(true);
         return;
       }
-      clearError(errorKey || null);
-      void refreshConversations().catch((e) => raise(null, `Could not load your chats. ${messageOf(e)}`, 'load'));
+      void sendAttempt(action, errorKey);
     };
-  }, [shownError, send, clearError, errorKey, refreshConversations, raise]);
+  }, [shownError, conversations, sendAttempt, errorKey, raise, retryChoice, draftRecipientUnverified]);
 
   const retryThread = useCallback(() => {
     const cid = selectedRef.current;
     if (!cid || cid.startsWith('legacy:')) return;
-    loadThread(cid).catch((e) => setThreadErrors((prev) => ({ ...prev, [cid]: messageOf(e) })));
-  }, [loadThread]);
+    loadThread(cid, observeRun).catch((e) => setThreadErrors((prev) => ({ ...prev, [cid]: messageOf(e) })));
+  }, [loadThread, observeRun]);
 
   const currentRun = selectedId ? (runs[selectedId] ?? null) : null;
   const activeRunIds = useMemo(() => {
@@ -868,8 +1766,35 @@ ${prompt}`;
     return out;
   }, [runs]);
 
+  const { approvals, toolApprovalCards } = useMemo(() => {
+    const list = approvalRead.list ?? NO_APPROVALS;
+    const keys = new Set(list.map(approvalKey));
+    const shown = [...list];
+    const retained = [...toolDecisions].filter(([key]) => !keys.has(key)).map(([, entry]) => entry);
+    retained.sort((a, b) => a.index - b.index);
+    for (const entry of retained) shown.splice(Math.min(entry.index, shown.length), 0, entry.approval);
+    return {
+      approvals: list.filter(item => !isSettledApproval(toolDecisions.get(approvalKey(item)))),
+      toolApprovalCards: shown.map((approval): ToolApprovalCard => {
+        const key = approvalKey(approval);
+        const entry = toolDecisions.get(key);
+        const canRefresh = entry?.phase === 'recovery' && !entry.retryable;
+        return {
+          key, approval, canRefresh,
+          locked: entry?.phase === 'pending' || entry?.phase === 'unavailable' || canRefresh,
+          outcome: entry?.phase === 'confirmed' ? entry.outcome : undefined,
+          error: entry?.phase === 'recovery' || entry?.phase === 'unavailable' ? entry.error : undefined,
+        };
+      }),
+    };
+  }, [approvalRead.list, toolDecisions]);
+
   return {
+    engines,
     conversations,
+    conversationListError,
+    retryingConversationList,
+    retryConversationList,
     legacy,
     selectedId,
     select,
@@ -880,31 +1805,65 @@ ${prompt}`;
     live: selectedId ? (live[selectedId] ?? null) : null,
     runsBySeq,
     approvals,
+    toolApprovalCards,
+    approvalRead,
+    refreshApprovals,
     drafts,
-    error: shownError?.message ?? null,
-    dismissError: () => clearError(errorKey || null),
+    resultsDrafts,
+    error: shownError?.message ?? (currentRun?.connectionWarning ? runConnectionWarning : null),
+    dismissError: () => {
+      if (!shownError && selectedId && currentRun?.connectionWarning) {
+        updateRuns((prev) => {
+          const run = prev[selectedId];
+          return run?.runId === currentRun.runId ? { ...prev, [selectedId]: { ...run, connectionWarning: false } } : prev;
+        });
+        return;
+      }
+      if (errorKey.startsWith(SUBMISSION_PREFIX)) forgetSubmission(errorKey.slice(SUBMISSION_PREFIX.length));
+      else if (shownError?.retry && typeof shownError.retry === 'object' && shownError.retry.createdCeoChat && !shownError.retry.requestId) {
+        setDraftMap((prev) => {
+          const next = { ...prev };
+          delete next[CEO_SUBMISSION_PREFIX + errorKey];
+          writeJson(KEY_DRAFTS, next);
+          return next;
+        });
+      }
+      clearError(errorKey);
+    },
     retry,
+    retryProviderCheck: retryReadiness === 'ready' ? null : retryReadiness === 'needs-catalog' ? 'checking' : retryReadiness,
     threadError,
+    threadLoading: Boolean(selectedId && !selectedId.startsWith('legacy:') && thread.cid !== selectedId && !threadError),
     retryThread,
     stopping: Boolean(currentRun && stoppingRuns[currentRun.runId]),
+    sending: sendLocks.has(selectedOwnerKey),
     canStop: Boolean(currentRun && !currentRun.runId.startsWith('ceo-') && !isTerminal(currentRun.status)),
-    draft: draftMap[selectedId ?? ''] ?? '',
+    draft: currentRun?.hideSubmittedDraft ? '' : (draftMap[selectedOwnerKey] ?? ''),
     setDraft,
     send,
     stop,
-    newChat: () => {
-      const current = agentFor(selectedRef.current)?.id ?? null;
-      select(null);
-      setDraftAgentId(current);
+    newChat: (recipientId) => {
+      const current = recipientId ?? recipientIdFor(selectedRef.current);
+      const owner = chatOwnerKey(null, current ?? CEO_PROFILE_ID);
+      if (!draftMap[owner] && !sending.current.has(owner) &&
+          ![...submissions.values()].some(record => record.cid === null && chatOwnerKey(null, record.agentId) === owner)) {
+        discardDraftChoice(owner);
+      }
+      select(null, current);
     },
     decide,
+    draftSaves,
     makeDeliverable,
     reviewDraft,
     downloadDraft,
     loaded,
     activeRunIds,
+    selectedAgentId,
+    draftRecipientUnverified,
+    profileIdForConversation,
     agentFor,
     openAgentChat,
+    invalidateNavigation,
     reloadConversations: refreshConversations,
     loadAllDrafts,
   };
